@@ -32,6 +32,11 @@ UPDATE_FLAG="$CACHE_DIR/nix-update-update-flag"
 # if [ -f \"$HOME/.cache/nix-update-update-flag\" ]; then touch \"$HOME/.cache/nix-update-rebuild-flag\" && pkill -x -RTMIN+12 .waybar-wrapped; fi &&
 REBUILD_FLAG="$CACHE_DIR/nix-update-rebuild-flag"
 
+# The UPDATING_FLAG signals if upgrade process is currently performing
+# This is required to force waybar module to render while we wait for nixos rebuild
+# and also this is enhances UI/UX side
+UPDATING_FLAG="$CACHE_DIR/nix-update-updating-flag"
+
 
 # ===== Initialize Files =====
 function init_files() {
@@ -184,16 +189,24 @@ function check_for_updates() {
         cd "$NIXOS_CONFIG_PATH" || return 1
         nix flake update
         nix build .#nixosConfigurations.$(hostname).config.system.build.toplevel
-        updates=$(nvd diff /run/current-system ./result | grep -e '\[U' | wc -l)
-        tooltip=$(nvd diff /run/current-system ./result | grep -e '\[U' | awk '{ for (i=3; i<NF; i++) printf $i " "; if (NF >= 3) print $NF; }' ORS='\\n')
+        if [ "$?" -eq 0 ]; then
+            updates=$(nvd diff /run/current-system ./result | grep -e '\[U' | wc -l)
+            tooltip=$(nvd diff /run/current-system ./result | grep -e '\[U' | awk '{ for (i=3; i<NF; i++) printf $i " "; if (NF >= 3) print $NF; }' ORS='\\n')
+        else
+            return 1
+        fi
     else
         # Use a temp directory to avoid modifying lock file
         cp -r "$NIXOS_CONFIG_PATH"/* "$tempdir"
         cd "$tempdir" || return 1
         nix flake update
         nix build .#nixosConfigurations.$(hostname).config.system.build.toplevel
-        updates=$(nvd diff /run/current-system ./result | grep -e '\[U' | wc -l)
-        tooltip=$(nvd diff /run/current-system ./result | grep -e '\[U' | awk '{ for (i=3; i<NF; i++) printf $i " "; if (NF >= 3) print $NF; }' ORS='\\n')
+        if [ "$?" -eq 0 ]; then
+            updates=$(nvd diff /run/current-system ./result | grep -e '\[U' | wc -l)
+            tooltip=$(nvd diff /run/current-system ./result | grep -e '\[U' | awk '{ for (i=3; i<NF; i++) printf $i " "; if (NF >= 3) print $NF; }' ORS='\\n')
+        else
+            return 1
+        fi
     fi
 
     # Save results
@@ -254,15 +267,27 @@ function main() {
 
           # Decide whether to show saved state or perform new check
           if [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
-              # Time to check for updates
-              if check_for_updates; then
-                  updates=$(cat "$STATE_FILE")
-                  var_setter
+              # Separating updating and updated phase
+              if [ -f $UPDATING_FLAG ]; then
+                  # Time to check for updates
+                  if check_for_updates; then
+                      updates=$(cat "$STATE_FILE")
+                      var_setter
+                  else
+                      # Update check failed
+                      updates="X"
+                      alt="error"
+                      tooltip="Update check failed"
+                  fi
+                  rm $UPDATING_FLAG
               else
-                  # Update check failed
                   updates=$(cat "$STATE_FILE")
-                  var_setter
-                  tooltip="Update check failed"
+                  alt="updating"
+                  tooltip="Performing an update"
+                  touch $UPDATING_FLAG
+                  # Rerun same script just to show updating status and
+                  # run update process in separate thread
+                  pkill -x -RTMIN+12 .waybar-wrapped 
               fi
           else
               # Use saved state
