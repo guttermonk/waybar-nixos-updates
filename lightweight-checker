@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+
+# Lightweight NixOS Update Checker for Waybar
+# Uses lazy nix eval to compare package versions without a full build.
+# Checks .version attributes against the latest nixpkgs — runs in seconds
+# rather than the minutes required by a full build + nvd diff.
+#
+# Tradeoffs vs full mode:
+#   - Only checks top-level packages in the system profile
+#   - Some store names don't map to nixpkgs attr names (~15-20%)
+#   - No added/removed package detection
+#   - No transitive dependency tracking
+
+# ===== Configuration =====
+UPDATE_INTERVAL="${UPDATE_INTERVAL:-3599}"
+CACHE_DIR="${CACHE_DIR:-$HOME/.cache}"
+NIXPKGS_CHANNEL="${NIXPKGS_CHANNEL:-github:NixOS/nixpkgs/nixpkgs-unstable}"
+STATE_FILE="$CACHE_DIR/nix-update-state"
+LAST_RUN_FILE="$CACHE_DIR/nix-update-last-run"
+LAST_RUN_TOOLTIP="$CACHE_DIR/nix-update-tooltip"
+BOOT_MARKER_FILE="$CACHE_DIR/nix-update-boot-marker"
+TOGGLE_FILE="$CACHE_DIR/nix-update-toggle"
+SKIP_AFTER_BOOT="${SKIP_AFTER_BOOT:-true}"
+GRACE_PERIOD="${GRACE_PERIOD:-60}"
+
+# ===== Initialize =====
+mkdir -p "$CACHE_DIR"
+[ -f "$STATE_FILE" ] || echo "0" > "$STATE_FILE"
+[ -f "$LAST_RUN_FILE" ] || echo "0" > "$LAST_RUN_FILE"
+[ -f "$LAST_RUN_TOOLTIP" ] || echo "System updated" > "$LAST_RUN_TOOLTIP"
+[ -f "$TOGGLE_FILE" ] || echo "enabled" > "$TOGGLE_FILE"
+
+# ===== Helpers =====
+check_boot_resume() {
+    local current_time
+    current_time=$(date +%s)
+    local uptime_seconds
+    uptime_seconds=$(awk '{print int($1)}' /proc/uptime)
+    local last_boot_time=$((current_time - uptime_seconds))
+
+    if [ ! -f "$BOOT_MARKER_FILE" ] || [ $((current_time - last_boot_time)) -lt "$GRACE_PERIOD" ]; then
+        echo "$current_time" > "$BOOT_MARKER_FILE"
+        return 0
+    fi
+    if [ -f "$BOOT_MARKER_FILE" ]; then
+        local marker_time
+        marker_time=$(cat "$BOOT_MARKER_FILE")
+        if [[ "$marker_time" =~ ^[0-9]+$ ]] && [ $((current_time - marker_time)) -lt "$GRACE_PERIOD" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+check_network() {
+    ip route | grep -q "^default" && ip -4 addr show | grep -qE "inet .* scope global"
+}
+
+output_json() {
+    local text="$1" alt="$2" tooltip="$3"
+    echo "{ \"text\":\"$text\", \"alt\":\"$alt\", \"tooltip\":\"$tooltip\" }"
+}
+
+# ===== Core: lightweight version check =====
+check_for_updates_lightweight() {
+    local tmpexpr
+    tmpexpr=$(mktemp /tmp/nix-version-check-XXXXXX.nix)
+    trap "rm -f '$tmpexpr'" RETURN
+
+    # Extract package names and current versions from system profile.
+    # Strips store hash, dedup suffixes (-man, -bin, -doc, -info),
+    # and filters to entries with a version (name-X.Y pattern).
+    local -A current_versions
+    while IFS= read -r entry; do
+        # Skip suffixed variants
+        case "$entry" in *-man|*-bin|*-doc|*-info) continue ;; esac
+        # Skip unstable/dated packages (no stable attr name)
+        case "$entry" in *unstable*) continue ;; esac
+        # Split name-version at first digit boundary after a hyphen
+        local name version
+        if [[ "$entry" =~ ^([a-zA-Z0-9_][a-zA-Z0-9_.-]*)-([0-9].*)$ ]]; then
+            name="${BASH_REMATCH[1]}"
+            version="${BASH_REMATCH[2]}"
+            # Deduplicate (keep first seen)
+            [ -z "${current_versions[$name]+x}" ] && current_versions[$name]="$version"
+        fi
+    done < <(nix-store -q --references /run/current-system/sw 2>/dev/null | sed 's|/nix/store/[a-z0-9]\{32\}-||')
+
+    local pkg_count=${#current_versions[@]}
+    if [ "$pkg_count" -eq 0 ]; then
+        echo "0" > "$STATE_FILE"
+        echo "System updated" > "$LAST_RUN_TOOLTIP"
+        return 0
+    fi
+
+    # Generate nix expression for a single eval
+    {
+        echo 'flakeRef:'
+        echo 'let'
+        echo '  pkgs = (builtins.getFlake flakeRef).legacyPackages.x86_64-linux;'
+        echo '  try = attr: let r = builtins.tryEval (pkgs.${attr}.version or "?"); in if r.success then r.value else "?";'
+        echo 'in {'
+        for name in "${!current_versions[@]}"; do
+            # Escape any special characters in the attr name
+            echo "  \"$name\" = try \"$name\";"
+        done
+        echo '}'
+    } > "$tmpexpr"
+
+    # Single lazy eval — only touches .version thunks, no build
+    local eval_result
+    eval_result=$(nix eval --json --file "$tmpexpr" --apply "f: f \"$NIXPKGS_CHANNEL\"" 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$eval_result" ]; then
+        echo "0" > "$STATE_FILE"
+        echo "Eval failed" > "$LAST_RUN_TOOLTIP"
+        return 1
+    fi
+
+    # Compare versions using jq
+    local changed_json
+    changed_json=$(echo "$eval_result" | jq --argjson current "$(
+        printf '{'
+        local first=true
+        for name in "${!current_versions[@]}"; do
+            $first || printf ','
+            printf '"%s":"%s"' "$name" "${current_versions[$name]}"
+            first=false
+        done
+        printf '}'
+    )" '
+        [ to_entries[] |
+          select(.value != "?") |
+          select($current[.key] != null) |
+          select(.value != $current[.key]) |
+          {name: .key, current: $current[.key], new: .value}
+        ] | sort_by(.name)
+    ')
+
+    local update_count
+    update_count=$(echo "$changed_json" | jq 'length')
+    echo "$update_count" > "$STATE_FILE"
+    echo "$(date +%s)" > "$LAST_RUN_FILE"
+
+    if [ "$update_count" -eq 0 ]; then
+        echo "System updated" > "$LAST_RUN_TOOLTIP"
+    else
+        local tooltip_text
+        tooltip_text=$(echo "$changed_json" | jq -r '.[] | "\(.name): \(.current) → \(.new)"' | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
+        echo "$tooltip_text" > "$LAST_RUN_TOOLTIP"
+    fi
+
+    return 0
+}
+
+# ===== Toggle =====
+toggle_updates() {
+    if [ ! -f "$TOGGLE_FILE" ]; then
+        echo "enabled" > "$TOGGLE_FILE"
+    fi
+    if [ "$(cat "$TOGGLE_FILE")" = "enabled" ]; then
+        echo "disabled" > "$TOGGLE_FILE"
+    else
+        echo "enabled" > "$TOGGLE_FILE"
+    fi
+    pkill -x -RTMIN+12 .waybar-wrapped
+}
+
+# ===== Main =====
+main() {
+    # Disabled?
+    if [ -f "$TOGGLE_FILE" ] && [ "$(cat "$TOGGLE_FILE")" = "disabled" ]; then
+        local updates
+        updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+        local last_run
+        last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
+        local last_fmt="never"
+        [ "$last_run" != "0" ] && last_fmt=$(date -d "@$last_run" "+%Y-%m-%d %H:%M")
+        local existing
+        existing=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
+        if [ "$updates" = "0" ] || [ -z "$updates" ]; then
+            output_json "$updates" "disabled" "Updates disabled (Last checked: $last_fmt)"
+        elif [ -n "$existing" ] && [ "$existing" != "System updated" ]; then
+            output_json "$updates" "disabled" "Updates disabled (Last checked: $last_fmt)\\n=================================================\\n$existing"
+        else
+            output_json "$updates" "disabled" "Updates disabled ($updates pending)\\nLast checked: $last_fmt"
+        fi
+        exit 0
+    fi
+
+    # Grace period?
+    if [ "$SKIP_AFTER_BOOT" = "true" ] && check_boot_resume; then
+        local updates
+        updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+        if [ "$updates" -ne 0 ] 2>/dev/null; then
+            local tooltip
+            tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "$updates updates available")
+            output_json "$updates" "has-updates" "$tooltip"
+        else
+            output_json "0" "updated" "System updated"
+        fi
+        exit 0
+    fi
+
+    # Network?
+    if ! check_network; then
+        local updates
+        updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+        output_json "${updates:-0}" "updated" "No network connection"
+        exit 0
+    fi
+
+    # Check interval
+    local updates
+    updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+    local last_run
+    last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
+    local current_time
+    current_time=$(date +%s)
+
+    if [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
+        if check_for_updates_lightweight; then
+            updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+        else
+            output_json "?" "error" "Lightweight check failed"
+            exit 0
+        fi
+    fi
+
+    if [ "$updates" -ne 0 ] 2>/dev/null; then
+        local tooltip
+        tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "$updates updates available")
+        output_json "$updates" "has-updates" "$tooltip"
+    else
+        output_json "0" "updated" "System updated"
+    fi
+}
+
+# Error handler
+trap 'echo "{ \"text\":\"?\", \"alt\":\"error\", \"tooltip\":\"Script error\" }"' ERR
+
+if [ "$1" = "toggle" ]; then
+    toggle_updates
+else
+    main
+fi
