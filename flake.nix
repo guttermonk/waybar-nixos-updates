@@ -18,13 +18,6 @@
           
           src = ./.;
           
-          buildInputs = with pkgs; [
-            bash
-            coreutils
-            libnotify
-            nvd
-          ];
-          
           nativeBuildInputs = with pkgs; [
             makeWrapper
           ];
@@ -39,7 +32,9 @@
             
             # Install icons
             mkdir -p $out/share/icons/waybar-nixos-updates
-            cp -r .icons/* $out/share/icons/waybar-nixos-updates/
+            if [ -d .icons ]; then
+              cp -r .icons/* $out/share/icons/waybar-nixos-updates/
+            fi
             
             # Wrap the script with required dependencies
             wrapProgram $out/bin/update-checker \
@@ -62,7 +57,7 @@
           
           meta = with pkgs.lib; {
             description = "A Waybar update checking script for NixOS";
-            homepage = "https://github.com/yourusername/waybar-nixos-updates";
+            homepage = "https://github.com/guttermonk/waybar-nixos-updates";
             license = licenses.mit;
             maintainers = [ ];
             platforms = platforms.linux;
