@@ -68,16 +68,49 @@
             platforms = platforms.linux;
           };
         };
+
+        # Flake input checker: compares locked revs against upstream via git ls-remote
+        waybar-nixos-updates-inputs = pkgs.stdenv.mkDerivation {
+          pname = "waybar-nixos-updates-inputs";
+          version = "1.0.0";
+          src = ./.;
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out/bin
+            cp input-checker $out/bin/input-checker
+            chmod +x $out/bin/input-checker
+            wrapProgram $out/bin/input-checker \
+              --prefix PATH : ${pkgs.lib.makeBinPath [
+                pkgs.coreutils
+                pkgs.git
+                pkgs.jq
+              ]}
+            runHook postInstall
+          '';
+          meta = with pkgs.lib; {
+            description = "Flake input staleness checker for Waybar";
+            homepage = "https://github.com/guttermonk/waybar-nixos-updates";
+            license = licenses.mit;
+            platforms = platforms.linux;
+          };
+        };
       in
       {
         packages = {
           default = waybar-nixos-updates;
           waybar-nixos-updates = waybar-nixos-updates;
+          inputs = waybar-nixos-updates-inputs;
         };
         
         apps.default = flake-utils.lib.mkApp {
           drv = waybar-nixos-updates;
           name = "update-checker";
+        };
+
+        apps.inputs = flake-utils.lib.mkApp {
+          drv = waybar-nixos-updates-inputs;
+          name = "input-checker";
         };
       }) // {
         # Home-Manager module
