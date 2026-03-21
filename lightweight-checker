@@ -110,15 +110,40 @@ calc_next_update() {
 }
 
 # ===== Home-Manager Detection =====
-get_home_manager_profile() {
-    # Check common home-manager profile locations
-    if [ -d "$HOME/.nix-profile" ]; then
-        echo "$HOME/.nix-profile"
-    elif [ -d "/nix/var/nix/profiles/per-user/$USER/home-manager" ]; then
-        echo "/nix/var/nix/profiles/per-user/$USER/home-manager"
-    elif [ -d "/nix/var/nix/profiles/per-user/$USER/profile" ]; then
-        echo "/nix/var/nix/profiles/per-user/$USER/profile"
+get_home_manager_generation() {
+    # Try to find the current home-manager generation path
+    # Method 1: Parse home-manager generations command
+    if command -v home-manager >/dev/null 2>&1; then
+        local gen_path
+        gen_path=$(home-manager generations 2>/dev/null | head -1 | grep -oP '/nix/store/[a-z0-9]+-home-manager-generation')
+        if [ -n "$gen_path" ] && [ -d "$gen_path" ]; then
+            echo "$gen_path"
+            return 0
+        fi
     fi
+    
+    # Method 2: Check profile symlinks
+    local profile_path="/nix/var/nix/profiles/per-user/$USER/home-manager"
+    if [ -L "$profile_path" ]; then
+        local target
+        target=$(readlink -f "$profile_path" 2>/dev/null)
+        if [ -d "$target" ]; then
+            echo "$target"
+            return 0
+        fi
+    fi
+    
+    # Method 3: Check ~/.nix-profile if it points to home-manager
+    if [ -L "$HOME/.nix-profile" ]; then
+        local target
+        target=$(readlink -f "$HOME/.nix-profile" 2>/dev/null)
+        if [ -d "$target" ]; then
+            echo "$target"
+            return 0
+        fi
+    fi
+    
+    return 1
 }
 
 # ===== Flake Channel Detection =====
@@ -308,6 +333,7 @@ update_package_sources_cache() {
 
 get_package_channel() {
     local pkg_name="$1"
+    local pkg_lower="${pkg_name,,}"  # Convert to lowercase for comparison
     
     # If no config parsing, everything uses single channel
     if [ -z "$CONFIG_DIR" ] || [ ! -f "$PACKAGE_SOURCES_CACHE" ]; then
@@ -315,14 +341,14 @@ get_package_channel() {
         return
     fi
     
-    # Check if package is in unstable list
-    if jq -e --arg pkg "$pkg_name" '.unstable | index($pkg)' "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
+    # Check if package is in unstable list (case-insensitive)
+    if jq -e --arg pkg "$pkg_lower" '.unstable | map(ascii_downcase) | index($pkg)' "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
         echo "unstable"
         return
     fi
     
-    # Check if package is in stable list
-    if jq -e --arg pkg "$pkg_name" '.stable | index($pkg)' "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
+    # Check if package is in stable list (case-insensitive)
+    if jq -e --arg pkg "$pkg_lower" '.stable | map(ascii_downcase) | index($pkg)' "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
         echo "stable"
         return
     fi
@@ -334,41 +360,52 @@ get_package_channel() {
 # ===== Package Collection =====
 collect_installed_packages() {
     local -A packages
+    local -A package_display_names  # Maps lowercase -> original case
     
-    # Collect from system profile
-    while IFS= read -r entry; do
-        case "$entry" in *-man|*-bin|*-doc|*-info) continue ;; esac
-        case "$entry" in *unstable*) continue ;; esac
-        
-        local name version
-        if [[ "$entry" =~ ^([a-zA-Z0-9_][a-zA-Z0-9_.-]*)-([0-9].*)$ ]]; then
-            name="${BASH_REMATCH[1]}"
-            version="${BASH_REMATCH[2]}"
-            [ -z "${packages[$name]+x}" ] && packages[$name]="$version"
-        fi
-    done < <(nix-store -q --references /run/current-system/sw 2>/dev/null | sed 's|/nix/store/[a-z0-9]\{32\}-||')
-    
-    # Collect from home-manager profile (auto-detect)
-    local hm_profile
-    hm_profile=$(get_home_manager_profile)
-    
-    if [ -n "$hm_profile" ] && [ -d "$hm_profile" ]; then
+    # Helper to extract packages from store paths
+    extract_packages() {
         while IFS= read -r entry; do
-            case "$entry" in *-man|*-bin|*-doc|*-info) continue ;; esac
+            # Skip common suffixes that aren't the main package
+            case "$entry" in *-man|*-bin|*-doc|*-info|*-dev|*-lib) continue ;; esac
+            # Skip entries with "unstable" in the name (date-versioned)
             case "$entry" in *unstable*) continue ;; esac
             
-            local name version
+            local name version name_lower
             if [[ "$entry" =~ ^([a-zA-Z0-9_][a-zA-Z0-9_.-]*)-([0-9].*)$ ]]; then
                 name="${BASH_REMATCH[1]}"
                 version="${BASH_REMATCH[2]}"
-                [ -z "${packages[$name]+x}" ] && packages[$name]="$version"
+                name_lower="${name,,}"  # Convert to lowercase
+                # Deduplicate - keep first seen (usually the actual package, not deps)
+                if [ -z "${packages[$name_lower]+x}" ]; then
+                    packages[$name_lower]="$version"
+                    package_display_names[$name_lower]="$name"
+                fi
             fi
-        done < <(nix-store -q --references "$hm_profile" 2>/dev/null | sed 's|/nix/store/[a-z0-9]\{32\}-||')
+        done
+    }
+    
+    # Collect from system profile (direct references only)
+    extract_packages < <(nix-store -q --references /run/current-system/sw 2>/dev/null | sed 's|/nix/store/[a-z0-9]\{32\}-||')
+    
+    # Collect from home-manager generation (recursive to catch programs.* packages)
+    local hm_gen
+    hm_gen=$(get_home_manager_generation)
+    
+    if [ -n "$hm_gen" ]; then
+        # Use recursive query but filter to likely user packages
+        # We look for packages that match names in the parsed config, or common patterns
+        extract_packages < <(
+            nix-store -qR "$hm_gen" 2>/dev/null | \
+            sed 's|/nix/store/[a-z0-9]\{32\}-||' | \
+            grep -E '^[a-zA-Z][a-zA-Z0-9_-]*-[0-9]+\.' | \
+            sort -u
+        )
     fi
     
-    # Output as associative array format for eval
-    for name in "${!packages[@]}"; do
-        printf '%s\t%s\n' "$name" "${packages[$name]}"
+    # Output as tab-separated name/version/display_name triplets
+    for name_lower in "${!packages[@]}"; do
+        local display_name="${package_display_names[$name_lower]:-$name_lower}"
+        printf '%s\t%s\t%s\n' "$name_lower" "${packages[$name_lower]}" "$display_name"
     done
 }
 
@@ -402,8 +439,10 @@ check_for_updates_lightweight() {
     
     # Collect installed packages
     local -A current_versions
-    while IFS=$'\t' read -r name version; do
+    local -A display_names
+    while IFS=$'\t' read -r name version display_name; do
         current_versions[$name]="$version"
+        display_names[$name]="$display_name"
     done < <(collect_installed_packages)
     
     local pkg_count=${#current_versions[@]}
@@ -502,12 +541,21 @@ check_for_updates_lightweight() {
             first=false
         done
         printf '}'
+    )" --argjson display "$(
+        printf '{'
+        local first=true
+        for name in "${!display_names[@]}"; do
+            $first || printf ','
+            printf '"%s":"%s"' "$name" "${display_names[$name]}"
+            first=false
+        done
+        printf '}'
     )" '
         [ to_entries[] |
           select(.value.version != "?") |
           select($current[.key] != null) |
           select(.value.version != $current[.key]) |
-          {name: .key, current: $current[.key], new: .value.version, channel: .value.channel}
+          {name: .key, current: $current[.key], new: .value.version, channel: .value.channel, display: ($display[.key] // .key)}
         ] | sort_by(.name)
     ')
     
@@ -522,9 +570,9 @@ check_for_updates_lightweight() {
     else
         local tooltip_text
         if [ "$single_channel_mode" = true ]; then
-            tooltip_text=$(echo "$changed_json" | jq -r '.[] | "\(.name): \(.current) → \(.new)"' | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
+            tooltip_text=$(echo "$changed_json" | jq -r '.[] | "\(.display): \(.current) → \(.new)"' | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
         else
-            tooltip_text=$(echo "$changed_json" | jq -r '.[] | "\(.name): \(.current) → \(.new) (\(.channel))"' | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
+            tooltip_text=$(echo "$changed_json" | jq -r '.[] | "\(.display): \(.current) → \(.new) (\(.channel))"' | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
         fi
         echo "$tooltip_text" > "$LAST_RUN_TOOLTIP"
         
