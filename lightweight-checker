@@ -43,6 +43,7 @@ BOOT_MARKER_FILE="$CACHE_DIR/nix-update-boot-marker"
 TOGGLE_FILE="$CACHE_DIR/nix-update-toggle"
 PACKAGE_SOURCES_CACHE="$CACHE_DIR/nix-update-package-sources.json"
 FLAKE_LOCK_HASH_FILE="$CACHE_DIR/nix-update-flake-lock-hash"
+UPDATING_FLAG="$CACHE_DIR/nix-update-updating-flag"
 
 # ===== Initialize =====
 mkdir -p "$CACHE_DIR"
@@ -657,10 +658,31 @@ main() {
     current_time=$(date +%s)
 
     if [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
-        if check_for_updates_lightweight; then
-            updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+        # Separating updating and updated phase (like full mode)
+        if [ -f "$UPDATING_FLAG" ]; then
+            # Second phase: actually check for updates
+            if check_for_updates_lightweight; then
+                updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+            else
+                output_json "?" "error" "Lightweight check failed"
+                rm -f "$UPDATING_FLAG"
+                exit 0
+            fi
+            rm -f "$UPDATING_FLAG"
         else
-            output_json "?" "error" "Lightweight check failed"
+            # First phase: show "updating" state and trigger re-run
+            local existing_tooltip
+            existing_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || "")
+            local tooltip
+            if [ "$updates" != "0" ] && [ -n "$existing_tooltip" ] && [ "$existing_tooltip" != "System updated" ]; then
+                tooltip="Checking for updates... Previous check found:\\n=============================================\\n$existing_tooltip"
+            else
+                tooltip="Checking for updates..."
+            fi
+            touch "$UPDATING_FLAG"
+            output_json "$updates" "updating" "$tooltip"
+            # Signal waybar to refresh, which will trigger second phase
+            pkill -x -RTMIN+12 .waybar-wrapped
             exit 0
         fi
     else
