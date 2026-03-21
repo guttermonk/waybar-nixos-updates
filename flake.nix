@@ -82,6 +82,12 @@
             cp lightweight-checker $out/bin/lightweight-checker
             chmod +x $out/bin/lightweight-checker
             
+            # Install icons (for notifications)
+            mkdir -p $out/share/icons/waybar-nixos-updates
+            if [ -d .icons ]; then
+              cp -r .icons/* $out/share/icons/waybar-nixos-updates/
+            fi
+            
             wrapProgram $out/bin/lightweight-checker \
               --prefix PATH : ${pkgs.lib.makeBinPath [
                 pkgs.coreutils
@@ -93,7 +99,7 @@
                 pkgs.iproute2
                 pkgs.jq
                 pkgs.nixVersions.stable
-                pkgs.nix-output-monitor
+                pkgs.libnotify
               ]}
             
             runHook postInstall
@@ -153,6 +159,12 @@
                   "full" builds the new system closure and diffs with nvd (accurate, slow).
                   "lightweight" uses lazy nix eval of .version attributes (fast, approximate).
                 '';
+              };
+              
+              notifications = mkOption {
+                type = types.bool;
+                default = true;
+                description = "Whether to show desktop notifications for update checks.";
               };
               
               updateInterval = mkOption {
@@ -219,9 +231,11 @@
                 then [ self.packages.${pkgs.system}.lightweight ]
                 else [ cfg.package ];
               
-              # Install icons to user's home directory (full mode only)
-              home.file.".icons" = mkIf (!isLightweight) {
-                source = "${cfg.package}/share/icons/waybar-nixos-updates";
+              # Install icons to user's home directory
+              home.file.".icons" = {
+                source = if isLightweight
+                  then "${self.packages.${pkgs.system}.lightweight}/share/icons/waybar-nixos-updates"
+                  else "${cfg.package}/share/icons/waybar-nixos-updates";
                 recursive = true;
               };
               
@@ -234,6 +248,7 @@
                   export NIXPKGS_CHANNEL="${cfg.nixpkgsChannel}"
                   export SKIP_AFTER_BOOT="${if cfg.skipAfterBoot then "true" else "false"}"
                   export GRACE_PERIOD="${toString cfg.gracePeriod}"
+                  export NOTIFICATIONS_ENABLED="${if cfg.notifications then "true" else "false"}"
                   exec ${checkerBin} "$@"
                 '' else ''
                   #!/usr/bin/env bash
@@ -242,6 +257,7 @@
                   export SKIP_AFTER_BOOT="${if cfg.skipAfterBoot then "true" else "false"}"
                   export GRACE_PERIOD="${toString cfg.gracePeriod}"
                   export UPDATE_LOCK_FILE="${if cfg.updateLockFile then "true" else "false"}"
+                  export NOTIFICATIONS_ENABLED="${if cfg.notifications then "true" else "false"}"
                   exec ${checkerBin} "$@"
                 '';
               };

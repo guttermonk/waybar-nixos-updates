@@ -22,6 +22,7 @@ BOOT_MARKER_FILE="$CACHE_DIR/nix-update-boot-marker"
 TOGGLE_FILE="$CACHE_DIR/nix-update-toggle"
 SKIP_AFTER_BOOT="${SKIP_AFTER_BOOT:-true}"
 GRACE_PERIOD="${GRACE_PERIOD:-60}"
+NOTIFICATIONS_ENABLED="${NOTIFICATIONS_ENABLED:-true}"
 
 # ===== Initialize =====
 mkdir -p "$CACHE_DIR"
@@ -61,8 +62,39 @@ output_json() {
     echo "{ \"text\":\"$text\", \"alt\":\"$alt\", \"tooltip\":\"$tooltip\" }"
 }
 
+send_notification() {
+    # Skip if notifications are disabled
+    if [ "$NOTIFICATIONS_ENABLED" != "true" ]; then
+        return 0
+    fi
+    
+    local icon="$1"
+    local title="$2"
+    local message="$3"
+    local expire_flag="$4"
+    
+    # Check if notify-send is available
+    if command -v notify-send >/dev/null 2>&1; then
+        if [ -f "$HOME/.icons/$icon.png" ]; then
+            notify-send -i "$HOME/.icons/$icon.png" "$title" "$message" $expire_flag
+        else
+            notify-send "$title" "$message" $expire_flag
+        fi
+    fi
+}
+
+calc_next_update() {
+    local last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
+    local current_time=$(date +%s)
+    local next_update=$((UPDATE_INTERVAL - (current_time - last_run)))
+    local next_update_min=$((next_update / 60))
+    echo "$next_update_min"
+}
+
 # ===== Core: lightweight version check =====
 check_for_updates_lightweight() {
+    send_notification "updates-checking" "Checking for Updates" "Please be patient (lightweight mode)" -e
+    
     local tmpexpr
     tmpexpr=$(mktemp /tmp/nix-version-check-XXXXXX.nix)
     trap "rm -f '$tmpexpr'" RETURN
@@ -89,7 +121,9 @@ check_for_updates_lightweight() {
     local pkg_count=${#current_versions[@]}
     if [ "$pkg_count" -eq 0 ]; then
         echo "0" > "$STATE_FILE"
+        echo "$(date +%s)" > "$LAST_RUN_FILE"
         echo "System updated" > "$LAST_RUN_TOOLTIP"
+        send_notification "updates-complete" "Update Check Complete" "No packages found to check" -e
         return 0
     fi
 
@@ -113,6 +147,7 @@ check_for_updates_lightweight() {
     if [ $? -ne 0 ] || [ -z "$eval_result" ]; then
         echo "0" > "$STATE_FILE"
         echo "Eval failed" > "$LAST_RUN_TOOLTIP"
+        send_notification "updates-failed" "Update Check Failed" "Nix eval failed - check tooltip for details"
         return 1
     fi
 
@@ -143,10 +178,16 @@ check_for_updates_lightweight() {
 
     if [ "$update_count" -eq 0 ]; then
         echo "System updated" > "$LAST_RUN_TOOLTIP"
+        send_notification "updates-complete" "Update Check Complete" "No updates available" -e
     else
         local tooltip_text
         tooltip_text=$(echo "$changed_json" | jq -r '.[] | "\(.name): \(.current) → \(.new)"' | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
         echo "$tooltip_text" > "$LAST_RUN_TOOLTIP"
+        if [ "$update_count" -eq 1 ]; then
+            send_notification "updates-pending" "Update Check Complete" "Found 1 update" -e
+        else
+            send_notification "updates-pending" "Update Check Complete" "Found $update_count updates" -e
+        fi
     fi
 
     return 0
@@ -205,6 +246,7 @@ main() {
     if ! check_network; then
         local updates
         updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+        send_notification "updates-failed" "Update Check Failed" "Not connected to the internet"
         output_json "${updates:-0}" "updated" "No network connection"
         exit 0
     fi
@@ -223,6 +265,11 @@ main() {
         else
             output_json "?" "error" "Lightweight check failed"
             exit 0
+        fi
+    else
+        # Throttled - show wait notification if triggered manually
+        if [ -t 0 ]; then
+            send_notification "updates-wait" "Please Wait" "Next update is in $(calc_next_update) min." -e
         fi
     fi
 
