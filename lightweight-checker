@@ -155,14 +155,21 @@ get_channel_from_flake_lock() {
         return 1
     fi
     
-    # Get the locked revision for the input
-    local rev
-    rev=$(jq -r --arg name "$input_name" '
-        .nodes[$name].locked.rev // empty
+    # Get the original branch ref for the input (not the locked revision)
+    # This allows us to check for the latest updates on that branch
+    local ref owner repo
+    ref=$(jq -r --arg name "$input_name" '
+        .nodes[$name].original.ref // empty
+    ' "$flake_lock" 2>/dev/null)
+    owner=$(jq -r --arg name "$input_name" '
+        .nodes[$name].original.owner // "NixOS"
+    ' "$flake_lock" 2>/dev/null)
+    repo=$(jq -r --arg name "$input_name" '
+        .nodes[$name].original.repo // "nixpkgs"
     ' "$flake_lock" 2>/dev/null)
     
-    if [ -n "$rev" ]; then
-        echo "github:NixOS/nixpkgs/$rev"
+    if [ -n "$ref" ]; then
+        echo "github:$owner/$repo/$ref"
         return 0
     fi
     
@@ -387,18 +394,15 @@ collect_installed_packages() {
     # Collect from system profile (direct references only)
     extract_packages < <(nix-store -q --references /run/current-system/sw 2>/dev/null | sed 's|/nix/store/[a-z0-9]\{32\}-||')
     
-    # Collect from home-manager generation (recursive to catch programs.* packages)
+    # Collect from home-manager generation (direct references only, like system profile)
     local hm_gen
     hm_gen=$(get_home_manager_generation)
     
     if [ -n "$hm_gen" ]; then
-        # Use recursive query but filter to likely user packages
-        # We look for packages that match names in the parsed config, or common patterns
+        # Use direct references only to avoid counting transitive dependencies
         extract_packages < <(
-            nix-store -qR "$hm_gen" 2>/dev/null | \
-            sed 's|/nix/store/[a-z0-9]\{32\}-||' | \
-            grep -E '^[a-zA-Z][a-zA-Z0-9_-]*-[0-9]+\.' | \
-            sort -u
+            nix-store -q --references "$hm_gen" 2>/dev/null | \
+            sed 's|/nix/store/[a-z0-9]\{32\}-||'
         )
     fi
     
