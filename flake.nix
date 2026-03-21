@@ -138,7 +138,7 @@
             cfg = config.programs.waybar-nixos-updates;
             isLightweight = cfg.checkMode == "lightweight";
             checkerBin = if isLightweight
-              then "${self.packages.${pkgs.system}.lightweight}/bin/lightweight-checker"
+              then "${self.packages.${pkgs.stdenv.hostPlatform.system}.lightweight}/bin/lightweight-checker"
               else "${cfg.package}/bin/update-checker";
           in {
             options.programs.waybar-nixos-updates = {
@@ -146,7 +146,7 @@
               
               package = mkOption {
                 type = types.package;
-                default = self.packages.${pkgs.system}.waybar-nixos-updates;
+                default = self.packages.${pkgs.stdenv.hostPlatform.system}.waybar-nixos-updates;
                 defaultText = literalExpression "waybar-nixos-updates";
                 description = "The waybar-nixos-updates package to use.";
               };
@@ -256,13 +256,13 @@
             config = mkIf cfg.enable {
               home.packages =
                 if isLightweight
-                then [ self.packages.${pkgs.system}.lightweight ]
+                then [ self.packages.${pkgs.stdenv.hostPlatform.system}.lightweight ]
                 else [ cfg.package ];
               
               # Install icons to user's home directory
               home.file.".icons" = {
                 source = if isLightweight
-                  then "${self.packages.${pkgs.system}.lightweight}/share/icons/waybar-nixos-updates"
+                  then "${self.packages.${pkgs.stdenv.hostPlatform.system}.lightweight}/share/icons/waybar-nixos-updates"
                   else "${cfg.package}/share/icons/waybar-nixos-updates";
                 recursive = true;
               };
@@ -313,7 +313,7 @@
               
               package = mkOption {
                 type = types.package;
-                default = self.packages.${pkgs.system}.waybar-nixos-updates;
+                default = self.packages.${pkgs.stdenv.hostPlatform.system}.waybar-nixos-updates;
                 defaultText = literalExpression "waybar-nixos-updates";
                 description = "The waybar-nixos-updates package to use.";
               };
