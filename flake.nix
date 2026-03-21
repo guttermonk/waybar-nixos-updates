@@ -180,9 +180,37 @@
               };
               
               nixpkgsChannel = mkOption {
-                type = types.str;
+                type = types.either types.str (types.submodule {
+                  options = {
+                    configDir = mkOption {
+                      type = types.str;
+                      description = "Path to nix config directory to scan for package sources";
+                    };
+                    stable = mkOption {
+                      type = types.str;
+                      default = "pkgs";
+                      description = "Identifier used for stable packages (e.g., 'pkgs' matches 'with pkgs;' and 'pkgs.foo')";
+                    };
+                    unstable = mkOption {
+                      type = types.str;
+                      default = "pkgs-unstable";
+                      description = "Identifier used for unstable packages (e.g., 'pkgs-unstable' matches 'with pkgs-unstable;')";
+                    };
+                  };
+                });
                 default = "github:NixOS/nixpkgs/nixpkgs-unstable";
-                description = "Nixpkgs flake ref to check against (lightweight mode only)";
+                description = ''
+                  Nixpkgs channel configuration for lightweight mode.
+                  
+                  Simple (single channel): Set to a flake ref string like "github:NixOS/nixpkgs/nixpkgs-unstable"
+                  
+                  Dual channel: Set to an attrset with:
+                    - configDir: Path to scan for .nix files
+                    - stable: Identifier for stable packages (default: "pkgs")
+                    - unstable: Identifier for unstable packages (default: "pkgs-unstable")
+                  
+                  In dual channel mode, flake refs are auto-detected from flake.lock.
+                '';
               };
               
               skipAfterBoot = mkOption {
@@ -245,10 +273,17 @@
                 text = if isLightweight then ''
                   #!/usr/bin/env bash
                   export UPDATE_INTERVAL="${toString cfg.updateInterval}"
-                  export NIXPKGS_CHANNEL="${cfg.nixpkgsChannel}"
+                  export FLAKE_DIR="${cfg.nixosConfigPath}"
                   export SKIP_AFTER_BOOT="${if cfg.skipAfterBoot then "true" else "false"}"
                   export GRACE_PERIOD="${toString cfg.gracePeriod}"
                   export NOTIFICATIONS_ENABLED="${if cfg.notifications then "true" else "false"}"
+                  ${if builtins.isString cfg.nixpkgsChannel then ''
+                  export NIXPKGS_CHANNEL="${cfg.nixpkgsChannel}"
+                  '' else ''
+                  export CONFIG_DIR="${cfg.nixpkgsChannel.configDir}"
+                  export STABLE_IDENTIFIER="${cfg.nixpkgsChannel.stable}"
+                  export UNSTABLE_IDENTIFIER="${cfg.nixpkgsChannel.unstable}"
+                  ''}
                   exec ${checkerBin} "$@"
                 '' else ''
                   #!/usr/bin/env bash

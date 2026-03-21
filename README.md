@@ -49,7 +49,8 @@ The original approach that performs a complete system closure build and diff:
 A faster alternative using lazy Nix evaluation:
 - Compares `.version` attributes using a single `nix eval`
 - Completes in seconds rather than minutes
-- Only checks top-level packages in your system profile
+- Checks both NixOS system packages AND home-manager packages (auto-detected)
+- Supports single-channel or dual-channel (stable + unstable) configurations
 - ~80-85% attribute name coverage (some store paths don't map to nixpkgs attrs)
 - No transitive dependency tracking
 
@@ -104,8 +105,15 @@ This provides the most flexibility for configuration:
     nixosConfigPath = "~/.config/nixos";
     updateLockFile = false;         # Use temp dir for checks
     
-    # Lightweight mode options:
+    # Lightweight mode - Option A: Single channel (simple)
     nixpkgsChannel = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    
+    # Lightweight mode - Option B: Dual channel (for mixed stable/unstable)
+    # nixpkgsChannel = {
+    #   configDir = "~/.config/nixos";   # Scans all *.nix files
+    #   stable = "pkgs";                  # Matches: pkgs.foo, with pkgs; [...]
+    #   unstable = "pkgs-unstable";       # Matches: pkgs-unstable.foo, with pkgs-unstable; [...]
+    # };
     
     # Common options:
     skipAfterBoot = true;           # Skip checks after boot/resume
@@ -155,7 +163,22 @@ When using the Home Manager module, you can configure these options:
 - `updateLockFile`: Whether to update the lock file directly or use a temporary copy (default: false)
 
 **Lightweight mode only:**
-- `nixpkgsChannel`: Nixpkgs flake ref to check against (default: `github:NixOS/nixpkgs/nixpkgs-unstable`)
+- `nixpkgsChannel`: Either a single flake ref string, or an attrset for dual-channel mode:
+  - Simple (single channel): `"github:NixOS/nixpkgs/nixpkgs-unstable"`
+  - Dual channel (mixed stable/unstable):
+    ```nix
+    {
+      configDir = "~/.config/nixos";  # Directory to scan for .nix files
+      stable = "pkgs";                 # Identifier for stable packages
+      unstable = "pkgs-unstable";      # Identifier for unstable packages
+    }
+    ```
+  - In dual-channel mode, flake refs are auto-detected from your `flake.lock`
+
+**Lightweight mode features:**
+- **Home-manager packages**: Automatically detected and included (no config needed)
+- **Dual-channel support**: Parses your nix configs to determine which packages are stable vs unstable
+- **Caching**: Parse results are cached and only refreshed when `flake.lock` changes
 
 You can also modify these environment variables or set them at the top of the script to customize behavior:
 
@@ -166,7 +189,11 @@ You can also modify these environment variables or set them at the top of the sc
 - `SKIP_AFTER_BOOT`: Whether to skip update checks right after boot/resume (default: true)
 - `GRACE_PERIOD`: Time in seconds to wait after boot/resume before checking (default: 60)
 - `UPDATE_LOCK_FILE`: Whether to update the lock file directly or use a temporary copy (default: false)
-- `NIXPKGS_CHANNEL`: Nixpkgs flake ref to check against, lightweight mode only (default: github:NixOS/nixpkgs/nixpkgs-unstable)
+- `NIXPKGS_CHANNEL`: Nixpkgs flake ref for single-channel mode (default: github:NixOS/nixpkgs/nixpkgs-unstable)
+- `CONFIG_DIR`: Directory to scan for dual-channel mode (enables dual-channel when set)
+- `STABLE_IDENTIFIER`: Identifier for stable packages in dual-channel mode (default: "pkgs")
+- `UNSTABLE_IDENTIFIER`: Identifier for unstable packages in dual-channel mode (default: "pkgs-unstable")
+- `FLAKE_DIR`: Path to flake directory for auto-detecting channel refs (default: ~/.config/nixos)
 
 ### 🔄 Toggle Functionality
 The script supports toggling update checks on/off. When disabled, it will show the last known state without performing new checks:
@@ -258,11 +285,16 @@ Here's a complete example of using waybar-nixos-updates with Home Manager:
               checkMode = "lightweight";  # or "full" for complete accuracy
               updateInterval = 3600;
               notifications = true;       # set to false to disable notifications
-              # Full mode options:
-              # nixosConfigPath = "~/.config/nixos";
-              # updateLockFile = false;
-              # Lightweight mode options:
-              nixpkgsChannel = "github:NixOS/nixpkgs/nixpkgs-unstable";
+              
+              # For single-channel (all packages from one nixpkgs):
+              # nixpkgsChannel = "github:NixOS/nixpkgs/nixpkgs-unstable";
+              
+              # For dual-channel (mixed stable + unstable packages):
+              nixpkgsChannel = {
+                configDir = "~/.config/nixos";
+                stable = "pkgs";
+                unstable = "pkgs-unstable";
+              };
             };
             
             # Configure Waybar
