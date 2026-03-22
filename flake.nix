@@ -282,10 +282,13 @@
               # Create a wrapper script with user's configuration
               home.file.".config/waybar/scripts/update-checker" = {
                 executable = true;
-                text = if isLightweight then ''
+                text = let
+                  # Helper to expand ~ to $HOME in paths
+                  expandTilde = path: builtins.replaceStrings ["~"] ["\${HOME}"] path;
+                in if isLightweight then ''
                   #!/usr/bin/env bash
                   export UPDATE_INTERVAL="${toString cfg.updateInterval}"
-                  export FLAKE_DIR="${cfg.nixosConfigPath}"
+                  export FLAKE_DIR="${expandTilde cfg.nixosConfigPath}"
                   export SKIP_AFTER_BOOT="${if cfg.skipAfterBoot then "true" else "false"}"
                   export GRACE_PERIOD="${toString cfg.gracePeriod}"
                   export NOTIFICATIONS_ENABLED="${if cfg.notifications then "true" else "false"}"
@@ -295,7 +298,7 @@
                   export EXPLICIT_PACKAGES_ONLY="${if cfg.explicitPackagesOnly then "true" else "false"}"
                   '' else ""}
                   '' else ''
-                  export CONFIG_DIR="${cfg.nixpkgsChannel.configDir}"
+                  export CONFIG_DIR="${expandTilde cfg.nixpkgsChannel.configDir}"
                   export STABLE_IDENTIFIER="${cfg.nixpkgsChannel.stable}"
                   export UNSTABLE_IDENTIFIER="${cfg.nixpkgsChannel.unstable}"
                   ${if cfg.explicitPackagesOnly != null then ''
@@ -306,7 +309,7 @@
                 '' else ''
                   #!/usr/bin/env bash
                   export UPDATE_INTERVAL="${toString cfg.updateInterval}"
-                  export NIXOS_CONFIG_PATH="${cfg.nixosConfigPath}"
+                  export NIXOS_CONFIG_PATH="${expandTilde cfg.nixosConfigPath}"
                   export SKIP_AFTER_BOOT="${if cfg.skipAfterBoot then "true" else "false"}"
                   export GRACE_PERIOD="${toString cfg.gracePeriod}"
                   export UPDATE_LOCK_FILE="${if cfg.updateLockFile then "true" else "false"}"
