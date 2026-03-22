@@ -188,16 +188,23 @@ get_channel_from_flake_lock() {
         return 1
     fi
     
-    # Get the original branch ref for the input (not the locked revision)
+    # Follow input indirection: root.inputs.nixpkgs might point to "nixpkgs_10"
+    # First, resolve the actual node name from root inputs
+    local actual_node
+    actual_node=$(jq -r --arg name "$input_name" '
+        .nodes.root.inputs[$name] // $name
+    ' "$flake_lock" 2>/dev/null)
+    
+    # Get the original branch ref for the resolved node (not the locked revision)
     # This allows us to check for the latest updates on that branch
     local ref owner repo
-    ref=$(jq -r --arg name "$input_name" '
+    ref=$(jq -r --arg name "$actual_node" '
         .nodes[$name].original.ref // empty
     ' "$flake_lock" 2>/dev/null)
-    owner=$(jq -r --arg name "$input_name" '
+    owner=$(jq -r --arg name "$actual_node" '
         .nodes[$name].original.owner // "NixOS"
     ' "$flake_lock" 2>/dev/null)
-    repo=$(jq -r --arg name "$input_name" '
+    repo=$(jq -r --arg name "$actual_node" '
         .nodes[$name].original.repo // "nixpkgs"
     ' "$flake_lock" 2>/dev/null)
     
@@ -383,6 +390,75 @@ extract_explicit_packages() {
     sort -u
 }
 
+# Fast extraction of package-to-channel mapping
+# Uses grep instead of slow bash regex loops
+# Output: JSON with stable and unstable package lists
+extract_package_channels_fast() {
+    local config_dir="$1"
+    local stable_id="$2"
+    local unstable_id="$3"
+    
+    local stable_pkgs unstable_pkgs
+    local filter_pattern='^(lib|stdenv|system|config|mkDerivation|callPackage|fetchFromGitHub|writeText|runCommand|makeWrapper|override|overrideAttrs|url|follows)$'
+    
+    # Extract packages referenced with unstable identifier
+    # Pattern 1: pkgs-unstable.foo
+    # Pattern 2: (with pkgs-unstable; [ foo bar ]) blocks
+    unstable_pkgs=$(
+        {
+            # Pattern 1: Direct references like pkgs-unstable.foo
+            find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+            xargs -0 grep -hoE "${unstable_id}\\.[a-z][a-zA-Z0-9_-]+" 2>/dev/null | \
+            sed "s/^${unstable_id}\\.//"
+            
+            # Pattern 2: (with pkgs-unstable; [ ... ]) blocks
+            # Use Perl regex for non-greedy matching to handle nested content
+            # Strip comments before extracting to avoid false positives
+            find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+            xargs -0 sed 's/#.*//g' 2>/dev/null | \
+            tr '\n' ' ' | \
+            grep -oP "\(with\s+${unstable_id}\s*;\s*\[.*?\]\s*\)" 2>/dev/null | \
+            sed 's/.*\[//; s/\].*//' | \
+            tr ' ' '\n' | \
+            grep -E '^[a-z][a-zA-Z0-9_-]*$'
+        } | \
+        grep -vE "$filter_pattern" | \
+        sort -u | \
+        jq -R -s 'split("\n") | map(select(length > 0))'
+    )
+    
+    # Extract packages referenced with stable identifier
+    # Pattern 1: pkgs.foo (but not pkgs-unstable.foo)
+    # Pattern 2: (with pkgs; [ foo bar ]) blocks
+    stable_pkgs=$(
+        {
+            # Pattern 1: Direct references like pkgs.foo (excluding pkgs-unstable, pkgs-stable, etc.)
+            find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+            xargs -0 grep -hoP "(?<![a-zA-Z0-9_-])${stable_id}\\.[a-z][a-zA-Z0-9_-]+" 2>/dev/null | \
+            grep -v "^${stable_id}-" | \
+            sed "s/^${stable_id}\\.//"
+            
+            # Pattern 2: (with pkgs; [ ... ]) blocks (but not "with pkgs-unstable")
+            # Strip comments before extracting to avoid false positives
+            find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+            xargs -0 sed 's/#.*//g' 2>/dev/null | \
+            tr '\n' ' ' | \
+            grep -oP "\(with\s+${stable_id}\s*;\s*\[.*?\]\s*\)" 2>/dev/null | \
+            grep -v "${unstable_id}" | \
+            sed 's/.*\[//; s/\].*//' | \
+            tr ' ' '\n' | \
+            grep -E '^[a-z][a-zA-Z0-9_-]*$'
+        } | \
+        grep -vE "$filter_pattern" | \
+        sort -u | \
+        jq -R -s 'split("\n") | map(select(length > 0))'
+    )
+    
+    # Combine into JSON
+    jq -n --argjson stable "${stable_pkgs:-[]}" --argjson unstable "${unstable_pkgs:-[]}" \
+        '{stable: $stable, unstable: $unstable}'
+}
+
 # Check if a package name is in the explicit packages list (case-insensitive)
 is_explicit_package() {
     local pkg_name="$1"
@@ -405,16 +481,11 @@ update_package_sources_cache() {
     fi
     
     if should_reparse_config; then
-        # Only do expensive regex parsing if we need dual-channel info
-        # Skip it when EXPLICIT_PACKAGES_ONLY is true (we only need the package list)
-        if [ "$EXPLICIT_PACKAGES_ONLY" != "true" ]; then
-            local result
-            result=$(parse_nix_configs "$CONFIG_DIR" "$STABLE_IDENTIFIER" "$UNSTABLE_IDENTIFIER")
-            echo "$result" > "$PACKAGE_SOURCES_CACHE"
-        else
-            # Create empty cache to avoid re-parsing
-            echo '{"stable":[],"unstable":[]}' > "$PACKAGE_SOURCES_CACHE"
-        fi
+        # Always extract package-to-channel mapping for dual-channel support
+        # Use the fast grep-based extraction instead of slow bash regex loops
+        local result
+        result=$(extract_package_channels_fast "$CONFIG_DIR" "$STABLE_IDENTIFIER" "$UNSTABLE_IDENTIFIER")
+        echo "$result" > "$PACKAGE_SOURCES_CACHE"
         
         # Extract explicit packages for filtering (this is fast)
         extract_explicit_packages "$CONFIG_DIR" > "$EXPLICIT_PACKAGES_CACHE"
@@ -463,8 +534,8 @@ collect_installed_packages() {
     # Helper to extract packages from store paths
     extract_packages() {
         while IFS= read -r entry; do
-            # Skip common suffixes that aren't the main package
-            case "$entry" in *-man|*-bin|*-doc|*-info|*-dev|*-lib) continue ;; esac
+            # Skip common output suffixes that aren't the main package
+            case "$entry" in *-man|*-bin|*-doc|*-info|*-dev|*-lib|*-terminfo|*-debug|*-static) continue ;; esac
             # Skip entries with "unstable" in the name (date-versioned)
             case "$entry" in *unstable*) continue ;; esac
             
@@ -472,6 +543,14 @@ collect_installed_packages() {
             if [[ "$entry" =~ ^([a-zA-Z0-9_][a-zA-Z0-9_.-]*)-([0-9].*)$ ]]; then
                 name="${BASH_REMATCH[1]}"
                 version="${BASH_REMATCH[2]}"
+                
+                # Strip common output suffixes from version (e.g., "0.44.0-terminfo" -> "0.44.0")
+                version="${version%-terminfo}"
+                version="${version%-man}"
+                version="${version%-doc}"
+                version="${version%-debug}"
+                version="${version%-static}"
+                
                 name_lower="${name,,}"  # Convert to lowercase
                 # Deduplicate - keep first seen (usually the actual package, not deps)
                 if [ -z "${packages[$name_lower]+x}" ]; then
