@@ -231,6 +231,18 @@
                 description = "Whether to update the lock file directly or use a temporary copy (full mode only)";
               };
               
+              explicitPackagesOnly = mkOption {
+                type = types.nullOr types.bool;
+                default = null;
+                description = ''
+                  Only report updates for packages explicitly defined in your config files (lightweight mode only).
+                  This filters out system dependencies and provides more accurate results.
+                  
+                  Defaults to true when nixpkgsChannel is set to dual-channel mode (attrset with configDir),
+                  false otherwise. Set explicitly to override the default.
+                '';
+              };
+              
               waybarConfig = mkOption {
                 type = types.attrs;
                 default = {
@@ -279,10 +291,16 @@
                   export NOTIFICATIONS_ENABLED="${if cfg.notifications then "true" else "false"}"
                   ${if builtins.isString cfg.nixpkgsChannel then ''
                   export NIXPKGS_CHANNEL="${cfg.nixpkgsChannel}"
+                  ${if cfg.explicitPackagesOnly != null then ''
+                  export EXPLICIT_PACKAGES_ONLY="${if cfg.explicitPackagesOnly then "true" else "false"}"
+                  '' else ""}
                   '' else ''
                   export CONFIG_DIR="${cfg.nixpkgsChannel.configDir}"
                   export STABLE_IDENTIFIER="${cfg.nixpkgsChannel.stable}"
                   export UNSTABLE_IDENTIFIER="${cfg.nixpkgsChannel.unstable}"
+                  ${if cfg.explicitPackagesOnly != null then ''
+                  export EXPLICIT_PACKAGES_ONLY="${if cfg.explicitPackagesOnly then "true" else "false"}"
+                  '' else ""}
                   ''}
                   exec ${checkerBin} "$@"
                 '' else ''

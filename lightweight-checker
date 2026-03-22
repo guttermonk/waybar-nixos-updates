@@ -35,6 +35,15 @@ SKIP_AFTER_BOOT="${SKIP_AFTER_BOOT:-true}"
 GRACE_PERIOD="${GRACE_PERIOD:-60}"
 NOTIFICATIONS_ENABLED="${NOTIFICATIONS_ENABLED:-true}"
 
+# Filter to only packages explicitly defined in config files
+# This reduces false positives from system dependencies
+# Defaults to "true" when CONFIG_DIR is set, "false" otherwise
+if [ -n "$CONFIG_DIR" ]; then
+    EXPLICIT_PACKAGES_ONLY="${EXPLICIT_PACKAGES_ONLY:-true}"
+else
+    EXPLICIT_PACKAGES_ONLY="${EXPLICIT_PACKAGES_ONLY:-false}"
+fi
+
 # Cache and state files
 STATE_FILE="$CACHE_DIR/nix-update-state"
 LAST_RUN_FILE="$CACHE_DIR/nix-update-last-run"
@@ -44,6 +53,7 @@ TOGGLE_FILE="$CACHE_DIR/nix-update-toggle"
 PACKAGE_SOURCES_CACHE="$CACHE_DIR/nix-update-package-sources.json"
 FLAKE_LOCK_HASH_FILE="$CACHE_DIR/nix-update-flake-lock-hash"
 UPDATING_FLAG="$CACHE_DIR/nix-update-updating-flag"
+EXPLICIT_PACKAGES_CACHE="$CACHE_DIR/nix-update-explicit-packages.txt"
 
 # ===== Initialize =====
 mkdir -p "$CACHE_DIR"
@@ -113,18 +123,19 @@ calc_next_update() {
 # ===== Home-Manager Detection =====
 get_home_manager_generation() {
     # Try to find the current home-manager generation path
-    # Method 1: Parse home-manager generations command
-    if command -v home-manager >/dev/null 2>&1; then
-        local gen_path
-        gen_path=$(home-manager generations 2>/dev/null | head -1 | grep -oP '/nix/store/[a-z0-9]+-home-manager-generation')
-        if [ -n "$gen_path" ] && [ -d "$gen_path" ]; then
-            echo "$gen_path"
+    # Method 1: Check gcroots/current-home (most reliable, reflects actual current state)
+    local gcroots_path="$HOME/.local/state/home-manager/gcroots/current-home"
+    if [ -L "$gcroots_path" ]; then
+        local target
+        target=$(readlink -f "$gcroots_path" 2>/dev/null)
+        if [ -d "$target" ]; then
+            echo "$target"
             return 0
         fi
     fi
     
-    # Method 2: Check profile symlinks
-    local profile_path="/nix/var/nix/profiles/per-user/$USER/home-manager"
+    # Method 2: Check profile symlinks in ~/.local/state/nix/profiles
+    local profile_path="$HOME/.local/state/nix/profiles/home-manager"
     if [ -L "$profile_path" ]; then
         local target
         target=$(readlink -f "$profile_path" 2>/dev/null)
@@ -134,7 +145,28 @@ get_home_manager_generation() {
         fi
     fi
     
-    # Method 3: Check ~/.nix-profile if it points to home-manager
+    # Method 3: Check legacy profile location
+    local legacy_profile="/nix/var/nix/profiles/per-user/$USER/home-manager"
+    if [ -L "$legacy_profile" ]; then
+        local target
+        target=$(readlink -f "$legacy_profile" 2>/dev/null)
+        if [ -d "$target" ]; then
+            echo "$target"
+            return 0
+        fi
+    fi
+    
+    # Method 4: Parse home-manager generations command (fallback, may be stale)
+    if command -v home-manager >/dev/null 2>&1; then
+        local gen_path
+        gen_path=$(home-manager generations 2>/dev/null | head -1 | grep -oP '/nix/store/[a-z0-9]+-home-manager-generation')
+        if [ -n "$gen_path" ] && [ -d "$gen_path" ]; then
+            echo "$gen_path"
+            return 0
+        fi
+    fi
+    
+    # Method 5: Check ~/.nix-profile if it points to home-manager
     if [ -L "$HOME/.nix-profile" ]; then
         local target
         target=$(readlink -f "$HOME/.nix-profile" 2>/dev/null)
@@ -319,15 +351,73 @@ parse_nix_configs() {
     }
 }
 
+# Extract explicit package names from nix config files
+# This uses heuristics to find package names:
+# 1. Bare identifiers on their own lines (e.g., "  brave")
+# 2. Overlay definitions (e.g., "brave = prev.brave.override")
+# 3. Package references like "pkgs.brave" or "pkgs-unstable.brave"
+extract_explicit_packages() {
+    local config_dir="$1"
+    
+    # Common nix/shell keywords and non-package identifiers to filter out
+    local filter_pattern='^(done|else|fi|echo|then|in|let|true|false|null|if|with|import|inherit|rec|self|super|builtins|lib|pkgs|config|options|args|inputs|outputs|system|name|value|enable|default|description|type|example|services|programs|environment|systemd|networking|users|boot|hardware|security|nixpkgs|home|fonts|xdg|gtk|qt|wayland|hyprland|dconf|gnome|kde|prev|final|old|new|src|version|meta|license|homepage|maintainers|platforms|broken|sha256|hash|url|owner|repo|rev|fetchurl|fetchgit|fetchFromGitHub|mkDerivation|stdenv|buildInputs|nativeBuildInputs|propagatedBuildInputs|checkInputs|installPhase|buildPhase|configurePhase|postInstall|preInstall|postBuild|preBuild|makeWrapper|wrapProgram|substituteInPlace|patchShebangs|autoPatchelfHook|pkg|drv|result|override|overrideAttrs|callPackage|writeText|writeScript|writeShellScript|runCommand|symlinkJoin|makeDesktopItem|copyDesktopItems|wrapGAppsHook|gobject|glib|cairo|pango|atk|gdk|pixbuf)$'
+    
+    {
+        # Pattern 1: Bare identifiers on their own lines (e.g., "  brave  # comment")
+        find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+        xargs -0 grep -hE '^\s*[a-z][a-zA-Z0-9_-]*\s*(#.*)?$' 2>/dev/null | \
+        sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//'
+        
+        # Pattern 2: Overlay definitions (e.g., "brave = prev.brave.override")
+        find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+        xargs -0 grep -hE '^\s*[a-z][a-zA-Z0-9_-]+\s*=\s*(prev|final|old)\.[a-z]' 2>/dev/null | \
+        sed 's/^\s*//; s/\s*=.*//'
+        
+        # Pattern 3: Package references like "pkgs.brave" or "pkgs-unstable.yt-dlp"
+        find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+        xargs -0 grep -hoE '(pkgs|pkgs-unstable|pkgs-stable)\.[a-z][a-zA-Z0-9_-]+' 2>/dev/null | \
+        sed 's/^[^.]*\.//'
+    } | \
+    grep -v '^\s*$' | \
+    grep -vE "$filter_pattern" | \
+    sort -u
+}
+
+# Check if a package name is in the explicit packages list (case-insensitive)
+is_explicit_package() {
+    local pkg_name="$1"
+    local pkg_lower="${pkg_name,,}"
+    
+    # Check against cached explicit packages
+    if [ -f "$EXPLICIT_PACKAGES_CACHE" ]; then
+        # Case-insensitive grep
+        if grep -qi "^${pkg_lower}$" "$EXPLICIT_PACKAGES_CACHE" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
 update_package_sources_cache() {
     if [ -z "$CONFIG_DIR" ]; then
         return 1
     fi
     
     if should_reparse_config; then
-        local result
-        result=$(parse_nix_configs "$CONFIG_DIR" "$STABLE_IDENTIFIER" "$UNSTABLE_IDENTIFIER")
-        echo "$result" > "$PACKAGE_SOURCES_CACHE"
+        # Only do expensive regex parsing if we need dual-channel info
+        # Skip it when EXPLICIT_PACKAGES_ONLY is true (we only need the package list)
+        if [ "$EXPLICIT_PACKAGES_ONLY" != "true" ]; then
+            local result
+            result=$(parse_nix_configs "$CONFIG_DIR" "$STABLE_IDENTIFIER" "$UNSTABLE_IDENTIFIER")
+            echo "$result" > "$PACKAGE_SOURCES_CACHE"
+        else
+            # Create empty cache to avoid re-parsing
+            echo '{"stable":[],"unstable":[]}' > "$PACKAGE_SOURCES_CACHE"
+        fi
+        
+        # Extract explicit packages for filtering (this is fast)
+        extract_explicit_packages "$CONFIG_DIR" > "$EXPLICIT_PACKAGES_CACHE"
         
         # Update flake.lock hash
         local flake_lock="$FLAKE_DIR/flake.lock"
@@ -405,6 +495,16 @@ collect_installed_packages() {
             nix-store -q --references "$hm_gen" 2>/dev/null | \
             sed 's|/nix/store/[a-z0-9]\{32\}-||'
         )
+        
+        # Also check home-manager-path if it exists (contains user packages like brave)
+        local hm_path
+        hm_path=$(nix-store -q --references "$hm_gen" 2>/dev/null | grep "home-manager-path$" | head -1)
+        if [ -n "$hm_path" ]; then
+            extract_packages < <(
+                nix-store -q --references "$hm_path" 2>/dev/null | \
+                sed 's|/nix/store/[a-z0-9]\{32\}-||'
+            )
+        fi
     fi
     
     # Output as tab-separated name/version/display_name triplets
@@ -423,7 +523,6 @@ check_for_updates_lightweight() {
     local channel="$NIXPKGS_CHANNEL"
     
     if [ -n "$CONFIG_DIR" ]; then
-        single_channel_mode=false
         update_package_sources_cache
         
         if ! detect_channels_from_flake; then
@@ -432,6 +531,13 @@ check_for_updates_lightweight() {
             if [ -z "$channel" ]; then
                 channel="github:NixOS/nixpkgs/nixpkgs-unstable"
             fi
+        elif [ "$STABLE_CHANNEL" = "$UNSTABLE_CHANNEL" ]; then
+            # Both channels are the same, use single-channel mode for efficiency
+            single_channel_mode=true
+            channel="$STABLE_CHANNEL"
+        else
+            # Different channels, use dual-channel mode
+            single_channel_mode=false
         fi
     elif [ -z "$channel" ]; then
         # Try to auto-detect from flake.lock
@@ -563,6 +669,18 @@ check_for_updates_lightweight() {
           {name: .key, current: $current[.key], new: .value.version, channel: .value.channel, display: ($display[.key] // .key)}
         ] | sort_by(.name)
     ')
+    
+    # Filter to explicit packages only if enabled
+    if [ "$EXPLICIT_PACKAGES_ONLY" = "true" ] && [ -f "$EXPLICIT_PACKAGES_CACHE" ]; then
+        # Build a JSON array of lowercase explicit package names for filtering
+        local explicit_pkgs_json
+        explicit_pkgs_json=$(awk '{print tolower($0)}' "$EXPLICIT_PACKAGES_CACHE" | jq -R -s 'split("\n") | map(select(length > 0))')
+        
+        # Filter in a single jq call (case-insensitive)
+        changed_json=$(echo "$changed_json" | jq --argjson explicit "$explicit_pkgs_json" '
+            [ .[] | select((.name | ascii_downcase) as $n | $explicit | index($n)) ]
+        ')
+    fi
     
     local update_count
     update_count=$(echo "$changed_json" | jq 'length')

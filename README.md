@@ -62,6 +62,8 @@ A faster alternative using lazy Nix evaluation:
 | Added/removed pkgs | ✓ | ✗ |
 | Attr name coverage | 100% | ~80-85% |
 
+**Explicit Packages Filter**: When `CONFIG_DIR` is set, lightweight mode automatically enables `EXPLICIT_PACKAGES_ONLY` mode, which only reports updates for packages explicitly defined in your nix configuration files. This significantly reduces false positives from system dependencies and provides results closer to what full mode would report.
+
 Choose **lightweight** mode if you want quick, frequent checks and don't need to track transitive dependencies. Choose **full** mode if you need complete accuracy.
 
 ## 🚀 How to Use
@@ -190,7 +192,8 @@ You can also modify these environment variables or set them at the top of the sc
 - `GRACE_PERIOD`: Time in seconds to wait after boot/resume before checking (default: 60)
 - `UPDATE_LOCK_FILE`: Whether to update the lock file directly or use a temporary copy (default: false)
 - `NIXPKGS_CHANNEL`: Nixpkgs flake ref for single-channel mode (default: github:NixOS/nixpkgs/nixpkgs-unstable)
-- `CONFIG_DIR`: Directory to scan for dual-channel mode (enables dual-channel when set)
+- `CONFIG_DIR`: Directory to scan for package names (enables `EXPLICIT_PACKAGES_ONLY` when set)
+- `EXPLICIT_PACKAGES_ONLY`: Only report updates for packages explicitly in config files (default: "true" when `CONFIG_DIR` is set, "false" otherwise). This filters out system dependencies and provides more accurate results.
 - `STABLE_IDENTIFIER`: Identifier for stable packages in dual-channel mode (default: "pkgs")
 - `UNSTABLE_IDENTIFIER`: Identifier for unstable packages in dual-channel mode (default: "pkgs-unstable")
 - `FLAKE_DIR`: Path to flake directory for auto-detecting channel refs (default: ~/.config/nixos)
