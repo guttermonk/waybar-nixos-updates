@@ -4,9 +4,10 @@
 # This script checks for NixOS updates and outputs JSON for Waybar integration
 
     # ===== Configuration =====
-    UPDATE_INTERVAL=3599  # Check interval in seconds (1 hour)
-    NIXOS_CONFIG_PATH="$HOME/.config/nixos"  # Path to NixOS configuration
-    CACHE_DIR="$HOME/.cache"
+    UPDATE_INTERVAL="${UPDATE_INTERVAL:-3599}"  # Check interval in seconds (1 hour)
+    NIXOS_CONFIG_PATH="${NIXOS_CONFIG_PATH:-$HOME/.config/nixos}"  # Path to NixOS configuration
+    CACHE_DIR="${CACHE_DIR:-$HOME/.cache}"
+    NOTIFICATIONS_ENABLED="${NOTIFICATIONS_ENABLED:-true}"  # Set to "false" to disable desktop notifications
     STATE_FILE="$CACHE_DIR/nix-update-state"
     LAST_RUN_FILE="$CACHE_DIR/nix-update-last-run"
     LAST_RUN_TOOLTIP="$CACHE_DIR/nix-update-tooltip"
@@ -75,11 +76,24 @@
 
     # ===== Helper Functions =====
     function send_notification() {
+        # Skip if notifications are disabled
+        if [ "$NOTIFICATIONS_ENABLED" != "true" ]; then
+            return 0
+        fi
+        
         local icon="$1"
         local title="$2"
         local message="$3"
         local expire_flag="$4" # Optional fourth parameter for -e flag
-        notify-send -i "$HOME/.icons/$icon.png" "$title" "$message" $expire_flag
+        
+        # Check if notify-send is available
+        if command -v notify-send >/dev/null 2>&1; then
+            if [ -f "$HOME/.icons/$icon.png" ]; then
+                notify-send -i "$HOME/.icons/$icon.png" "$title" "$message" $expire_flag
+            else
+                notify-send "$title" "$message" $expire_flag
+            fi
+        fi
     }
 
     function check_boot_resume() {

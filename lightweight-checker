@@ -1,0 +1,911 @@
+#!/usr/bin/env bash
+
+# Lightweight NixOS Update Checker for Waybar
+# Uses lazy nix eval to compare package versions without a full build.
+# Checks .version attributes against nixpkgs — runs in seconds
+# rather than the minutes required by a full build + nvd diff.
+#
+# Features:
+#   - Supports single-channel or dual-channel (stable + unstable) mode
+#   - Auto-detects home-manager packages
+#   - Parses nix config files to determine package sources
+#   - Caches parse results for performance
+#
+# Tradeoffs vs full mode:
+#   - Only checks top-level packages in system/home-manager profiles
+#   - Some store names don't map to nixpkgs attr names (~15-20%)
+#   - No added/removed package detection
+#   - No transitive dependency tracking
+
+# ===== Configuration =====
+UPDATE_INTERVAL="${UPDATE_INTERVAL:-3599}"
+CACHE_DIR="${CACHE_DIR:-$HOME/.cache}"
+FLAKE_DIR="${FLAKE_DIR:-$HOME/.config/nixos}"
+
+# Single channel mode (simple)
+# Set to a flake ref like "github:NixOS/nixpkgs/nixpkgs-unstable"
+NIXPKGS_CHANNEL="${NIXPKGS_CHANNEL:-}"
+
+# Dual channel mode (advanced)
+# Set to "true" to enable dual-channel detection from flake.lock
+# When enabled, FLAKE_DIR is used to scan .nix files for package sources
+DUAL_CHANNEL_MODE="${DUAL_CHANNEL_MODE:-false}"
+STABLE_IDENTIFIER="${STABLE_IDENTIFIER:-pkgs}"
+UNSTABLE_IDENTIFIER="${UNSTABLE_IDENTIFIER:-pkgs-unstable}"
+
+# Other settings
+SKIP_AFTER_BOOT="${SKIP_AFTER_BOOT:-true}"
+GRACE_PERIOD="${GRACE_PERIOD:-60}"
+NOTIFICATIONS_ENABLED="${NOTIFICATIONS_ENABLED:-true}"
+
+# Filter to only packages explicitly defined in config files
+# This reduces false positives from system dependencies
+# Defaults to "true" when dual channel mode is enabled, "false" otherwise
+if [ "$DUAL_CHANNEL_MODE" = "true" ]; then
+    EXPLICIT_PACKAGES_ONLY="${EXPLICIT_PACKAGES_ONLY:-true}"
+else
+    EXPLICIT_PACKAGES_ONLY="${EXPLICIT_PACKAGES_ONLY:-false}"
+fi
+
+# Cache and state files
+STATE_FILE="$CACHE_DIR/nix-update-state"
+LAST_RUN_FILE="$CACHE_DIR/nix-update-last-run"
+LAST_RUN_TOOLTIP="$CACHE_DIR/nix-update-tooltip"
+BOOT_MARKER_FILE="$CACHE_DIR/nix-update-boot-marker"
+TOGGLE_FILE="$CACHE_DIR/nix-update-toggle"
+PACKAGE_SOURCES_CACHE="$CACHE_DIR/nix-update-package-sources.json"
+FLAKE_LOCK_HASH_FILE="$CACHE_DIR/nix-update-flake-lock-hash"
+UPDATING_FLAG="$CACHE_DIR/nix-update-updating-flag"
+EXPLICIT_PACKAGES_CACHE="$CACHE_DIR/nix-update-explicit-packages.txt"
+
+# ===== Initialize =====
+mkdir -p "$CACHE_DIR"
+[ -f "$STATE_FILE" ] || echo "0" > "$STATE_FILE"
+[ -f "$LAST_RUN_FILE" ] || echo "0" > "$LAST_RUN_FILE"
+[ -f "$LAST_RUN_TOOLTIP" ] || echo "System updated" > "$LAST_RUN_TOOLTIP"
+[ -f "$TOGGLE_FILE" ] || echo "enabled" > "$TOGGLE_FILE"
+
+# ===== Helpers =====
+send_notification() {
+    if [ "$NOTIFICATIONS_ENABLED" != "true" ]; then
+        return 0
+    fi
+    
+    local icon="$1"
+    local title="$2"
+    local message="$3"
+    local expire_flag="$4"
+    
+    if command -v notify-send >/dev/null 2>&1; then
+        if [ -f "$HOME/.icons/$icon.png" ]; then
+            notify-send -i "$HOME/.icons/$icon.png" "$title" "$message" $expire_flag
+        else
+            notify-send "$title" "$message" $expire_flag
+        fi
+    fi
+}
+
+check_boot_resume() {
+    local current_time
+    current_time=$(date +%s)
+    local uptime_seconds
+    uptime_seconds=$(awk '{print int($1)}' /proc/uptime)
+    local last_boot_time=$((current_time - uptime_seconds))
+
+    if [ ! -f "$BOOT_MARKER_FILE" ] || [ $((current_time - last_boot_time)) -lt "$GRACE_PERIOD" ]; then
+        echo "$current_time" > "$BOOT_MARKER_FILE"
+        return 0
+    fi
+    if [ -f "$BOOT_MARKER_FILE" ]; then
+        local marker_time
+        marker_time=$(cat "$BOOT_MARKER_FILE")
+        if [[ "$marker_time" =~ ^[0-9]+$ ]] && [ $((current_time - marker_time)) -lt "$GRACE_PERIOD" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+check_network() {
+    ip route | grep -q "^default" && ip -4 addr show | grep -qE "inet .* scope global"
+}
+
+output_json() {
+    local text="$1" alt="$2" tooltip="$3"
+    echo "{ \"text\":\"$text\", \"alt\":\"$alt\", \"tooltip\":\"$tooltip\" }"
+}
+
+calc_next_update() {
+    local last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
+    local current_time=$(date +%s)
+    local next_update=$((UPDATE_INTERVAL - (current_time - last_run)))
+    local next_update_min=$((next_update / 60))
+    echo "$next_update_min"
+}
+
+# ===== Home-Manager Detection =====
+get_home_manager_generation() {
+    # Try to find the current home-manager generation path
+    # Method 1: Check gcroots/current-home (most reliable, reflects actual current state)
+    local gcroots_path="$HOME/.local/state/home-manager/gcroots/current-home"
+    if [ -L "$gcroots_path" ]; then
+        local target
+        target=$(readlink -f "$gcroots_path" 2>/dev/null)
+        if [ -d "$target" ]; then
+            echo "$target"
+            return 0
+        fi
+    fi
+    
+    # Method 2: Check profile symlinks in ~/.local/state/nix/profiles
+    local profile_path="$HOME/.local/state/nix/profiles/home-manager"
+    if [ -L "$profile_path" ]; then
+        local target
+        target=$(readlink -f "$profile_path" 2>/dev/null)
+        if [ -d "$target" ]; then
+            echo "$target"
+            return 0
+        fi
+    fi
+    
+    # Method 3: Check legacy profile location
+    local legacy_profile="/nix/var/nix/profiles/per-user/$USER/home-manager"
+    if [ -L "$legacy_profile" ]; then
+        local target
+        target=$(readlink -f "$legacy_profile" 2>/dev/null)
+        if [ -d "$target" ]; then
+            echo "$target"
+            return 0
+        fi
+    fi
+    
+    # Method 4: Parse home-manager generations command (fallback, may be stale)
+    if command -v home-manager >/dev/null 2>&1; then
+        local gen_path
+        gen_path=$(home-manager generations 2>/dev/null | head -1 | grep -oP '/nix/store/[a-z0-9]+-home-manager-generation')
+        if [ -n "$gen_path" ] && [ -d "$gen_path" ]; then
+            echo "$gen_path"
+            return 0
+        fi
+    fi
+    
+    # Method 5: Check ~/.nix-profile if it points to home-manager
+    if [ -L "$HOME/.nix-profile" ]; then
+        local target
+        target=$(readlink -f "$HOME/.nix-profile" 2>/dev/null)
+        if [ -d "$target" ]; then
+            echo "$target"
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+# ===== Flake Channel Detection =====
+get_channel_from_flake_lock() {
+    local input_name="$1"
+    local flake_lock="$FLAKE_DIR/flake.lock"
+    
+    if [ ! -f "$flake_lock" ]; then
+        return 1
+    fi
+    
+    # Follow input indirection: root.inputs.nixpkgs might point to "nixpkgs_10"
+    # First, resolve the actual node name from root inputs
+    local actual_node
+    actual_node=$(jq -r --arg name "$input_name" '
+        .nodes.root.inputs[$name] // $name
+    ' "$flake_lock" 2>/dev/null)
+    
+    # Get the original branch ref for the resolved node (not the locked revision)
+    # This allows us to check for the latest updates on that branch
+    local ref owner repo
+    ref=$(jq -r --arg name "$actual_node" '
+        .nodes[$name].original.ref // empty
+    ' "$flake_lock" 2>/dev/null)
+    owner=$(jq -r --arg name "$actual_node" '
+        .nodes[$name].original.owner // "NixOS"
+    ' "$flake_lock" 2>/dev/null)
+    repo=$(jq -r --arg name "$actual_node" '
+        .nodes[$name].original.repo // "nixpkgs"
+    ' "$flake_lock" 2>/dev/null)
+    
+    if [ -n "$ref" ]; then
+        echo "github:$owner/$repo/$ref"
+        return 0
+    fi
+    
+    return 1
+}
+
+detect_channels_from_flake() {
+    local flake_lock="$FLAKE_DIR/flake.lock"
+    
+    if [ ! -f "$flake_lock" ]; then
+        return 1
+    fi
+    
+    # Find nixpkgs and nixpkgs-unstable inputs
+    STABLE_CHANNEL=$(get_channel_from_flake_lock "nixpkgs")
+    UNSTABLE_CHANNEL=$(get_channel_from_flake_lock "nixpkgs-unstable")
+    
+    # If only one channel found, use it for both
+    if [ -z "$STABLE_CHANNEL" ] && [ -n "$UNSTABLE_CHANNEL" ]; then
+        STABLE_CHANNEL="$UNSTABLE_CHANNEL"
+    elif [ -n "$STABLE_CHANNEL" ] && [ -z "$UNSTABLE_CHANNEL" ]; then
+        UNSTABLE_CHANNEL="$STABLE_CHANNEL"
+    elif [ -z "$STABLE_CHANNEL" ] && [ -z "$UNSTABLE_CHANNEL" ]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# ===== Config Parsing =====
+should_reparse_config() {
+    local flake_lock="$FLAKE_DIR/flake.lock"
+    
+    # No cache exists
+    [ ! -f "$PACKAGE_SOURCES_CACHE" ] && return 0
+    [ ! -f "$FLAKE_LOCK_HASH_FILE" ] && return 0
+    
+    # flake.lock changed (indicates rebuild)
+    if [ -f "$flake_lock" ]; then
+        local current_hash
+        current_hash=$(md5sum "$flake_lock" 2>/dev/null | cut -d' ' -f1)
+        local cached_hash
+        cached_hash=$(cat "$FLAKE_LOCK_HASH_FILE" 2>/dev/null)
+        
+        if [ "$current_hash" != "$cached_hash" ]; then
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+parse_nix_configs() {
+    local config_dir="$1"
+    local stable_id="$2"
+    local unstable_id="$3"
+    
+    local -A stable_packages
+    local -A unstable_packages
+    
+    # Find all .nix files
+    while IFS= read -r -d '' nix_file; do
+        # Read file content, strip comments
+        local content
+        content=$(sed 's/#.*$//' "$nix_file" 2>/dev/null | tr '\n' ' ')
+        
+        # Pattern 1: Direct references like pkgs-unstable.zed-editor or pkgs.bat
+        # Match unstable pattern (must check first to avoid partial match)
+        while [[ "$content" =~ ${unstable_id}\.([a-zA-Z0-9_-]+) ]]; do
+            local pkg="${BASH_REMATCH[1]}"
+            # Skip common non-package attributes
+            case "$pkg" in
+                lib|stdenv|system|config|mkDerivation|callPackage|fetchFromGitHub|writeText|runCommand|makeWrapper|buildInputs|nativeBuildInputs|override|overrideAttrs)
+                    ;;
+                *)
+                    unstable_packages["$pkg"]=1
+                    ;;
+            esac
+            content="${content/${BASH_REMATCH[0]}/}"
+        done
+        
+        # Match stable pattern (use word boundary to avoid matching pkgs-unstable)
+        # We use a negative lookahead equivalent by checking the pattern more carefully
+        local stable_pattern="([^a-zA-Z0-9_-]|^)${stable_id}\\.([a-zA-Z0-9_-]+)"
+        while [[ "$content" =~ $stable_pattern ]]; do
+            local pkg="${BASH_REMATCH[2]}"
+            case "$pkg" in
+                lib|stdenv|system|config|mkDerivation|callPackage|fetchFromGitHub|writeText|runCommand|makeWrapper|buildInputs|nativeBuildInputs|override|overrideAttrs)
+                    ;;
+                *)
+                    # Only add if not already marked as unstable
+                    [ -z "${unstable_packages[$pkg]+x}" ] && stable_packages["$pkg"]=1
+                    ;;
+            esac
+            content="${content/${BASH_REMATCH[0]}/}"
+        done
+        
+        # Pattern 2: List blocks like "with pkgs-unstable; [" or "(with pkgs; ["
+        # Extract unstable list blocks
+        local unstable_list_pattern="with[[:space:]]+${unstable_id}[[:space:]]*;[[:space:]]*\\[([^]]+)\\]"
+        while [[ "$content" =~ $unstable_list_pattern ]]; do
+            local list_content="${BASH_REMATCH[1]}"
+            # Extract identifiers from the list
+            for pkg in $list_content; do
+                # Clean up the package name
+                pkg=$(echo "$pkg" | tr -d '(),' | grep -oE '^[a-zA-Z][a-zA-Z0-9_-]*$')
+                if [ -n "$pkg" ]; then
+                    unstable_packages["$pkg"]=1
+                fi
+            done
+            content="${content/${BASH_REMATCH[0]}/}"
+        done
+        
+        # Extract stable list blocks
+        local stable_list_pattern="with[[:space:]]+${stable_id}[[:space:]]*;[[:space:]]*\\[([^]]+)\\]"
+        while [[ "$content" =~ $stable_list_pattern ]]; do
+            local list_content="${BASH_REMATCH[1]}"
+            for pkg in $list_content; do
+                pkg=$(echo "$pkg" | tr -d '(),' | grep -oE '^[a-zA-Z][a-zA-Z0-9_-]*$')
+                if [ -n "$pkg" ]; then
+                    [ -z "${unstable_packages[$pkg]+x}" ] && stable_packages["$pkg"]=1
+                fi
+            done
+            content="${content/${BASH_REMATCH[0]}/}"
+        done
+        
+    done < <(find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null)
+    
+    # Output as JSON
+    {
+        printf '{"stable":['
+        local first=true
+        for pkg in "${!stable_packages[@]}"; do
+            $first || printf ','
+            printf '"%s"' "$pkg"
+            first=false
+        done
+        printf '],"unstable":['
+        first=true
+        for pkg in "${!unstable_packages[@]}"; do
+            $first || printf ','
+            printf '"%s"' "$pkg"
+            first=false
+        done
+        printf ']}'
+    }
+}
+
+# Extract explicit package names from nix config files
+# This uses heuristics to find package names:
+# 1. Bare identifiers on their own lines (e.g., "  brave")
+# 2. Overlay definitions (e.g., "brave = prev.brave.override")
+# 3. Package references like "pkgs.brave" or "pkgs-unstable.brave"
+extract_explicit_packages() {
+    local config_dir="$1"
+    
+    # Common nix/shell keywords and non-package identifiers to filter out
+    local filter_pattern='^(done|else|fi|echo|then|in|let|true|false|null|if|with|import|inherit|rec|self|super|builtins|lib|pkgs|config|options|args|inputs|outputs|system|name|value|enable|default|description|type|example|services|programs|environment|systemd|networking|users|boot|hardware|security|nixpkgs|home|fonts|xdg|gtk|qt|wayland|hyprland|dconf|gnome|kde|prev|final|old|new|src|version|meta|license|homepage|maintainers|platforms|broken|sha256|hash|url|owner|repo|rev|fetchurl|fetchgit|fetchFromGitHub|mkDerivation|stdenv|buildInputs|nativeBuildInputs|propagatedBuildInputs|checkInputs|installPhase|buildPhase|configurePhase|postInstall|preInstall|postBuild|preBuild|makeWrapper|wrapProgram|substituteInPlace|patchShebangs|autoPatchelfHook|pkg|drv|result|override|overrideAttrs|callPackage|writeText|writeScript|writeShellScript|runCommand|symlinkJoin|makeDesktopItem|copyDesktopItems|wrapGAppsHook|gobject|glib|cairo|pango|atk|gdk|pixbuf)$'
+    
+    {
+        # Pattern 1: Bare identifiers on their own lines (e.g., "  brave  # comment")
+        find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+        xargs -0 grep -hE '^\s*[a-z][a-zA-Z0-9_-]*\s*(#.*)?$' 2>/dev/null | \
+        sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//'
+        
+        # Pattern 2: Overlay definitions (e.g., "brave = prev.brave.override")
+        find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+        xargs -0 grep -hE '^\s*[a-z][a-zA-Z0-9_-]+\s*=\s*(prev|final|old)\.[a-z]' 2>/dev/null | \
+        sed 's/^\s*//; s/\s*=.*//'
+        
+        # Pattern 3: Package references like "pkgs.brave" or "pkgs-unstable.yt-dlp"
+        find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+        xargs -0 grep -hoE '(pkgs|pkgs-unstable|pkgs-stable)\.[a-z][a-zA-Z0-9_-]+' 2>/dev/null | \
+        sed 's/^[^.]*\.//'
+    } | \
+    grep -v '^\s*$' | \
+    grep -vE "$filter_pattern" | \
+    sort -u
+}
+
+# Fast extraction of package-to-channel mapping
+# Uses grep instead of slow bash regex loops
+# Output: JSON with stable and unstable package lists
+extract_package_channels_fast() {
+    local config_dir="$1"
+    local stable_id="$2"
+    local unstable_id="$3"
+    
+    local stable_pkgs unstable_pkgs
+    local filter_pattern='^(lib|stdenv|system|config|mkDerivation|callPackage|fetchFromGitHub|writeText|runCommand|makeWrapper|override|overrideAttrs|url|follows)$'
+    
+    # Extract packages referenced with unstable identifier
+    # Pattern 1: pkgs-unstable.foo
+    # Pattern 2: (with pkgs-unstable; [ foo bar ]) blocks
+    unstable_pkgs=$(
+        {
+            # Pattern 1: Direct references like pkgs-unstable.foo
+            find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+            xargs -0 grep -hoE "${unstable_id}\\.[a-z][a-zA-Z0-9_-]+" 2>/dev/null | \
+            sed "s/^${unstable_id}\\.//"
+            
+            # Pattern 2: (with pkgs-unstable; [ ... ]) blocks
+            # Use Perl regex for non-greedy matching to handle nested content
+            # Strip comments before extracting to avoid false positives
+            find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+            xargs -0 sed 's/#.*//g' 2>/dev/null | \
+            tr '\n' ' ' | \
+            grep -oP "\(with\s+${unstable_id}\s*;\s*\[.*?\]\s*\)" 2>/dev/null | \
+            sed 's/.*\[//; s/\].*//' | \
+            tr ' ' '\n' | \
+            grep -E '^[a-z][a-zA-Z0-9_-]*$'
+        } | \
+        grep -vE "$filter_pattern" | \
+        sort -u | \
+        jq -R -s 'split("\n") | map(select(length > 0))'
+    )
+    
+    # Extract packages referenced with stable identifier
+    # Pattern 1: pkgs.foo (but not pkgs-unstable.foo)
+    # Pattern 2: (with pkgs; [ foo bar ]) blocks
+    stable_pkgs=$(
+        {
+            # Pattern 1: Direct references like pkgs.foo (excluding pkgs-unstable, pkgs-stable, etc.)
+            find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+            xargs -0 grep -hoP "(?<![a-zA-Z0-9_-])${stable_id}\\.[a-z][a-zA-Z0-9_-]+" 2>/dev/null | \
+            grep -v "^${stable_id}-" | \
+            sed "s/^${stable_id}\\.//"
+            
+            # Pattern 2: (with pkgs; [ ... ]) blocks (but not "with pkgs-unstable")
+            # Strip comments before extracting to avoid false positives
+            find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+            xargs -0 sed 's/#.*//g' 2>/dev/null | \
+            tr '\n' ' ' | \
+            grep -oP "\(with\s+${stable_id}\s*;\s*\[.*?\]\s*\)" 2>/dev/null | \
+            grep -v "${unstable_id}" | \
+            sed 's/.*\[//; s/\].*//' | \
+            tr ' ' '\n' | \
+            grep -E '^[a-z][a-zA-Z0-9_-]*$'
+        } | \
+        grep -vE "$filter_pattern" | \
+        sort -u | \
+        jq -R -s 'split("\n") | map(select(length > 0))'
+    )
+    
+    # Combine into JSON
+    jq -n --argjson stable "${stable_pkgs:-[]}" --argjson unstable "${unstable_pkgs:-[]}" \
+        '{stable: $stable, unstable: $unstable}'
+}
+
+# Check if a package name is in the explicit packages list (case-insensitive)
+is_explicit_package() {
+    local pkg_name="$1"
+    local pkg_lower="${pkg_name,,}"
+    
+    # Check against cached explicit packages
+    if [ -f "$EXPLICIT_PACKAGES_CACHE" ]; then
+        # Case-insensitive grep
+        if grep -qi "^${pkg_lower}$" "$EXPLICIT_PACKAGES_CACHE" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+update_package_sources_cache() {
+    if [ "$DUAL_CHANNEL_MODE" != "true" ]; then
+        return 1
+    fi
+    
+    if should_reparse_config; then
+        # Always extract package-to-channel mapping for dual-channel support
+        # Use the fast grep-based extraction instead of slow bash regex loops
+        local result
+        result=$(extract_package_channels_fast "$FLAKE_DIR" "$STABLE_IDENTIFIER" "$UNSTABLE_IDENTIFIER")
+        echo "$result" > "$PACKAGE_SOURCES_CACHE"
+        
+        # Extract explicit packages for filtering (this is fast)
+        extract_explicit_packages "$FLAKE_DIR" > "$EXPLICIT_PACKAGES_CACHE"
+        
+        # Update flake.lock hash
+        local flake_lock="$FLAKE_DIR/flake.lock"
+        if [ -f "$flake_lock" ]; then
+            md5sum "$flake_lock" 2>/dev/null | cut -d' ' -f1 > "$FLAKE_LOCK_HASH_FILE"
+        fi
+    fi
+    
+    return 0
+}
+
+get_package_channel() {
+    local pkg_name="$1"
+    local pkg_lower="${pkg_name,,}"  # Convert to lowercase for comparison
+    
+    # If no config parsing, everything uses single channel
+    if [ "$DUAL_CHANNEL_MODE" != "true" ] || [ ! -f "$PACKAGE_SOURCES_CACHE" ]; then
+        echo "single"
+        return
+    fi
+    
+    # Check if package is in unstable list (case-insensitive)
+    if jq -e --arg pkg "$pkg_lower" '.unstable | map(ascii_downcase) | index($pkg)' "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
+        echo "unstable"
+        return
+    fi
+    
+    # Check if package is in stable list (case-insensitive)
+    if jq -e --arg pkg "$pkg_lower" '.stable | map(ascii_downcase) | index($pkg)' "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
+        echo "stable"
+        return
+    fi
+    
+    # Unknown - default to stable
+    echo "stable"
+}
+
+# ===== Package Collection =====
+collect_installed_packages() {
+    local -A packages
+    local -A package_display_names  # Maps lowercase -> original case
+    
+    # Helper to extract packages from store paths
+    extract_packages() {
+        while IFS= read -r entry; do
+            # Skip common output suffixes that aren't the main package
+            case "$entry" in *-man|*-bin|*-doc|*-info|*-dev|*-lib|*-terminfo|*-debug|*-static) continue ;; esac
+            # Skip entries with "unstable" in the name (date-versioned)
+            case "$entry" in *unstable*) continue ;; esac
+            
+            local name version name_lower
+            if [[ "$entry" =~ ^([a-zA-Z0-9_][a-zA-Z0-9_.-]*)-([0-9].*)$ ]]; then
+                name="${BASH_REMATCH[1]}"
+                version="${BASH_REMATCH[2]}"
+                
+                # Strip common output suffixes from version (e.g., "0.44.0-terminfo" -> "0.44.0")
+                version="${version%-terminfo}"
+                version="${version%-man}"
+                version="${version%-doc}"
+                version="${version%-debug}"
+                version="${version%-static}"
+                
+                name_lower="${name,,}"  # Convert to lowercase
+                # Deduplicate - keep first seen (usually the actual package, not deps)
+                if [ -z "${packages[$name_lower]+x}" ]; then
+                    packages[$name_lower]="$version"
+                    package_display_names[$name_lower]="$name"
+                fi
+            fi
+        done
+    }
+    
+    # Collect from system profile (direct references only)
+    extract_packages < <(nix-store -q --references /run/current-system/sw 2>/dev/null | sed 's|/nix/store/[a-z0-9]\{32\}-||')
+    
+    # Collect from home-manager generation (direct references only, like system profile)
+    local hm_gen
+    hm_gen=$(get_home_manager_generation)
+    
+    if [ -n "$hm_gen" ]; then
+        # Use direct references only to avoid counting transitive dependencies
+        extract_packages < <(
+            nix-store -q --references "$hm_gen" 2>/dev/null | \
+            sed 's|/nix/store/[a-z0-9]\{32\}-||'
+        )
+        
+        # Also check home-manager-path if it exists (contains user packages like brave)
+        local hm_path
+        hm_path=$(nix-store -q --references "$hm_gen" 2>/dev/null | grep "home-manager-path$" | head -1)
+        if [ -n "$hm_path" ]; then
+            extract_packages < <(
+                nix-store -q --references "$hm_path" 2>/dev/null | \
+                sed 's|/nix/store/[a-z0-9]\{32\}-||'
+            )
+        fi
+    fi
+    
+    # Output as tab-separated name/version/display_name triplets
+    for name_lower in "${!packages[@]}"; do
+        local display_name="${package_display_names[$name_lower]:-$name_lower}"
+        printf '%s\t%s\t%s\n' "$name_lower" "${packages[$name_lower]}" "$display_name"
+    done
+}
+
+# ===== Core: lightweight version check =====
+check_for_updates_lightweight() {
+    send_notification "updates-checking" "Checking for Updates" "Please be patient (lightweight mode)" -e
+    
+    # Determine mode and channels
+    local single_channel_mode=true
+    local channel="$NIXPKGS_CHANNEL"
+    
+    if [ "$DUAL_CHANNEL_MODE" = "true" ]; then
+        update_package_sources_cache
+        
+        if ! detect_channels_from_flake; then
+            # Fallback to single channel if detection fails
+            single_channel_mode=true
+            if [ -z "$channel" ]; then
+                channel="github:NixOS/nixpkgs/nixpkgs-unstable"
+            fi
+        elif [ "$STABLE_CHANNEL" = "$UNSTABLE_CHANNEL" ]; then
+            # Both channels are the same, use single-channel mode for efficiency
+            single_channel_mode=true
+            channel="$STABLE_CHANNEL"
+        else
+            # Different channels, use dual-channel mode
+            single_channel_mode=false
+        fi
+    elif [ -z "$channel" ]; then
+        # Try to auto-detect from flake.lock
+        if detect_channels_from_flake; then
+            channel="$STABLE_CHANNEL"
+        else
+            channel="github:NixOS/nixpkgs/nixpkgs-unstable"
+        fi
+    fi
+    
+    # Collect installed packages
+    local -A current_versions
+    local -A display_names
+    while IFS=$'\t' read -r name version display_name; do
+        current_versions[$name]="$version"
+        display_names[$name]="$display_name"
+    done < <(collect_installed_packages)
+    
+    local pkg_count=${#current_versions[@]}
+    if [ "$pkg_count" -eq 0 ]; then
+        echo "0" > "$STATE_FILE"
+        echo "$(date +%s)" > "$LAST_RUN_FILE"
+        echo "System updated" > "$LAST_RUN_TOOLTIP"
+        send_notification "updates-complete" "Update Check Complete" "No packages found to check" -e
+        return 0
+    fi
+    
+    # Build nix expression based on mode
+    local tmpexpr
+    tmpexpr=$(mktemp /tmp/nix-version-check-XXXXXX.nix)
+    trap "rm -f '$tmpexpr'" RETURN
+    
+    if [ "$single_channel_mode" = true ]; then
+        # Single channel mode - check all packages against one channel
+        {
+            echo 'flakeRef:'
+            echo 'let'
+            echo '  pkgs = (builtins.getFlake flakeRef).legacyPackages.x86_64-linux;'
+            echo '  try = attr: let r = builtins.tryEval (pkgs.${attr}.version or "?"); in if r.success then r.value else "?";'
+            echo 'in {'
+            for name in "${!current_versions[@]}"; do
+                echo "  \"$name\" = { version = try \"$name\"; channel = \"single\"; };"
+            done
+            echo '}'
+        } > "$tmpexpr"
+        
+        local eval_result
+        eval_result=$(nix eval --json --file "$tmpexpr" --apply "f: f \"$channel\"" 2>/dev/null)
+        
+        if [ $? -ne 0 ] || [ -z "$eval_result" ]; then
+            echo "0" > "$STATE_FILE"
+            echo "Eval failed" > "$LAST_RUN_TOOLTIP"
+            send_notification "updates-failed" "Update Check Failed" "Nix eval failed - check tooltip for details"
+            return 1
+        fi
+    else
+        # Dual channel mode - separate packages by source
+        local -A stable_pkgs
+        local -A unstable_pkgs
+        
+        for name in "${!current_versions[@]}"; do
+            local pkg_channel
+            pkg_channel=$(get_package_channel "$name")
+            
+            if [ "$pkg_channel" = "unstable" ]; then
+                unstable_pkgs[$name]="${current_versions[$name]}"
+            else
+                stable_pkgs[$name]="${current_versions[$name]}"
+            fi
+        done
+        
+        # Generate expression that checks both channels
+        {
+            echo '{ stableRef, unstableRef }:'
+            echo 'let'
+            echo '  stablePkgs = (builtins.getFlake stableRef).legacyPackages.x86_64-linux;'
+            echo '  unstablePkgs = (builtins.getFlake unstableRef).legacyPackages.x86_64-linux;'
+            echo '  tryStable = attr: let r = builtins.tryEval (stablePkgs.${attr}.version or "?"); in if r.success then r.value else "?";'
+            echo '  tryUnstable = attr: let r = builtins.tryEval (unstablePkgs.${attr}.version or "?"); in if r.success then r.value else "?";'
+            echo 'in {'
+            
+            for name in "${!stable_pkgs[@]}"; do
+                echo "  \"$name\" = { version = tryStable \"$name\"; channel = \"stable\"; };"
+            done
+            
+            for name in "${!unstable_pkgs[@]}"; do
+                echo "  \"$name\" = { version = tryUnstable \"$name\"; channel = \"unstable\"; };"
+            done
+            
+            echo '}'
+        } > "$tmpexpr"
+        
+        local eval_result
+        eval_result=$(nix eval --json --file "$tmpexpr" --apply "f: f { stableRef = \"$STABLE_CHANNEL\"; unstableRef = \"$UNSTABLE_CHANNEL\"; }" 2>/dev/null)
+        
+        if [ $? -ne 0 ] || [ -z "$eval_result" ]; then
+            echo "0" > "$STATE_FILE"
+            echo "Eval failed" > "$LAST_RUN_TOOLTIP"
+            send_notification "updates-failed" "Update Check Failed" "Nix eval failed - check tooltip for details"
+            return 1
+        fi
+    fi
+    
+    # Compare versions using jq
+    local changed_json
+    changed_json=$(echo "$eval_result" | jq --argjson current "$(
+        printf '{'
+        local first=true
+        for name in "${!current_versions[@]}"; do
+            $first || printf ','
+            printf '"%s":"%s"' "$name" "${current_versions[$name]}"
+            first=false
+        done
+        printf '}'
+    )" --argjson display "$(
+        printf '{'
+        local first=true
+        for name in "${!display_names[@]}"; do
+            $first || printf ','
+            printf '"%s":"%s"' "$name" "${display_names[$name]}"
+            first=false
+        done
+        printf '}'
+    )" '
+        [ to_entries[] |
+          select(.value.version != "?") |
+          select($current[.key] != null) |
+          select(.value.version != $current[.key]) |
+          {name: .key, current: $current[.key], new: .value.version, channel: .value.channel, display: ($display[.key] // .key)}
+        ] | sort_by(.name)
+    ')
+    
+    # Filter to explicit packages only if enabled
+    if [ "$EXPLICIT_PACKAGES_ONLY" = "true" ] && [ -f "$EXPLICIT_PACKAGES_CACHE" ]; then
+        # Build a JSON array of lowercase explicit package names for filtering
+        local explicit_pkgs_json
+        explicit_pkgs_json=$(awk '{print tolower($0)}' "$EXPLICIT_PACKAGES_CACHE" | jq -R -s 'split("\n") | map(select(length > 0))')
+        
+        # Filter in a single jq call (case-insensitive)
+        changed_json=$(echo "$changed_json" | jq --argjson explicit "$explicit_pkgs_json" '
+            [ .[] | select((.name | ascii_downcase) as $n | $explicit | index($n)) ]
+        ')
+    fi
+    
+    local update_count
+    update_count=$(echo "$changed_json" | jq 'length')
+    echo "$update_count" > "$STATE_FILE"
+    echo "$(date +%s)" > "$LAST_RUN_FILE"
+    
+    if [ "$update_count" -eq 0 ]; then
+        echo "System updated" > "$LAST_RUN_TOOLTIP"
+        send_notification "updates-complete" "Update Check Complete" "No updates available" -e
+    else
+        local tooltip_text
+        if [ "$single_channel_mode" = true ]; then
+            tooltip_text=$(echo "$changed_json" | jq -r '.[] | "\(.display): \(.current) → \(.new)"' | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
+        else
+            tooltip_text=$(echo "$changed_json" | jq -r '.[] | "\(.display): \(.current) → \(.new) (\(.channel))"' | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
+        fi
+        echo "$tooltip_text" > "$LAST_RUN_TOOLTIP"
+        
+        if [ "$update_count" -eq 1 ]; then
+            send_notification "updates-pending" "Update Check Complete" "Found 1 update" -e
+        else
+            send_notification "updates-pending" "Update Check Complete" "Found $update_count updates" -e
+        fi
+    fi
+    
+    return 0
+}
+
+# ===== Toggle =====
+toggle_updates() {
+    if [ ! -f "$TOGGLE_FILE" ]; then
+        echo "enabled" > "$TOGGLE_FILE"
+    fi
+    if [ "$(cat "$TOGGLE_FILE")" = "enabled" ]; then
+        echo "disabled" > "$TOGGLE_FILE"
+    else
+        echo "enabled" > "$TOGGLE_FILE"
+    fi
+    pkill -x -RTMIN+12 .waybar-wrapped
+}
+
+# ===== Main =====
+main() {
+    # Disabled?
+    if [ -f "$TOGGLE_FILE" ] && [ "$(cat "$TOGGLE_FILE")" = "disabled" ]; then
+        local updates
+        updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+        local last_run
+        last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
+        local last_fmt="never"
+        [ "$last_run" != "0" ] && last_fmt=$(date -d "@$last_run" "+%Y-%m-%d %H:%M")
+        local existing
+        existing=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
+        if [ "$updates" = "0" ] || [ -z "$updates" ]; then
+            output_json "$updates" "disabled" "Updates disabled (Last checked: $last_fmt)"
+        elif [ -n "$existing" ] && [ "$existing" != "System updated" ]; then
+            output_json "$updates" "disabled" "Updates disabled (Last checked: $last_fmt)\\n=================================================\\n$existing"
+        else
+            output_json "$updates" "disabled" "Updates disabled ($updates pending)\\nLast checked: $last_fmt"
+        fi
+        exit 0
+    fi
+
+    # Grace period?
+    if [ "$SKIP_AFTER_BOOT" = "true" ] && check_boot_resume; then
+        local updates
+        updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+        if [ "$updates" -ne 0 ] 2>/dev/null; then
+            local tooltip
+            tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "$updates updates available")
+            output_json "$updates" "has-updates" "$tooltip"
+        else
+            output_json "0" "updated" "System updated"
+        fi
+        exit 0
+    fi
+
+    # Network?
+    if ! check_network; then
+        local updates
+        updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+        send_notification "updates-failed" "Update Check Failed" "Not connected to the internet"
+        output_json "${updates:-0}" "updated" "No network connection"
+        exit 0
+    fi
+
+    # Check interval
+    local updates
+    updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+    local last_run
+    last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
+    local current_time
+    current_time=$(date +%s)
+
+    if [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
+        # Separating updating and updated phase (like full mode)
+        if [ -f "$UPDATING_FLAG" ]; then
+            # Second phase: actually check for updates
+            if check_for_updates_lightweight; then
+                updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+            else
+                output_json "?" "error" "Lightweight check failed"
+                rm -f "$UPDATING_FLAG"
+                exit 0
+            fi
+            rm -f "$UPDATING_FLAG"
+        else
+            # First phase: show "updating" state and trigger re-run
+            local existing_tooltip
+            existing_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || "")
+            local tooltip
+            if [ "$updates" != "0" ] && [ -n "$existing_tooltip" ] && [ "$existing_tooltip" != "System updated" ]; then
+                tooltip="Checking for updates... Previous check found:\\n=============================================\\n$existing_tooltip"
+            else
+                tooltip="Checking for updates..."
+            fi
+            touch "$UPDATING_FLAG"
+            output_json "$updates" "updating" "$tooltip"
+            # Signal waybar to refresh, which will trigger second phase
+            pkill -x -RTMIN+12 .waybar-wrapped
+            exit 0
+        fi
+    else
+        # Throttled - show wait notification if triggered manually
+        if [ -t 0 ]; then
+            send_notification "updates-wait" "Please Wait" "Next update is in $(calc_next_update) min." -e
+        fi
+    fi
+
+    if [ "$updates" -ne 0 ] 2>/dev/null; then
+        local tooltip
+        tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "$updates updates available")
+        output_json "$updates" "has-updates" "$tooltip"
+    else
+        output_json "0" "updated" "System updated"
+    fi
+}
+
+# Error handler
+trap 'echo "{ \"text\":\"?\", \"alt\":\"error\", \"tooltip\":\"Script error\" }"' ERR
+
+if [ "$1" = "toggle" ]; then
+    toggle_updates
+else
+    main
+fi

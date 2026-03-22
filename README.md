@@ -34,6 +34,38 @@ When using the flake, all dependencies are automatically handled. The script req
 - Your flake is in `~/.config/nixos` (configurable via Home Manager module)
 - Your flake's nixosConfigurations is named the same as your `$hostname`
 
+## ⚡ Check Modes
+
+waybar-nixos-updates supports two update checking strategies:
+
+### Full Mode (Default)
+The original approach that performs a complete system closure build and diff:
+- Runs `nix flake update` + `nix build` + `nvd diff`
+- Detects all package changes including transitive dependencies
+- Shows added/removed packages
+- Takes several minutes to complete
+
+### Lightweight Mode
+A faster alternative using lazy Nix evaluation:
+- Compares `.version` attributes using a single `nix eval`
+- Completes in seconds rather than minutes
+- Checks both NixOS system packages AND home-manager packages (auto-detected)
+- Supports single-channel or dual-channel (stable + unstable) configurations
+- ~80-85% attribute name coverage (some store paths don't map to nixpkgs attrs)
+- No transitive dependency tracking
+
+| Feature | Full | Lightweight |
+| --- | --- | --- |
+| Speed | Minutes (full build) | Seconds (lazy eval) |
+| Accuracy | Complete closure diff | Top-level packages only |
+| Transitive deps | ✓ | ✗ |
+| Added/removed pkgs | ✓ | ✗ |
+| Attr name coverage | 100% | ~80-85% |
+
+**Explicit Packages Filter**: When `CONFIG_DIR` is set, lightweight mode automatically enables `EXPLICIT_PACKAGES_ONLY` mode, which only reports updates for packages explicitly defined in your nix configuration files. This significantly reduces false positives from system dependencies and provides results closer to what full mode would report.
+
+Choose **lightweight** mode if you want quick, frequent checks and don't need to track transitive dependencies. Choose **full** mode if you need complete accuracy.
+
 ## 🚀 How to Use
 
 ### 💿 Installation Methods
@@ -67,11 +99,31 @@ This provides the most flexibility for configuration:
   
   programs.waybar-nixos-updates = {
     enable = true;
+    checkMode = "lightweight";      # "full" (default) or "lightweight"
     updateInterval = 3600;          # Check every hour
+    notifications = true;           # Set to false to disable desktop notifications
+    
+    # Path to your NixOS flake (used by both modes):
+    # - Full mode: for nix build and nvd diff
+    # - Lightweight mode: for flake.lock and .nix file scanning
     nixosConfigPath = "~/.config/nixos";
+    
+    # Full mode only:
+    updateLockFile = false;         # Use temp dir for checks
+    
+    # Lightweight mode - Option A: Single channel (simple)
+    nixpkgsChannel = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    
+    # Lightweight mode - Option B: Dual channel (for mixed stable/unstable)
+    # Scans nixosConfigPath for .nix files to determine package sources
+    # nixpkgsChannel = {
+    #   stable = "pkgs";                  # Matches: pkgs.foo, with pkgs; [...]
+    #   unstable = "pkgs-unstable";       # Matches: pkgs-unstable.foo, with pkgs-unstable; [...]
+    # };
+    
+    # Common options:
     skipAfterBoot = true;           # Skip checks after boot/resume
     gracePeriod = 60;               # Wait 60s after boot
-    updateLockFile = false;         # Use temp dir for checks
   };
   
   # Then add to your waybar configuration:
@@ -103,14 +155,61 @@ imports = [ ./path-to-waybar-nixos-updates/default.nix ];
 For a manual installation, download the `update-checker` script, put it in your [PATH](https://unix.stackexchange.com/a/26059) and make it executable (`chmod +x update-checker`). Add the icons to your ~/.icons folder.
 
 ### ⚙️ Configuration Options
-You can modify these variables at the top of the script to customize behavior:
 
+When using the Home Manager module, you can configure these options:
+
+- `checkMode`: Update check strategy - `"full"` (default) or `"lightweight"`
+- `updateInterval`: Time in seconds between update checks (default: 3600)
+- `notifications`: Whether to show desktop notifications (default: true)
+- `skipAfterBoot`: Whether to skip update checks right after boot/resume (default: true)
+- `gracePeriod`: Time in seconds to wait after boot/resume before checking (default: 60)
+
+**Both modes:**
+- `nixosConfigPath`: Path to your NixOS configuration flake directory (default: `~/.config/nixos`)
+  - Full mode: Used for `nix build` and `nvd diff`
+  - Lightweight mode: Used for reading `flake.lock` and scanning `.nix` files for package sources
+
+**Full mode only:**
+- `updateLockFile`: Whether to update the lock file directly or use a temporary copy (default: false)
+
+**Lightweight mode only:**
+- `nixpkgsChannel`: Either a single flake ref string, or an attrset for dual-channel mode:
+  - Simple (single channel): `"github:NixOS/nixpkgs/nixpkgs-unstable"`
+  - Dual channel (mixed stable/unstable):
+    ```nix
+    {
+      stable = "pkgs";                 # Identifier for stable packages
+      unstable = "pkgs-unstable";      # Identifier for unstable packages
+    }
+    ```
+  - In dual-channel mode, `nixosConfigPath` is scanned for `.nix` files to determine package sources, and flake refs are auto-detected from your `flake.lock`
+- `explicitPackagesOnly`: Only report updates for packages explicitly defined in your config files (default: `true` in dual-channel mode, `false` otherwise)
+
+**Lightweight mode features:**
+- **Home-manager packages**: Automatically detected and included (no config needed)
+- **Dual-channel support**: Parses your nix configs to determine which packages are stable vs unstable
+- **Caching**: Parse results are cached and only refreshed when `flake.lock` changes
+
+You can also modify these environment variables or set them at the top of the script to customize behavior:
+
+**Common variables (both modes):**
 - `UPDATE_INTERVAL`: Time in seconds between update checks (default: 3599)
-- `NIXOS_CONFIG_PATH`: Path to your NixOS configuration (default: ~/.config/nixos)
 - `CACHE_DIR`: Directory for storing cache files (default: ~/.cache)
+- `NOTIFICATIONS_ENABLED`: Set to "false" to disable desktop notifications (default: "true")
 - `SKIP_AFTER_BOOT`: Whether to skip update checks right after boot/resume (default: true)
 - `GRACE_PERIOD`: Time in seconds to wait after boot/resume before checking (default: 60)
+
+**Full mode variables:**
+- `NIXOS_CONFIG_PATH`: Path to your NixOS configuration (default: ~/.config/nixos)
 - `UPDATE_LOCK_FILE`: Whether to update the lock file directly or use a temporary copy (default: false)
+
+**Lightweight mode variables:**
+- `FLAKE_DIR`: Path to flake directory - used for reading `flake.lock` and scanning `.nix` files (default: ~/.config/nixos)
+- `NIXPKGS_CHANNEL`: Nixpkgs flake ref for single-channel mode (e.g., "github:NixOS/nixpkgs/nixpkgs-unstable")
+- `DUAL_CHANNEL_MODE`: Set to "true" to enable dual-channel detection from flake.lock (default: "false")
+- `EXPLICIT_PACKAGES_ONLY`: Only report updates for packages explicitly in config files (default: "true" when `DUAL_CHANNEL_MODE` is enabled, "false" otherwise). This filters out system dependencies and provides more accurate results.
+- `STABLE_IDENTIFIER`: Identifier for stable packages in dual-channel mode (default: "pkgs")
+- `UNSTABLE_IDENTIFIER`: Identifier for unstable packages in dual-channel mode (default: "pkgs-unstable")
 
 ### 🔄 Toggle Functionality
 The script supports toggling update checks on/off. When disabled, it will show the last known state without performing new checks:
@@ -130,7 +229,7 @@ In json (if adding directly to the config file):
     "exec": "$HOME/bin/update-checker", // <--- path to script
     "signal": 12,
     "on-click": "$HOME/bin/update-checker toggle", // toggle update checking
-    "on-click-right": "rm ~/.cache/nix-update-last-run", // force an update
+    "on-click-right": "rm ~/.cache/nix-update-last-run && pkill -RTMIN+12 waybar", // force an update
     "interval": 3600, // refresh every hour
     "tooltip": true,
     "return-type": "json",
@@ -199,9 +298,19 @@ Here's a complete example of using waybar-nixos-updates with Home Manager:
             # Enable the waybar-nixos-updates module
             programs.waybar-nixos-updates = {
               enable = true;
+              checkMode = "lightweight";  # or "full" for complete accuracy
               updateInterval = 3600;
-              nixosConfigPath = "~/.config/nixos";
-              updateLockFile = false;  # Use temp directory for safety
+              notifications = true;       # set to false to disable notifications
+              
+              # For single-channel (all packages from one nixpkgs):
+              # nixpkgsChannel = "github:NixOS/nixpkgs/nixpkgs-unstable";
+              
+              # For dual-channel (mixed stable + unstable packages):
+              # nixosConfigPath is used to scan .nix files for package sources
+              nixpkgsChannel = {
+                stable = "pkgs";
+                unstable = "pkgs-unstable";
+              };
             };
             
             # Configure Waybar
@@ -246,10 +355,12 @@ Here's a complete example of using waybar-nixos-updates with Home Manager:
 
 The flake provides the following outputs:
 
-- **packages.default**: The waybar-nixos-updates package with all dependencies
+- **packages.default**: The waybar-nixos-updates package (full mode)
+- **packages.lightweight**: The lightweight checker package
 - **homeManagerModules.default**: Home Manager module for user-level configuration
 - **nixosModules.default**: NixOS module for system-level installation
-- **apps.default**: Direct execution of the update-checker script
+- **apps.default**: Direct execution of the update-checker script (full mode)
+- **apps.lightweight**: Direct execution of the lightweight-checker script
 
 ### 🔍 Troubleshooting
 
@@ -321,7 +432,11 @@ nixup =
 Some additional things to expect in regards to 1) what notifications you'll receive, 2) what files will be written, 3) and how the script uses your network connection.
 
 ### 🔔 Notifications
-These notifications require `notify-send` to be installed on your system. The script sends desktop notifications to keep you informed:
+These notifications require `notify-send` to be installed on your system. The script sends desktop notifications to keep you informed.
+
+**To disable notifications:** Set `notifications = false;` in your Home Manager configuration, or set the environment variable `NOTIFICATIONS_ENABLED="false"`.
+
+Notifications include:
 - When starting an update check: "Checking for Updates - Please be patient"
 - When throttled due to recent checks: "Please Wait" with time until next check
 - When updates are found: "Update Check Complete" with the number of updates
