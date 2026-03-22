@@ -216,7 +216,7 @@ In json (if adding directly to the config file):
     "exec": "$HOME/bin/update-checker", // <--- path to script
     "signal": 12,
     "on-click": "$HOME/bin/update-checker toggle", // toggle update checking
-    "on-click-right": "rm ~/.cache/nix-update-last-run", // force an update
+    "on-click-right": "rm ~/.cache/nix-update-last-run && pkill -RTMIN+12 waybar", // force an update
     "interval": 3600, // refresh every hour
     "tooltip": true,
     "return-type": "json",
