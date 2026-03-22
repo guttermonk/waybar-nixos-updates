@@ -5,15 +5,27 @@
 # Runs in seconds — no nix evaluation or builds required.
 #
 # Checks each GitHub input in flake.lock against its tracked branch.
-# Inputs pinned to a specific commit (original.rev set) are skipped.
+# Supports both unpinned and pinned inputs with configurable modes.
 
 # ===== Configuration =====
 FLAKE_DIR="${FLAKE_DIR:-$HOME/.config/nixos}"
 UPDATE_INTERVAL="${UPDATE_INTERVAL:-3599}"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache}"
+
+# Mode: "disabled" | "show" | "count"
+#   - disabled: Don't check inputs
+#   - show: Check and show in tooltip, but don't include in count
+#   - count: Check, show in tooltip, and include in waybar count
+INPUT_CHECKER_MODE="${INPUT_CHECKER_MODE:-count}"
+INPUT_CHECKER_PINNED="${INPUT_CHECKER_PINNED:-disabled}"
+
 STATE_FILE="$CACHE_DIR/nix-update-input-state"
 LAST_RUN_FILE="$CACHE_DIR/nix-update-input-last-run"
 LAST_RUN_TOOLTIP="$CACHE_DIR/nix-update-input-tooltip"
+INPUT_STATE_FILE="$CACHE_DIR/nix-update-input-unpinned-state"
+INPUT_TOOLTIP_FILE="$CACHE_DIR/nix-update-input-unpinned-tooltip"
+PINNED_STATE_FILE="$CACHE_DIR/nix-update-input-pinned-state"
+PINNED_TOOLTIP_FILE="$CACHE_DIR/nix-update-input-pinned-tooltip"
 
 # ===== Initialize =====
 mkdir -p "$CACHE_DIR"
@@ -25,13 +37,14 @@ output_json() {
     echo "{ \"text\":\"$1\", \"alt\":\"$2\", \"tooltip\":\"$3\" }"
 }
 
-check_flake_inputs() {
+check_unpinned_inputs() {
     local flake_lock="$FLAKE_DIR/flake.lock"
     [[ ! -f "$flake_lock" ]] && return 1
 
     local count=0
     local tooltip=""
 
+    # Check GitHub inputs (unpinned)
     while IFS=$'\t' read -r name owner repo rev ref last_modified; do
         local remote_ref
         [[ "$ref" == "HEAD" ]] && remote_ref="HEAD" || remote_ref="refs/heads/$ref"
@@ -59,14 +72,177 @@ check_flake_inputs() {
         @tsv
     ' "$flake_lock")
 
-    echo "$count" > "$STATE_FILE"
-    echo "$(date +%s)" > "$LAST_RUN_FILE"
+    # Check generic git inputs (Bitbucket, GitLab, self-hosted, etc.) - unpinned
+    while IFS=$'\t' read -r name url rev ref last_modified; do
+        local remote_ref="$ref"
+        
+        local latest
+        latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
+            "$url" "$remote_ref" 2>/dev/null | cut -f1)
+
+        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
+            count=$((count + 1))
+            local locked_date
+            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$name (locked: $locked_date)"
+        fi
+    done < <(jq -r '
+        . as $root |
+        $root.nodes.root.inputs | to_entries[] |
+        select(.value | type == "string") |
+        {name: .key, node: $root.nodes[.value]} |
+        select(.node.locked.type == "git") |
+        select(.node.original.rev == null) |
+        [.name, .node.locked.url, .node.locked.rev,
+         (.node.locked.ref // "HEAD"), (.node.locked.lastModified | tostring)] |
+        @tsv
+    ' "$flake_lock")
+
+    echo "$count" > "$INPUT_STATE_FILE"
 
     if [ "$count" -eq 0 ]; then
+        echo "" > "$INPUT_TOOLTIP_FILE"
+    else
+        echo "$tooltip" > "$INPUT_TOOLTIP_FILE"
+    fi
+    
+    return 0
+}
+
+check_pinned_inputs() {
+    local flake_lock="$FLAKE_DIR/flake.lock"
+    [[ ! -f "$flake_lock" ]] && return 1
+
+    local count=0
+    local tooltip=""
+
+    # Check pinned GitHub inputs
+    while IFS=$'\t' read -r name owner repo rev ref last_modified; do
+        local remote_ref
+        [[ "$ref" == "HEAD" ]] && remote_ref="HEAD" || remote_ref="refs/heads/$ref"
+
+        local latest
+        latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
+            "https://github.com/$owner/$repo" "$remote_ref" 2>/dev/null | cut -f1)
+
+        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
+            count=$((count + 1))
+            local locked_date
+            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$name (pinned: $locked_date)"
+        fi
+    done < <(jq -r '
+        . as $root |
+        $root.nodes.root.inputs | to_entries[] |
+        select(.value | type == "string") |
+        {name: .key, node: $root.nodes[.value]} |
+        select(.node.locked.type == "github") |
+        select(.node.original.rev != null) |
+        [.name, .node.original.owner, .node.original.repo, .node.locked.rev,
+         (.node.original.ref // "HEAD"), (.node.locked.lastModified | tostring)] |
+        @tsv
+    ' "$flake_lock")
+
+    # Check pinned generic git inputs
+    while IFS=$'\t' read -r name url rev ref last_modified; do
+        local remote_ref="$ref"
+        
+        local latest
+        latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
+            "$url" "$remote_ref" 2>/dev/null | cut -f1)
+
+        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
+            count=$((count + 1))
+            local locked_date
+            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$name (pinned: $locked_date)"
+        fi
+    done < <(jq -r '
+        . as $root |
+        $root.nodes.root.inputs | to_entries[] |
+        select(.value | type == "string") |
+        {name: .key, node: $root.nodes[.value]} |
+        select(.node.locked.type == "git") |
+        select(.node.original.rev != null) |
+        [.name, .node.locked.url, .node.locked.rev,
+         (.node.locked.ref // "HEAD"), (.node.locked.lastModified | tostring)] |
+        @tsv
+    ' "$flake_lock")
+
+    echo "$count" > "$PINNED_STATE_FILE"
+
+    if [ "$count" -eq 0 ]; then
+        echo "" > "$PINNED_TOOLTIP_FILE"
+    else
+        echo "$tooltip" > "$PINNED_TOOLTIP_FILE"
+    fi
+    
+    return 0
+}
+
+run_checks() {
+    local input_count=0
+    local input_tooltip=""
+    local input_count_for_total=0
+    
+    local pinned_count=0
+    local pinned_tooltip=""
+    local pinned_count_for_total=0
+    
+    # Check unpinned inputs based on mode
+    if [ "$INPUT_CHECKER_MODE" != "disabled" ]; then
+        check_unpinned_inputs
+        input_count=$(cat "$INPUT_STATE_FILE" 2>/dev/null || echo "0")
+        input_tooltip=$(cat "$INPUT_TOOLTIP_FILE" 2>/dev/null || echo "")
+        if [ "$INPUT_CHECKER_MODE" = "count" ]; then
+            input_count_for_total=$input_count
+        fi
+    fi
+    
+    # Check pinned inputs based on mode
+    if [ "$INPUT_CHECKER_PINNED" != "disabled" ]; then
+        check_pinned_inputs
+        pinned_count=$(cat "$PINNED_STATE_FILE" 2>/dev/null || echo "0")
+        pinned_tooltip=$(cat "$PINNED_TOOLTIP_FILE" 2>/dev/null || echo "")
+        if [ "$INPUT_CHECKER_PINNED" = "count" ]; then
+            pinned_count_for_total=$pinned_count
+        fi
+    fi
+    
+    # Calculate total count
+    local total_count=$((input_count_for_total + pinned_count_for_total))
+    echo "$total_count" > "$STATE_FILE"
+    echo "$(date +%s)" > "$LAST_RUN_FILE"
+    
+    # Build tooltip
+    local final_tooltip=""
+    
+    if [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ "$input_count" -gt 0 ]; then
+        if [ "$INPUT_CHECKER_PINNED" != "disabled" ]; then
+            final_tooltip="Inputs:\\n$input_tooltip"
+        else
+            final_tooltip="$input_tooltip"
+        fi
+    fi
+    
+    if [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ "$pinned_count" -gt 0 ]; then
+        if [ -n "$final_tooltip" ]; then
+            final_tooltip="$final_tooltip\\n\\nPinned:\\n$pinned_tooltip"
+        else
+            final_tooltip="Pinned:\\n$pinned_tooltip"
+        fi
+    fi
+    
+    if [ -z "$final_tooltip" ]; then
         echo "All inputs up to date" > "$LAST_RUN_TOOLTIP"
     else
-        echo "$tooltip" > "$LAST_RUN_TOOLTIP"
+        echo "$final_tooltip" > "$LAST_RUN_TOOLTIP"
     fi
+    
+    return 0
 }
 
 # ===== Main =====
@@ -74,8 +250,14 @@ updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
 last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
 current_time=$(date +%s)
 
+# Check if input checking is completely disabled
+if [ "$INPUT_CHECKER_MODE" = "disabled" ] && [ "$INPUT_CHECKER_PINNED" = "disabled" ]; then
+    output_json "0" "updated" "Input checking disabled"
+    exit 0
+fi
+
 if [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
-    if check_flake_inputs; then
+    if run_checks; then
         updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
     else
         output_json "?" "error" "Input check failed"

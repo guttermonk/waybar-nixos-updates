@@ -38,6 +38,14 @@ SKIP_AFTER_BOOT="${SKIP_AFTER_BOOT:-true}"
 GRACE_PERIOD="${GRACE_PERIOD:-60}"
 NOTIFICATIONS_ENABLED="${NOTIFICATIONS_ENABLED:-true}"
 
+# Input checker integration
+# Mode: "disabled" | "show" | "count"
+#   - disabled: Don't check inputs
+#   - show: Check and show in tooltip, but don't include in count
+#   - count: Check, show in tooltip, and include in waybar count
+INPUT_CHECKER_MODE="${INPUT_CHECKER_MODE:-disabled}"
+INPUT_CHECKER_PINNED="${INPUT_CHECKER_PINNED:-disabled}"
+
 # Filter to only packages explicitly defined in config files
 # This reduces false positives from system dependencies
 # Defaults to "true" when dual channel mode is enabled, "false" otherwise
@@ -58,6 +66,12 @@ FLAKE_LOCK_HASH_FILE="$CACHE_DIR/nix-update-flake-lock-hash"
 UPDATING_FLAG="$CACHE_DIR/nix-update-updating-flag"
 EXPLICIT_PACKAGES_CACHE="$CACHE_DIR/nix-update-explicit-packages.txt"
 
+# Input checker state files
+INPUT_STATE_FILE="$CACHE_DIR/nix-update-input-state"
+INPUT_TOOLTIP_FILE="$CACHE_DIR/nix-update-input-tooltip"
+PINNED_STATE_FILE="$CACHE_DIR/nix-update-pinned-state"
+PINNED_TOOLTIP_FILE="$CACHE_DIR/nix-update-pinned-tooltip"
+
 # ===== Initialize =====
 mkdir -p "$CACHE_DIR"
 [ -f "$STATE_FILE" ] || echo "0" > "$STATE_FILE"
@@ -71,18 +85,29 @@ send_notification() {
         return 0
     fi
     
+    # Check if notify-send is available
+    if ! command -v notify-send >/dev/null 2>&1; then
+        return 0
+    fi
+    
     local icon="$1"
     local title="$2"
     local message="$3"
-    local expire_flag="$4"
+    local expire_flag="${4:-}" # Optional fourth parameter for -e flag
     
-    if command -v notify-send >/dev/null 2>&1; then
-        if [ -f "$HOME/.icons/$icon.png" ]; then
-            notify-send -i "$HOME/.icons/$icon.png" "$title" "$message" $expire_flag
-        else
-            notify-send "$title" "$message" $expire_flag
-        fi
+    local args=("$title" "$message")
+    if [ -f "$HOME/.icons/$icon.png" ]; then
+        args=(-i "$HOME/.icons/$icon.png" "${args[@]}")
     fi
+    if [ -n "$expire_flag" ]; then
+        args+=("$expire_flag")
+    fi
+    
+    notify-send "${args[@]}" >/dev/null 2>&1 || true
+}
+
+refresh_waybar() {
+    pkill -x -RTMIN+12 .waybar-wrapped >/dev/null 2>&1 || true
 }
 
 check_boot_resume() {
@@ -107,7 +132,7 @@ check_boot_resume() {
 }
 
 check_network() {
-    ip route | grep -q "^default" && ip -4 addr show | grep -qE "inet .* scope global"
+    ip route 2>/dev/null | grep -q "^default" && ip -4 addr show 2>/dev/null | grep -qE "inet .* scope global"
 }
 
 output_json() {
@@ -121,6 +146,154 @@ calc_next_update() {
     local next_update=$((UPDATE_INTERVAL - (current_time - last_run)))
     local next_update_min=$((next_update / 60))
     echo "$next_update_min"
+}
+
+# ===== Flake Input Checking =====
+check_flake_inputs() {
+    local flake_lock="$FLAKE_DIR/flake.lock"
+    [[ ! -f "$flake_lock" ]] && return 1
+
+    local count=0
+    local tooltip=""
+
+    # Check GitHub inputs (unpinned)
+    while IFS=$'\t' read -r name owner repo rev ref last_modified; do
+        local remote_ref
+        [[ "$ref" == "HEAD" ]] && remote_ref="HEAD" || remote_ref="refs/heads/$ref"
+
+        local latest
+        latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
+            "https://github.com/$owner/$repo" "$remote_ref" 2>/dev/null | cut -f1)
+
+        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
+            count=$((count + 1))
+            local locked_date
+            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$name (locked: $locked_date)"
+        fi
+    done < <(jq -r '
+        . as $root |
+        $root.nodes.root.inputs | to_entries[] |
+        select(.value | type == "string") |
+        {name: .key, node: $root.nodes[.value]} |
+        select(.node.locked.type == "github") |
+        select(.node.original.rev == null) |
+        [.name, .node.original.owner, .node.original.repo, .node.locked.rev,
+         (.node.original.ref // "HEAD"), (.node.locked.lastModified | tostring)] |
+        @tsv
+    ' "$flake_lock")
+
+    # Check generic git inputs (Bitbucket, GitLab, self-hosted, etc.) - unpinned
+    while IFS=$'\t' read -r name url rev ref last_modified; do
+        local remote_ref="$ref"
+        
+        local latest
+        latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
+            "$url" "$remote_ref" 2>/dev/null | cut -f1)
+
+        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
+            count=$((count + 1))
+            local locked_date
+            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$name (locked: $locked_date)"
+        fi
+    done < <(jq -r '
+        . as $root |
+        $root.nodes.root.inputs | to_entries[] |
+        select(.value | type == "string") |
+        {name: .key, node: $root.nodes[.value]} |
+        select(.node.locked.type == "git") |
+        select(.node.original.rev == null) |
+        [.name, .node.locked.url, .node.locked.rev,
+         (.node.locked.ref // "HEAD"), (.node.locked.lastModified | tostring)] |
+        @tsv
+    ' "$flake_lock")
+
+    echo "$count" > "$INPUT_STATE_FILE"
+
+    if [ "$count" -eq 0 ]; then
+        echo "" > "$INPUT_TOOLTIP_FILE"
+    else
+        echo "$tooltip" > "$INPUT_TOOLTIP_FILE"
+    fi
+    
+    return 0
+}
+
+# Check pinned flake inputs
+check_pinned_inputs() {
+    local flake_lock="$FLAKE_DIR/flake.lock"
+    [[ ! -f "$flake_lock" ]] && return 1
+
+    local count=0
+    local tooltip=""
+
+    # Check pinned GitHub inputs
+    while IFS=$'\t' read -r name owner repo rev ref last_modified; do
+        local remote_ref
+        [[ "$ref" == "HEAD" ]] && remote_ref="HEAD" || remote_ref="refs/heads/$ref"
+
+        local latest
+        latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
+            "https://github.com/$owner/$repo" "$remote_ref" 2>/dev/null | cut -f1)
+
+        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
+            count=$((count + 1))
+            local locked_date
+            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$name (pinned: $locked_date)"
+        fi
+    done < <(jq -r '
+        . as $root |
+        $root.nodes.root.inputs | to_entries[] |
+        select(.value | type == "string") |
+        {name: .key, node: $root.nodes[.value]} |
+        select(.node.locked.type == "github") |
+        select(.node.original.rev != null) |
+        [.name, .node.original.owner, .node.original.repo, .node.locked.rev,
+         (.node.original.ref // "HEAD"), (.node.locked.lastModified | tostring)] |
+        @tsv
+    ' "$flake_lock")
+
+    # Check pinned generic git inputs
+    while IFS=$'\t' read -r name url rev ref last_modified; do
+        local remote_ref="$ref"
+        
+        local latest
+        latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
+            "$url" "$remote_ref" 2>/dev/null | cut -f1)
+
+        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
+            count=$((count + 1))
+            local locked_date
+            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$name (pinned: $locked_date)"
+        fi
+    done < <(jq -r '
+        . as $root |
+        $root.nodes.root.inputs | to_entries[] |
+        select(.value | type == "string") |
+        {name: .key, node: $root.nodes[.value]} |
+        select(.node.locked.type == "git") |
+        select(.node.original.rev != null) |
+        [.name, .node.locked.url, .node.locked.rev,
+         (.node.locked.ref // "HEAD"), (.node.locked.lastModified | tostring)] |
+        @tsv
+    ' "$flake_lock")
+
+    echo "$count" > "$PINNED_STATE_FILE"
+
+    if [ "$count" -eq 0 ]; then
+        echo "" > "$PINNED_TOOLTIP_FILE"
+    else
+        echo "$tooltip" > "$PINNED_TOOLTIP_FILE"
+    fi
+    
+    return 0
 }
 
 # ===== Home-Manager Detection =====
@@ -764,27 +937,109 @@ check_for_updates_lightweight() {
         ')
     fi
     
-    local update_count
-    update_count=$(echo "$changed_json" | jq 'length')
-    echo "$update_count" > "$STATE_FILE"
+    local pkg_count
+    pkg_count=$(echo "$changed_json" | jq 'length')
+    
+    # Check flake inputs based on mode
+    local input_count=0
+    local input_tooltip=""
+    local input_count_for_total=0
+    if [ "$INPUT_CHECKER_MODE" != "disabled" ]; then
+        check_flake_inputs
+        input_count=$(cat "$INPUT_STATE_FILE" 2>/dev/null || echo "0")
+        input_tooltip=$(cat "$INPUT_TOOLTIP_FILE" 2>/dev/null || echo "")
+        if [ "$INPUT_CHECKER_MODE" = "count" ]; then
+            input_count_for_total=$input_count
+        fi
+    fi
+    
+    # Check pinned inputs based on mode
+    local pinned_count=0
+    local pinned_tooltip=""
+    local pinned_count_for_total=0
+    if [ "$INPUT_CHECKER_PINNED" != "disabled" ]; then
+        check_pinned_inputs
+        pinned_count=$(cat "$PINNED_STATE_FILE" 2>/dev/null || echo "0")
+        pinned_tooltip=$(cat "$PINNED_TOOLTIP_FILE" 2>/dev/null || echo "")
+        if [ "$INPUT_CHECKER_PINNED" = "count" ]; then
+            pinned_count_for_total=$pinned_count
+        fi
+    fi
+    
+    # Calculate total count (only items with mode="count")
+    local total_count=$((pkg_count + input_count_for_total + pinned_count_for_total))
+    echo "$total_count" > "$STATE_FILE"
     echo "$(date +%s)" > "$LAST_RUN_FILE"
     
-    if [ "$update_count" -eq 0 ]; then
+    # Check if there's anything to show (including "show" mode items)
+    local has_items_to_show=false
+    [ "$pkg_count" -gt 0 ] && has_items_to_show=true
+    [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ "$input_count" -gt 0 ] && has_items_to_show=true
+    [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ "$pinned_count" -gt 0 ] && has_items_to_show=true
+    
+    if [ "$has_items_to_show" = false ]; then
         echo "System updated" > "$LAST_RUN_TOOLTIP"
         send_notification "updates-complete" "Update Check Complete" "No updates available" -e
     else
-        local tooltip_text
-        if [ "$single_channel_mode" = true ]; then
-            tooltip_text=$(echo "$changed_json" | jq -r '.[] | "\(.display): \(.current) → \(.new)"' | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
-        else
-            tooltip_text=$(echo "$changed_json" | jq -r '.[] | "\(.display): \(.current) → \(.new) (\(.channel))"' | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
+        local tooltip_text=""
+        local has_multiple_sections=false
+        
+        # Check if we have multiple sections to show
+        local section_count=0
+        [ "$pkg_count" -gt 0 ] && section_count=$((section_count + 1))
+        [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ "$input_count" -gt 0 ] && section_count=$((section_count + 1))
+        [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ "$pinned_count" -gt 0 ] && section_count=$((section_count + 1))
+        [ "$section_count" -gt 1 ] && has_multiple_sections=true
+        
+        # Build packages section
+        if [ "$pkg_count" -gt 0 ]; then
+            local pkg_tooltip
+            if [ "$single_channel_mode" = true ]; then
+                pkg_tooltip=$(echo "$changed_json" | jq -r '.[] | "\(.display): \(.current) → \(.new)"' | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
+            else
+                pkg_tooltip=$(echo "$changed_json" | jq -r '.[] | "\(.display): \(.current) → \(.new) (\(.channel))"' | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
+            fi
+            if [ "$has_multiple_sections" = true ]; then
+                tooltip_text="Packages:\\n$pkg_tooltip"
+            else
+                tooltip_text="$pkg_tooltip"
+            fi
         fi
+        
+        # Build inputs section
+        if [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ "$input_count" -gt 0 ]; then
+            if [ -n "$tooltip_text" ]; then
+                tooltip_text="$tooltip_text\\n\\nInputs:\\n$input_tooltip"
+            else
+                if [ "$has_multiple_sections" = true ]; then
+                    tooltip_text="Inputs:\\n$input_tooltip"
+                else
+                    tooltip_text="$input_tooltip"
+                fi
+            fi
+        fi
+        
+        # Build pinned section
+        if [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ "$pinned_count" -gt 0 ]; then
+            if [ -n "$tooltip_text" ]; then
+                tooltip_text="$tooltip_text\\n\\nPinned:\\n$pinned_tooltip"
+            else
+                if [ "$has_multiple_sections" = true ]; then
+                    tooltip_text="Pinned:\\n$pinned_tooltip"
+                else
+                    tooltip_text="$pinned_tooltip"
+                fi
+            fi
+        fi
+        
         echo "$tooltip_text" > "$LAST_RUN_TOOLTIP"
         
-        if [ "$update_count" -eq 1 ]; then
+        if [ "$total_count" -eq 0 ]; then
+            send_notification "updates-complete" "Update Check Complete" "No countable updates" -e
+        elif [ "$total_count" -eq 1 ]; then
             send_notification "updates-pending" "Update Check Complete" "Found 1 update" -e
         else
-            send_notification "updates-pending" "Update Check Complete" "Found $update_count updates" -e
+            send_notification "updates-pending" "Update Check Complete" "Found $total_count updates" -e
         fi
     fi
     
@@ -801,7 +1056,7 @@ toggle_updates() {
     else
         echo "enabled" > "$TOGGLE_FILE"
     fi
-    pkill -x -RTMIN+12 .waybar-wrapped
+    refresh_waybar
 }
 
 # ===== Main =====
@@ -882,7 +1137,7 @@ main() {
             touch "$UPDATING_FLAG"
             output_json "$updates" "updating" "$tooltip"
             # Signal waybar to refresh, which will trigger second phase
-            pkill -x -RTMIN+12 .waybar-wrapped
+            refresh_waybar
             exit 0
         fi
     else
@@ -892,10 +1147,14 @@ main() {
         fi
     fi
 
+    local tooltip
+    tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "System updated")
+    
     if [ "$updates" -ne 0 ] 2>/dev/null; then
-        local tooltip
-        tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "$updates updates available")
         output_json "$updates" "has-updates" "$tooltip"
+    elif [ -n "$tooltip" ] && [ "$tooltip" != "System updated" ]; then
+        # Items exist but not counted (mode="show")
+        output_json "0" "updated" "$tooltip"
     else
         output_json "0" "updated" "System updated"
     fi

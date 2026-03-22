@@ -1,7 +1,7 @@
 # Example configuration for waybar-nixos-updates
 # This file demonstrates how to integrate waybar-nixos-updates into your NixOS configuration
 
-{ config, lib, pkgs, ... }:
+{ config, ... }:
 
 {
   # Example 1: Basic Home Manager configuration (full mode - default)
@@ -42,6 +42,33 @@
   #   };
   #   # Channels are auto-detected from flake.lock (nixpkgs and nixpkgs-unstable inputs)
   #   # explicitPackagesOnly defaults to true in dual-channel mode
+  # };
+
+  # Example 1d: With flake input staleness checking
+  # Combines package updates with stale input detection in one tooltip
+  # programs.waybar-nixos-updates = {
+  #   enable = true;
+  #   checkMode = "lightweight";  # Works with both "full" and "lightweight"
+  #   nixosConfigPath = "~/.config/nixos";
+  #   nixpkgsChannel = {
+  #     stable = "pkgs";
+  #     unstable = "pkgs-unstable";
+  #   };
+  #   inputChecker = {
+  #     mode = "count";    # "disabled" | "show" | "count"
+  #     pinned = "show";   # "disabled" | "show" | "count"
+  #   };
+  #   # Tooltip will show:
+  #   #   Packages:
+  #   #   brave: 1.87.192 → 1.88.132
+  #   #   dprint: 0.51.1 → 0.52.1
+  #   #
+  #   #   Inputs:
+  #   #   home-manager (locked: 2026-02-14)
+  #   #   hyprland (locked: 2026-02-15)
+  #   #
+  #   #   Pinned:
+  #   #   some-fork (pinned: 2025-08-03)
   # };
 
   # Example 2: Complete Waybar configuration with the update module

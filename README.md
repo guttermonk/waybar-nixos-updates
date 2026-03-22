@@ -163,6 +163,20 @@ When using the Home Manager module, you can configure these options:
 - `notifications`: Whether to show desktop notifications (default: true)
 - `skipAfterBoot`: Whether to skip update checks right after boot/resume (default: true)
 - `gracePeriod`: Time in seconds to wait after boot/resume before checking (default: 60)
+- `inputChecker.mode`: How to handle stale flake inputs (default: `"disabled"`)
+  - `"disabled"`: Don't check inputs (no resources used)
+  - `"show"`: Check and show in tooltip, but don't include in count
+  - `"count"`: Check, show in tooltip, and include in waybar count
+  - Uses `git ls-remote` to compare locked revisions against upstream
+  - Tooltip shows separate "Packages:" and "Inputs:" sections when multiple exist
+  - Supported input types:
+    - GitHub inputs (`github:owner/repo/branch`)
+    - Generic git inputs (`git+https://...`) - Bitbucket, GitLab, self-hosted, etc.
+- `inputChecker.pinned`: How to handle pinned flake inputs (default: `"disabled"`)
+  - `"disabled"`: Don't check pinned inputs (no resources used)
+  - `"show"`: Check and show in separate "Pinned:" section, but don't count
+  - `"count"`: Check, show, and include in waybar count
+  - Pinned inputs are those with `original.rev` set in flake.lock
 
 **Both modes:**
 - `nixosConfigPath`: Path to your NixOS configuration flake directory (default: `~/.config/nixos`)
@@ -198,6 +212,8 @@ You can also modify these environment variables or set them at the top of the sc
 - `NOTIFICATIONS_ENABLED`: Set to "false" to disable desktop notifications (default: "true")
 - `SKIP_AFTER_BOOT`: Whether to skip update checks right after boot/resume (default: true)
 - `GRACE_PERIOD`: Time in seconds to wait after boot/resume before checking (default: 60)
+- `INPUT_CHECKER_MODE`: How to handle stale inputs: "disabled" | "show" | "count" (default: "disabled")
+- `INPUT_CHECKER_PINNED`: How to handle pinned inputs: "disabled" | "show" | "count" (default: "disabled")
 
 **Full mode variables:**
 - `NIXOS_CONFIG_PATH`: Path to your NixOS configuration (default: ~/.config/nixos)
@@ -250,7 +266,7 @@ In nix (if adding it "the nix way" through home-manager):
   exec = "$HOME/bin/update-checker";  # Or "${pkgs.waybar-nixos-updates}/bin/update-checker" if using the flake
   signal = 12;
   on-click = "$HOME/bin/update-checker toggle";  # Toggle update checking
-  on-click-right = "rm ~/.cache/nix-update-last-run";
+  on-click-right = "rm ~/.cache/nix-update-last-run && pkill -RTMIN+12 waybar";
   interval = 3600;
   tooltip = true;
   return-type = "json";

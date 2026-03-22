@@ -157,7 +157,8 @@
         apps.inputs = flake-utils.lib.mkApp {
           drv = waybar-nixos-updates-inputs;
           name = "input-checker";
-        
+        };
+
         apps.lightweight = flake-utils.lib.mkApp {
           drv = waybar-nixos-updates-lightweight;
           name = "lightweight-checker";
@@ -271,6 +272,29 @@
                 '';
               };
               
+              inputChecker = {
+                mode = mkOption {
+                  type = types.enum [ "disabled" "show" "count" ];
+                  default = "disabled";
+                  description = ''
+                    How to handle stale flake inputs (checked via git ls-remote).
+                    - "disabled": Don't check inputs (no resources used)
+                    - "show": Check and show in tooltip, but don't include in count
+                    - "count": Check, show in tooltip, and include in waybar count
+                  '';
+                };
+                pinned = mkOption {
+                  type = types.enum [ "disabled" "show" "count" ];
+                  default = "disabled";
+                  description = ''
+                    How to handle pinned flake inputs (inputs with original.rev set).
+                    - "disabled": Don't check pinned inputs (no resources used)
+                    - "show": Check and show in separate "Pinned:" section, but don't count
+                    - "count": Check, show, and include in waybar count
+                  '';
+                };
+              };
+              
               waybarConfig = mkOption {
                 type = types.attrs;
                 default = {
@@ -320,6 +344,8 @@
                   export SKIP_AFTER_BOOT="${if cfg.skipAfterBoot then "true" else "false"}"
                   export GRACE_PERIOD="${toString cfg.gracePeriod}"
                   export NOTIFICATIONS_ENABLED="${if cfg.notifications then "true" else "false"}"
+                  export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
+                  export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
                   ${if builtins.isString cfg.nixpkgsChannel then ''
                   export NIXPKGS_CHANNEL="${cfg.nixpkgsChannel}"
                   ${if cfg.explicitPackagesOnly != null then ''
@@ -342,6 +368,8 @@
                   export GRACE_PERIOD="${toString cfg.gracePeriod}"
                   export UPDATE_LOCK_FILE="${if cfg.updateLockFile then "true" else "false"}"
                   export NOTIFICATIONS_ENABLED="${if cfg.notifications then "true" else "false"}"
+                  export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
+                  export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
                   exec ${checkerBin} "$@"
                 '';
               };
