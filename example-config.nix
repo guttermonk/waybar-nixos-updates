@@ -4,18 +4,45 @@
 { config, lib, pkgs, ... }:
 
 {
-  # Example 1: Basic Home Manager configuration
+  # Example 1: Basic Home Manager configuration (full mode - default)
   # Add this to your home-manager configuration
   programs.waybar-nixos-updates = {
     enable = true;
     
     # Optional: Override default settings
     updateInterval = 3600;              # Check every hour (in seconds)
-    nixosConfigPath = "~/.config/nixos"; # Path to your NixOS flake
+    nixosConfigPath = "~/.config/nixos"; # Path to your NixOS flake (used by both modes)
     skipAfterBoot = true;                # Don't check immediately after boot
     gracePeriod = 60;                    # Wait 60 seconds after boot before checking
-    updateLockFile = false;              # Use temporary directory for safety
+    updateLockFile = false;              # Use temporary directory for safety (full mode only)
   };
+
+  # Example 1b: Lightweight mode - single channel (fast, simple)
+  # programs.waybar-nixos-updates = {
+  #   enable = true;
+  #   mode = "lightweight";
+  #   nixosConfigPath = "~/.config/nixos";  # Used for flake.lock and .nix file scanning
+  #   nixpkgsChannel = "github:NixOS/nixpkgs/nixos-unstable";
+  #   
+  #   # Optional: Also filter to only explicitly defined packages
+  #   explicitPackagesOnly = true;
+  # };
+
+  # Example 1c: Lightweight mode - dual channel (stable + unstable)
+  # Best for configs that use both pkgs and pkgs-unstable
+  # programs.waybar-nixos-updates = {
+  #   enable = true;
+  #   mode = "lightweight";
+  #   nixosConfigPath = "~/.config/nixos";  # Scans .nix files here for package sources
+  #   nixpkgsChannel = {
+  #     # These identifiers match what you use in your nix files:
+  #     # e.g., "pkgs.bat" or "with pkgs-unstable; [ brave ]"
+  #     stable = "pkgs";
+  #     unstable = "pkgs-unstable";
+  #   };
+  #   # Channels are auto-detected from flake.lock (nixpkgs and nixpkgs-unstable inputs)
+  #   # explicitPackagesOnly defaults to true in dual-channel mode
+  # };
 
   # Example 2: Complete Waybar configuration with the update module
   programs.waybar = {

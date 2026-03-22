@@ -103,16 +103,20 @@ This provides the most flexibility for configuration:
     updateInterval = 3600;          # Check every hour
     notifications = true;           # Set to false to disable desktop notifications
     
-    # Full mode options:
+    # Path to your NixOS flake (used by both modes):
+    # - Full mode: for nix build and nvd diff
+    # - Lightweight mode: for flake.lock and .nix file scanning
     nixosConfigPath = "~/.config/nixos";
+    
+    # Full mode only:
     updateLockFile = false;         # Use temp dir for checks
     
     # Lightweight mode - Option A: Single channel (simple)
     nixpkgsChannel = "github:NixOS/nixpkgs/nixpkgs-unstable";
     
     # Lightweight mode - Option B: Dual channel (for mixed stable/unstable)
+    # Scans nixosConfigPath for .nix files to determine package sources
     # nixpkgsChannel = {
-    #   configDir = "~/.config/nixos";   # Scans all *.nix files
     #   stable = "pkgs";                  # Matches: pkgs.foo, with pkgs; [...]
     #   unstable = "pkgs-unstable";       # Matches: pkgs-unstable.foo, with pkgs-unstable; [...]
     # };
@@ -160,8 +164,12 @@ When using the Home Manager module, you can configure these options:
 - `skipAfterBoot`: Whether to skip update checks right after boot/resume (default: true)
 - `gracePeriod`: Time in seconds to wait after boot/resume before checking (default: 60)
 
+**Both modes:**
+- `nixosConfigPath`: Path to your NixOS configuration flake directory (default: `~/.config/nixos`)
+  - Full mode: Used for `nix build` and `nvd diff`
+  - Lightweight mode: Used for reading `flake.lock` and scanning `.nix` files for package sources
+
 **Full mode only:**
-- `nixosConfigPath`: Path to your NixOS configuration (default: `~/.config/nixos`)
 - `updateLockFile`: Whether to update the lock file directly or use a temporary copy (default: false)
 
 **Lightweight mode only:**
@@ -170,12 +178,12 @@ When using the Home Manager module, you can configure these options:
   - Dual channel (mixed stable/unstable):
     ```nix
     {
-      configDir = "~/.config/nixos";  # Directory to scan for .nix files
       stable = "pkgs";                 # Identifier for stable packages
       unstable = "pkgs-unstable";      # Identifier for unstable packages
     }
     ```
-  - In dual-channel mode, flake refs are auto-detected from your `flake.lock`
+  - In dual-channel mode, `nixosConfigPath` is scanned for `.nix` files to determine package sources, and flake refs are auto-detected from your `flake.lock`
+- `explicitPackagesOnly`: Only report updates for packages explicitly defined in your config files (default: `true` in dual-channel mode, `false` otherwise)
 
 **Lightweight mode features:**
 - **Home-manager packages**: Automatically detected and included (no config needed)
@@ -184,19 +192,24 @@ When using the Home Manager module, you can configure these options:
 
 You can also modify these environment variables or set them at the top of the script to customize behavior:
 
+**Common variables (both modes):**
 - `UPDATE_INTERVAL`: Time in seconds between update checks (default: 3599)
-- `NIXOS_CONFIG_PATH`: Path to your NixOS configuration (default: ~/.config/nixos)
 - `CACHE_DIR`: Directory for storing cache files (default: ~/.cache)
 - `NOTIFICATIONS_ENABLED`: Set to "false" to disable desktop notifications (default: "true")
 - `SKIP_AFTER_BOOT`: Whether to skip update checks right after boot/resume (default: true)
 - `GRACE_PERIOD`: Time in seconds to wait after boot/resume before checking (default: 60)
+
+**Full mode variables:**
+- `NIXOS_CONFIG_PATH`: Path to your NixOS configuration (default: ~/.config/nixos)
 - `UPDATE_LOCK_FILE`: Whether to update the lock file directly or use a temporary copy (default: false)
-- `NIXPKGS_CHANNEL`: Nixpkgs flake ref for single-channel mode (default: github:NixOS/nixpkgs/nixpkgs-unstable)
-- `CONFIG_DIR`: Directory to scan for package names (enables `EXPLICIT_PACKAGES_ONLY` when set)
-- `EXPLICIT_PACKAGES_ONLY`: Only report updates for packages explicitly in config files (default: "true" when `CONFIG_DIR` is set, "false" otherwise). This filters out system dependencies and provides more accurate results.
+
+**Lightweight mode variables:**
+- `FLAKE_DIR`: Path to flake directory - used for reading `flake.lock` and scanning `.nix` files (default: ~/.config/nixos)
+- `NIXPKGS_CHANNEL`: Nixpkgs flake ref for single-channel mode (e.g., "github:NixOS/nixpkgs/nixpkgs-unstable")
+- `DUAL_CHANNEL_MODE`: Set to "true" to enable dual-channel detection from flake.lock (default: "false")
+- `EXPLICIT_PACKAGES_ONLY`: Only report updates for packages explicitly in config files (default: "true" when `DUAL_CHANNEL_MODE` is enabled, "false" otherwise). This filters out system dependencies and provides more accurate results.
 - `STABLE_IDENTIFIER`: Identifier for stable packages in dual-channel mode (default: "pkgs")
 - `UNSTABLE_IDENTIFIER`: Identifier for unstable packages in dual-channel mode (default: "pkgs-unstable")
-- `FLAKE_DIR`: Path to flake directory for auto-detecting channel refs (default: ~/.config/nixos)
 
 ### 🔄 Toggle Functionality
 The script supports toggling update checks on/off. When disabled, it will show the last known state without performing new checks:
@@ -293,8 +306,8 @@ Here's a complete example of using waybar-nixos-updates with Home Manager:
               # nixpkgsChannel = "github:NixOS/nixpkgs/nixpkgs-unstable";
               
               # For dual-channel (mixed stable + unstable packages):
+              # nixosConfigPath is used to scan .nix files for package sources
               nixpkgsChannel = {
-                configDir = "~/.config/nixos";
                 stable = "pkgs";
                 unstable = "pkgs-unstable";
               };

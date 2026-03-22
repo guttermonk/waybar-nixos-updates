@@ -176,16 +176,12 @@
               nixosConfigPath = mkOption {
                 type = types.str;
                 default = "~/.config/nixos";
-                description = "Path to your NixOS configuration (full mode only)";
+                description = "Path to your NixOS configuration flake directory (used by both modes)";
               };
               
               nixpkgsChannel = mkOption {
                 type = types.either types.str (types.submodule {
                   options = {
-                    configDir = mkOption {
-                      type = types.str;
-                      description = "Path to nix config directory to scan for package sources";
-                    };
                     stable = mkOption {
                       type = types.str;
                       default = "pkgs";
@@ -205,11 +201,11 @@
                   Simple (single channel): Set to a flake ref string like "github:NixOS/nixpkgs/nixpkgs-unstable"
                   
                   Dual channel: Set to an attrset with:
-                    - configDir: Path to scan for .nix files
                     - stable: Identifier for stable packages (default: "pkgs")
                     - unstable: Identifier for unstable packages (default: "pkgs-unstable")
                   
-                  In dual channel mode, flake refs are auto-detected from flake.lock.
+                  In dual channel mode, nixosConfigPath is used to scan .nix files for package sources,
+                  and flake refs are auto-detected from flake.lock.
                 '';
               };
               
@@ -238,7 +234,7 @@
                   Only report updates for packages explicitly defined in your config files (lightweight mode only).
                   This filters out system dependencies and provides more accurate results.
                   
-                  Defaults to true when nixpkgsChannel is set to dual-channel mode (attrset with configDir),
+                  Defaults to true when nixpkgsChannel is set to dual-channel mode (attrset),
                   false otherwise. Set explicitly to override the default.
                 '';
               };
@@ -298,7 +294,7 @@
                   export EXPLICIT_PACKAGES_ONLY="${if cfg.explicitPackagesOnly then "true" else "false"}"
                   '' else ""}
                   '' else ''
-                  export CONFIG_DIR="${expandTilde cfg.nixpkgsChannel.configDir}"
+                  export DUAL_CHANNEL_MODE="true"
                   export STABLE_IDENTIFIER="${cfg.nixpkgsChannel.stable}"
                   export UNSTABLE_IDENTIFIER="${cfg.nixpkgsChannel.unstable}"
                   ${if cfg.explicitPackagesOnly != null then ''

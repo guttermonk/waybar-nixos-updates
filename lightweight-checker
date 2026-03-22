@@ -23,10 +23,13 @@ CACHE_DIR="${CACHE_DIR:-$HOME/.cache}"
 FLAKE_DIR="${FLAKE_DIR:-$HOME/.config/nixos}"
 
 # Single channel mode (simple)
+# Set to a flake ref like "github:NixOS/nixpkgs/nixpkgs-unstable"
 NIXPKGS_CHANNEL="${NIXPKGS_CHANNEL:-}"
 
 # Dual channel mode (advanced)
-CONFIG_DIR="${CONFIG_DIR:-}"
+# Set to "true" to enable dual-channel detection from flake.lock
+# When enabled, FLAKE_DIR is used to scan .nix files for package sources
+DUAL_CHANNEL_MODE="${DUAL_CHANNEL_MODE:-false}"
 STABLE_IDENTIFIER="${STABLE_IDENTIFIER:-pkgs}"
 UNSTABLE_IDENTIFIER="${UNSTABLE_IDENTIFIER:-pkgs-unstable}"
 
@@ -37,8 +40,8 @@ NOTIFICATIONS_ENABLED="${NOTIFICATIONS_ENABLED:-true}"
 
 # Filter to only packages explicitly defined in config files
 # This reduces false positives from system dependencies
-# Defaults to "true" when CONFIG_DIR is set, "false" otherwise
-if [ -n "$CONFIG_DIR" ]; then
+# Defaults to "true" when dual channel mode is enabled, "false" otherwise
+if [ "$DUAL_CHANNEL_MODE" = "true" ]; then
     EXPLICIT_PACKAGES_ONLY="${EXPLICIT_PACKAGES_ONLY:-true}"
 else
     EXPLICIT_PACKAGES_ONLY="${EXPLICIT_PACKAGES_ONLY:-false}"
@@ -476,7 +479,7 @@ is_explicit_package() {
 }
 
 update_package_sources_cache() {
-    if [ -z "$CONFIG_DIR" ]; then
+    if [ "$DUAL_CHANNEL_MODE" != "true" ]; then
         return 1
     fi
     
@@ -484,11 +487,11 @@ update_package_sources_cache() {
         # Always extract package-to-channel mapping for dual-channel support
         # Use the fast grep-based extraction instead of slow bash regex loops
         local result
-        result=$(extract_package_channels_fast "$CONFIG_DIR" "$STABLE_IDENTIFIER" "$UNSTABLE_IDENTIFIER")
+        result=$(extract_package_channels_fast "$FLAKE_DIR" "$STABLE_IDENTIFIER" "$UNSTABLE_IDENTIFIER")
         echo "$result" > "$PACKAGE_SOURCES_CACHE"
         
         # Extract explicit packages for filtering (this is fast)
-        extract_explicit_packages "$CONFIG_DIR" > "$EXPLICIT_PACKAGES_CACHE"
+        extract_explicit_packages "$FLAKE_DIR" > "$EXPLICIT_PACKAGES_CACHE"
         
         # Update flake.lock hash
         local flake_lock="$FLAKE_DIR/flake.lock"
@@ -505,7 +508,7 @@ get_package_channel() {
     local pkg_lower="${pkg_name,,}"  # Convert to lowercase for comparison
     
     # If no config parsing, everything uses single channel
-    if [ -z "$CONFIG_DIR" ] || [ ! -f "$PACKAGE_SOURCES_CACHE" ]; then
+    if [ "$DUAL_CHANNEL_MODE" != "true" ] || [ ! -f "$PACKAGE_SOURCES_CACHE" ]; then
         echo "single"
         return
     fi
@@ -601,7 +604,7 @@ check_for_updates_lightweight() {
     local single_channel_mode=true
     local channel="$NIXPKGS_CHANNEL"
     
-    if [ -n "$CONFIG_DIR" ]; then
+    if [ "$DUAL_CHANNEL_MODE" = "true" ]; then
         update_package_sources_cache
         
         if ! detect_channels_from_flake; then
