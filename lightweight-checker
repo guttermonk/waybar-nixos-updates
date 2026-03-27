@@ -37,6 +37,8 @@ UNSTABLE_IDENTIFIER="${UNSTABLE_IDENTIFIER:-pkgs-unstable}"
 SKIP_AFTER_BOOT="${SKIP_AFTER_BOOT:-true}"
 GRACE_PERIOD="${GRACE_PERIOD:-60}"
 NOTIFICATIONS_ENABLED="${NOTIFICATIONS_ENABLED:-true}"
+# Clock format for tooltip timestamps: "24h" (14:23) or "12h" (2:23 PM)
+CLOCK_FORMAT="${CLOCK_FORMAT:-24h}"
 
 # Input checker integration
 # Mode: "disabled" | "show" | "count"
@@ -209,22 +211,31 @@ format_tooltip_header() {
     local current_time
     current_time=$(date +%s)
 
+    local time_fmt
+    if [ "$CLOCK_FORMAT" = "12h" ]; then
+        time_fmt="+%I:%M %p"
+    else
+        time_fmt="+%H:%M"
+    fi
+
     local last_checked next_check
     if [ "$last_run" = "0" ]; then
         last_checked="never"
         next_check="soon"
     else
-        last_checked=$(date -d "@$last_run" "+%H:%M")
+        last_checked=$(date -d "@$last_run" "$time_fmt")
         local next_run=$(( last_run + UPDATE_INTERVAL ))
         if [ "$current_time" -gt "$next_run" ]; then
             next_check="overdue"
         else
-            next_check=$(date -d "@$next_run" "+%H:%M")
+            next_check=$(date -d "@$next_run" "$time_fmt")
         fi
     fi
 
     echo "Last checked: $last_checked · Next check: $next_check"
 }
+</thinking>
+
 
 # ===== Flake Input Checking =====
 check_flake_inputs() {

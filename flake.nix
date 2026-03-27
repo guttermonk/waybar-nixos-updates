@@ -257,6 +257,16 @@
                 default = 60;
                 description = "Time in seconds to wait after boot/resume before checking";
               };
+
+              clockFormat = mkOption {
+                type = types.enum [ "24h" "12h" ];
+                default = "24h";
+                description = ''
+                  Clock format for tooltip timestamps.
+                  - "24h": 14:23
+                  - "12h": 2:23 PM
+                '';
+              };
               
               updateLockFile = mkOption {
                 type = types.bool;
@@ -349,6 +359,7 @@
                   export SKIP_AFTER_BOOT="${if cfg.skipAfterBoot then "true" else "false"}"
                   export GRACE_PERIOD="${toString cfg.gracePeriod}"
                   export NOTIFICATIONS_ENABLED="${if cfg.notifications then "true" else "false"}"
+                  export CLOCK_FORMAT="${cfg.clockFormat}"
                   export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
                   ${if builtins.isString cfg.nixpkgsChannel then ''
@@ -373,6 +384,7 @@
                   export GRACE_PERIOD="${toString cfg.gracePeriod}"
                   export UPDATE_LOCK_FILE="${if cfg.updateLockFile then "true" else "false"}"
                   export NOTIFICATIONS_ENABLED="${if cfg.notifications then "true" else "false"}"
+                  export CLOCK_FORMAT="${cfg.clockFormat}"
                   export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
                   exec ${checkerBin} "$@"
