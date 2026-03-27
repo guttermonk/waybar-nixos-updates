@@ -35,20 +35,11 @@
     # If you have a separate script to update your lock file (i.e. "nix flake update" script)
     # and you have UPDATE_LOCK_FILE set to "false",
     # the UPDATE_FLAG will signal that your lock file has been updated.
-    # Add the following to your update script so that the output of nvd diff is piped in:
-    # | tee >(if grep -qe '\\[U'; then touch \"$HOME/.cache/nix-update-update-flag\"; else rm -f \"$HOME/.cache/nix-update-update-flag\"; fi) &&
-    UPDATE_FLAG="$CACHE_DIR/nix-update-update-flag"
-
-    # The REBUILD_FLAG signals this script to run after your system has been rebuilt.
-    # Add this to your update script:
-    # touch \"$HOME/.cache/nix-update-rebuild-flag\" && pkill -x -RTMIN+12 .waybar-wrapped
-    REBUILD_FLAG="$CACHE_DIR/nix-update-rebuild-flag"
-
-    # The INPUT_UPDATE_FLAG signals that flake inputs were updated (e.g. nix flake update).
-    # Forces an immediate input re-check WITHOUT clearing package state, since the
-    # system hasn't been rebuilt yet. Add this to any alias that runs nix flake update:
-    # touch \"$HOME/.cache/nix-update-input-update-flag\" && pkill -x -RTMIN+12 .waybar-wrapped
-    INPUT_UPDATE_FLAG="$CACHE_DIR/nix-update-input-update-flag"
+    # Auto-detection cache files - no flag files or alias modifications needed.
+    # Stores the last seen /run/current-system path to auto-detect rebuilds.
+    SYSTEM_PATH_FILE="$CACHE_DIR/nix-update-system-path"
+    # Stores the flake.lock hash to auto-detect input updates.
+    FLAKE_LOCK_INPUT_HASH_FILE="$CACHE_DIR/nix-update-flake-lock-input-hash"
 
     # The UPDATING_FLAG signals if upgrade process is currently performing
     # This is required to force waybar module to render while we wait for nixos rebuild.
@@ -197,12 +188,49 @@
         fi
     }
 
-    function sys_updated() {
-      if [ -f "$REBUILD_FLAG" ]; then
-        return 0 # System has been updated
-      else
-        return 1 # System has not been updated
-      fi
+    function check_system_rebuilt() {
+        # Auto-detect rebuild by comparing /run/current-system to cached path.
+        # Triggers whenever nixos-rebuild switch completes, regardless of what changed.
+        # No flag files or alias modifications needed.
+        local current_system
+        current_system=$(readlink /run/current-system 2>/dev/null)
+        local cached_system
+        cached_system=$(cat "$SYSTEM_PATH_FILE" 2>/dev/null || echo "")
+
+        if [ -n "$current_system" ] && [ -z "$cached_system" ]; then
+            # First run - initialize without treating as a rebuild
+            echo "$current_system" > "$SYSTEM_PATH_FILE"
+            return 1
+        elif [ -n "$current_system" ] && [ "$current_system" != "$cached_system" ]; then
+            # Rebuild detected - update cache
+            echo "$current_system" > "$SYSTEM_PATH_FILE"
+            return 0
+        fi
+        return 1
+    }
+
+    function check_inputs_updated() {
+        # Auto-detect flake.lock changes to trigger an immediate input re-check.
+        # Triggers whenever any input is updated via nix flake update, regardless
+        # of which alias or command was used. No flag files needed.
+        local flake_lock="$NIXOS_CONFIG_PATH/flake.lock"
+        [ ! -f "$flake_lock" ] && return 1
+
+        local current_hash
+        current_hash=$(md5sum "$flake_lock" 2>/dev/null | cut -d' ' -f1)
+        local cached_hash
+        cached_hash=$(cat "$FLAKE_LOCK_INPUT_HASH_FILE" 2>/dev/null || echo "")
+
+        if [ -z "$cached_hash" ]; then
+            # First run - initialize without triggering re-check
+            echo "$current_hash" > "$FLAKE_LOCK_INPUT_HASH_FILE"
+            return 1
+        elif [ "$current_hash" != "$cached_hash" ]; then
+            # flake.lock changed - update cache and signal re-check needed
+            echo "$current_hash" > "$FLAKE_LOCK_INPUT_HASH_FILE"
+            return 0
+        fi
+        return 1
     }
 
     function calc_next_update() {
@@ -608,30 +636,20 @@
           local alt=""
           local tooltip=""
 
-          # Delete flags if system was just updated
-          if sys_updated; then
+          # Auto-detect rebuild via /run/current-system comparison
+          if check_system_rebuilt; then
               updates=0
               alt="updated"
               tooltip="System updated"
               echo "$updates" > "$STATE_FILE"
               echo "$tooltip" > "$LAST_RUN_TOOLTIP"
-              # Do NOT zero input/pinned state - if only some inputs were updated
-              # (e.g. checkup only updates nixpkgs/nixpkgs-unstable), other stale
-              # inputs should remain visible. Remove LAST_RUN_FILE instead to force
-              # a fresh full re-check on the next invocation.
-              if [ -f "$UPDATE_FLAG" ]; then
-                rm "$UPDATE_FLAG"
-              fi
-              rm -f "$REBUILD_FLAG"
-              rm -f "$INPUT_UPDATE_FLAG"
+              # Input state is preserved: stale inputs that weren't updated remain visible.
+              # Removing LAST_RUN_FILE forces a fresh full re-check on the next invocation.
               rm -f "$LAST_RUN_FILE"
           else
-              # Check if flake inputs were updated (via INPUT_UPDATE_FLAG from flakeup/checkup).
-              # Package state is intentionally preserved - the system hasn't been rebuilt yet.
-              # Removing LAST_RUN_FILE lets the interval check trigger immediately,
-              # which will re-check inputs and show any that are still stale.
-              if [ -f "$INPUT_UPDATE_FLAG" ]; then
-                  rm -f "$INPUT_UPDATE_FLAG"
+              # Auto-detect flake.lock changes for immediate input re-check.
+              # Package state is intentionally preserved - system hasn't been rebuilt yet.
+              if check_inputs_updated; then
                   rm -f "$LAST_RUN_FILE"
               fi
 
