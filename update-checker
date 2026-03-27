@@ -252,18 +252,46 @@
         echo "$next_update_min"
     }
 
+    function format_tooltip_header() {
+        local last_run
+        last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
+        local current_time
+        current_time=$(date +%s)
+
+        local last_checked next_check
+        if [ "$last_run" = "0" ]; then
+            last_checked="never"
+            next_check="soon"
+        else
+            last_checked=$(date -d "@$last_run" "+%H:%M")
+            local next_run=$(( last_run + UPDATE_INTERVAL ))
+            if [ "$current_time" -gt "$next_run" ]; then
+                next_check="overdue"
+            else
+                next_check=$(date -d "@$next_run" "+%H:%M")
+            fi
+        fi
+
+        echo "Last checked: $last_checked · Next check: $next_check"
+    }
+
     function var_setter() {
         # Ensure updates is a number
         if [ -z "$updates" ]; then
             updates=0
         fi
-        
+
+        local header
+        header=$(format_tooltip_header)
+
         if [ "$updates" -ne 0 ]; then
             alt="has-updates"
-            tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "$updates updates available")
+            local existing_tooltip
+            existing_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "$updates updates available")
+            tooltip="$header\\n=================================================\\n$existing_tooltip"
         else
             alt="updated"
-            tooltip="System updated"
+            tooltip="$header"
         fi
     }
 

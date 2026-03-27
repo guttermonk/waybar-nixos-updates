@@ -203,6 +203,29 @@ calc_next_update() {
     echo "$next_update_min"
 }
 
+format_tooltip_header() {
+    local last_run
+    last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
+    local current_time
+    current_time=$(date +%s)
+
+    local last_checked next_check
+    if [ "$last_run" = "0" ]; then
+        last_checked="never"
+        next_check="soon"
+    else
+        last_checked=$(date -d "@$last_run" "+%H:%M")
+        local next_run=$(( last_run + UPDATE_INTERVAL ))
+        if [ "$current_time" -gt "$next_run" ]; then
+            next_check="overdue"
+        else
+            next_check=$(date -d "@$next_run" "+%H:%M")
+        fi
+    fi
+
+    echo "Last checked: $last_checked · Next check: $next_check"
+}
+
 # ===== Flake Input Checking =====
 check_flake_inputs() {
     local flake_lock="$FLAKE_DIR/flake.lock"
@@ -1265,14 +1288,16 @@ main() {
 
     local tooltip
     tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "System updated")
-    
+    local header
+    header=$(format_tooltip_header)
+
     if [ "$updates" -ne 0 ] 2>/dev/null; then
-        output_json "$updates" "has-updates" "$tooltip"
+        output_json "$updates" "has-updates" "$header\\n=================================================\\n$tooltip"
     elif [ -n "$tooltip" ] && [ "$tooltip" != "System updated" ]; then
         # Items exist but not counted (mode="show")
-        output_json "0" "updated" "$tooltip"
+        output_json "0" "updated" "$header\\n=================================================\\n$tooltip"
     else
-        output_json "0" "updated" "System updated"
+        output_json "0" "updated" "$header"
     fi
 }
 
