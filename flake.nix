@@ -40,12 +40,14 @@
             wrapProgram $out/bin/update-checker \
               --prefix PATH : ${pkgs.lib.makeBinPath [
                 pkgs.coreutils
+                pkgs.findutils
                 pkgs.libnotify
                 pkgs.nvd
                 pkgs.nixVersions.stable
                 pkgs.gnugrep
                 pkgs.gawk
                 pkgs.gnused
+                pkgs.jq
                 pkgs.procps
                 pkgs.systemd
                 pkgs.iproute2
@@ -91,6 +93,7 @@
             wrapProgram $out/bin/lightweight-checker \
               --prefix PATH : ${pkgs.lib.makeBinPath [
                 pkgs.coreutils
+                pkgs.findutils
                 pkgs.gnugrep
                 pkgs.gawk
                 pkgs.gnused
@@ -301,7 +304,7 @@
                   exec = "~/.config/waybar/scripts/update-checker";
                   signal = 12;
                   on-click = "~/.config/waybar/scripts/update-checker toggle";
-                  on-click-right = "rm ~/.cache/nix-update-last-run && pkill -RTMIN+12 .waybar-wrapped";
+                  on-click-right = "rm -f ~/.cache/nix-update-{state,last-run,tooltip,updating-flag} && pkill -RTMIN+12 .waybar-wrapped";
                   interval = cfg.updateInterval;
                   tooltip = true;
                   return-type = "json";
