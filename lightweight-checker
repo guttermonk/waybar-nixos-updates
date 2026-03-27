@@ -226,8 +226,6 @@ format_tooltip_header() {
 
     echo "Last checked: $last_checked · Next check: $next_check"
 }
-</thinking>
-
 
 # ===== Flake Input Checking =====
 check_flake_inputs() {
