@@ -208,9 +208,6 @@ calc_next_update() {
 format_tooltip_header() {
     local last_run
     last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
-    local current_time
-    current_time=$(date +%s)
-
     local time_fmt
     if [ "$CLOCK_FORMAT" = "12h" ]; then
         time_fmt="+%I:%M %p"
@@ -224,12 +221,7 @@ format_tooltip_header() {
         next_check="soon"
     else
         last_checked=$(date -d "@$last_run" "$time_fmt")
-        local next_run=$(( last_run + UPDATE_INTERVAL ))
-        if [ "$current_time" -gt "$next_run" ]; then
-            next_check="overdue"
-        else
-            next_check=$(date -d "@$next_run" "$time_fmt")
-        fi
+        next_check=$(date -d "@$((last_run + UPDATE_INTERVAL))" "$time_fmt")
     fi
 
     echo "Last checked: $last_checked · Next check: $next_check"
