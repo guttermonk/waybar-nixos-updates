@@ -313,6 +313,7 @@
                 type = types.attrs;
                 default = {
                   exec = "~/.config/waybar/scripts/update-checker";
+                  exec-on-event = false;
                   signal = 12;
                   on-click = "~/.config/waybar/scripts/update-checker toggle";
                   on-click-right = "rm -f ~/.cache/nix-update-{state,last-run,tooltip,updating-flag} && pkill -RTMIN+12 .waybar-wrapped";
