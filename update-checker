@@ -609,15 +609,15 @@
               tooltip="System updated"
               echo "$updates" > "$STATE_FILE"
               echo "$tooltip" > "$LAST_RUN_TOOLTIP"
-              # Clear input checker state files
-              echo "0" > "$INPUT_STATE_FILE"
-              echo "" > "$INPUT_TOOLTIP_FILE"
-              echo "0" > "$PINNED_STATE_FILE"
-              echo "" > "$PINNED_TOOLTIP_FILE"
+              # Do NOT zero input/pinned state - if only some inputs were updated
+              # (e.g. checkup only updates nixpkgs/nixpkgs-unstable), other stale
+              # inputs should remain visible. Remove LAST_RUN_FILE instead to force
+              # a fresh full re-check on the next invocation.
               if [ -f "$UPDATE_FLAG" ]; then
                 rm "$UPDATE_FLAG"
               fi
               rm -f "$REBUILD_FLAG"
+              rm -f "$LAST_RUN_FILE"
           else
               # Read state from files
               updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")

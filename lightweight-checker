@@ -1120,17 +1120,18 @@ toggle_updates() {
 main() {
     # Check if system was just rebuilt (via REBUILD_FLAG from update script)
     if [ -f "$REBUILD_FLAG" ]; then
-        # System was rebuilt - clear the update state
+        # System was rebuilt - clear package state but re-check inputs immediately.
+        # Inputs are NOT zeroed: if only some inputs were updated (e.g. checkup only
+        # updates nixpkgs/nixpkgs-unstable), other stale inputs should remain visible.
+        # Removing LAST_RUN_FILE forces a fresh full check on the next invocation,
+        # and refresh_waybar triggers that invocation right away.
         echo "0" > "$STATE_FILE"
         echo "System updated" > "$LAST_RUN_TOOLTIP"
-        # Clear input/pinned state files
-        echo "0" > "$INPUT_STATE_FILE"
-        echo "" > "$INPUT_TOOLTIP_FILE"
-        echo "0" > "$PINNED_STATE_FILE"
-        echo "" > "$PINNED_TOOLTIP_FILE"
         rm -f "$UPDATE_FLAG"
         rm -f "$REBUILD_FLAG"
+        rm -f "$LAST_RUN_FILE"
         output_json "0" "updated" "System updated"
+        refresh_waybar
         exit 0
     fi
     
