@@ -76,9 +76,15 @@ PINNED_TOOLTIP_FILE="$CACHE_DIR/nix-update-pinned-tooltip"
 # The UPDATE_FLAG signals that your lock file has been updated.
 # The REBUILD_FLAG signals this script to clear updates after system rebuild.
 # Add this to your update script:
-# if [ -f "$HOME/.cache/nix-update-update-flag" ]; then touch "$HOME/.cache/nix-update-rebuild-flag" && pkill -x -RTMIN+12 .waybar-wrapped; fi
+# touch "$HOME/.cache/nix-update-rebuild-flag" && pkill -x -RTMIN+12 .waybar-wrapped
 UPDATE_FLAG="$CACHE_DIR/nix-update-update-flag"
 REBUILD_FLAG="$CACHE_DIR/nix-update-rebuild-flag"
+
+# The INPUT_UPDATE_FLAG signals that flake inputs were updated (e.g. nix flake update).
+# Forces an immediate input re-check WITHOUT clearing package state, since the
+# system hasn't been rebuilt yet. Add this to any alias that runs nix flake update:
+# touch "$HOME/.cache/nix-update-input-update-flag" && pkill -x -RTMIN+12 .waybar-wrapped
+INPUT_UPDATE_FLAG="$CACHE_DIR/nix-update-input-update-flag"
 
 # ===== Initialize =====
 mkdir -p "$CACHE_DIR"
@@ -1129,10 +1135,21 @@ main() {
         echo "System updated" > "$LAST_RUN_TOOLTIP"
         rm -f "$UPDATE_FLAG"
         rm -f "$REBUILD_FLAG"
+        rm -f "$INPUT_UPDATE_FLAG"
         rm -f "$LAST_RUN_FILE"
         output_json "0" "updated" "System updated"
         refresh_waybar
         exit 0
+    fi
+
+    # Check if flake inputs were updated (via INPUT_UPDATE_FLAG from flakeup/checkup).
+    # Package state is intentionally preserved - the system hasn't been rebuilt yet.
+    # Removing LAST_RUN_FILE lets the normal interval check trigger immediately,
+    # which will re-check inputs and show any that are still stale.
+    if [ -f "$INPUT_UPDATE_FLAG" ]; then
+        rm -f "$INPUT_UPDATE_FLAG"
+        rm -f "$LAST_RUN_FILE"
+        # Fall through - interval check will now trigger immediately
     fi
     
     # Disabled?

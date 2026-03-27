@@ -19,6 +19,11 @@ CACHE_DIR="${CACHE_DIR:-$HOME/.cache}"
 INPUT_CHECKER_MODE="${INPUT_CHECKER_MODE:-count}"
 INPUT_CHECKER_PINNED="${INPUT_CHECKER_PINNED:-disabled}"
 
+# The INPUT_UPDATE_FLAG signals that flake inputs were updated (e.g. nix flake update).
+# Forces an immediate re-check. Add this to any alias that runs nix flake update:
+# touch "$HOME/.cache/nix-update-input-update-flag" && pkill -x -RTMIN+12 .waybar-wrapped
+INPUT_UPDATE_FLAG="$CACHE_DIR/nix-update-input-update-flag"
+
 STATE_FILE="$CACHE_DIR/nix-update-input-state"
 LAST_RUN_FILE="$CACHE_DIR/nix-update-input-last-run"
 LAST_RUN_TOOLTIP="$CACHE_DIR/nix-update-input-tooltip"
@@ -256,7 +261,15 @@ if [ "$INPUT_CHECKER_MODE" = "disabled" ] && [ "$INPUT_CHECKER_PINNED" = "disabl
     exit 0
 fi
 
+# If flake inputs were updated, force a re-check regardless of interval
+if [ -f "$INPUT_UPDATE_FLAG" ]; then
+    rm -f "$INPUT_UPDATE_FLAG"
+    rm -f "$LAST_RUN_FILE"
+    last_run=0
+fi
+
 if [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
+</thinking>
     if run_checks; then
         updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
     else
