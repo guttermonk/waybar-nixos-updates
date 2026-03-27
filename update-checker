@@ -114,67 +114,66 @@
     }
 
     function check_boot_resume() {
-            # This function detects if the system has recently booted or resumed from hibernation/sleep
-            # Returns 0 (true) if we're in the grace period, 1 (false) otherwise
+            # Detects if system recently booted OR resumed from suspend/hibernate
+            # Returns 0 (true) if we're in grace period, 1 (false) otherwise
 
             local current_time=$(date +%s)
-            local uptime_seconds=$(cat /proc/uptime | awk '{print int($1)}')
+            local uptime_seconds=$(awk '{print int($1)}' /proc/uptime)
             local last_boot_time=$((current_time - uptime_seconds))
 
-            # Check if this is first run after boot
-            if [ ! -f "$BOOT_MARKER_FILE" ] || [ $((current_time - last_boot_time)) -lt "$GRACE_PERIOD" ]; then
-                # We're either in first run or within grace period after boot
+            # Check if this is a recent boot
+            if [ $((current_time - last_boot_time)) -lt "$GRACE_PERIOD" ]; then
                 echo "$current_time" > "$BOOT_MARKER_FILE"
                 return 0
             fi
 
-            # Initialize resume timestamp
-            local last_resume=0
-
-            # Try to detect resume using systemd logs
+            # Check for recent suspend/hibernate resume using journalctl
             if command -v journalctl >/dev/null 2>&1; then
-                # Get timestamp of last resume/wakeup event from systemd journal
-                local resume_log=$(journalctl -b -u systemd-suspend.service -u systemd-hibernate.service -n 1 -o short-unix 2>/dev/null)
-                if [ -n "$resume_log" ]; then
-                    # Extract just the numeric timestamp from the beginning of the line
-                    local timestamp=$(echo "$resume_log" | sed -E 's/^([0-9]+).*/\1/')
-                    if [ -n "$timestamp" ] && [[ "$timestamp" =~ ^[0-9]+$ ]]; then
-                        last_resume=$timestamp
+                local last_resume=0
+                
+                # Method 1: Check sleep.target (most reliable - "Stopped target Sleep" = resume)
+                local resume_timestamp
+                resume_timestamp=$(journalctl -b -u sleep.target --output=short-unix 2>/dev/null \
+                    | grep "Stopped target Sleep" | tail -1 | awk '{print int($1)}')
+                
+                if [[ "$resume_timestamp" =~ ^[0-9]+$ ]] && [ "$resume_timestamp" -gt 0 ]; then
+                    last_resume=$resume_timestamp
+                fi
+                
+                # Method 2: Check systemd suspend/hibernate service timestamps
+                if [ "$last_resume" -eq 0 ]; then
+                    resume_timestamp=$(journalctl -b -u systemd-suspend.service -u systemd-hibernate.service \
+                        -u systemd-hybrid-sleep.service -u systemd-suspend-then-hibernate.service \
+                        --output=short-unix -n 1 2>/dev/null | tail -1 | awk '{print int($1)}')
+                    
+                    if [[ "$resume_timestamp" =~ ^[0-9]+$ ]] && [ "$resume_timestamp" -gt 0 ]; then
+                        last_resume=$resume_timestamp
                     fi
                 fi
-
-                # If no direct service logs, try looking for resume messages in kernel logs
-                if [ $last_resume -eq 0 ]; then
-                    local wake_log=$(journalctl -b -k -g "PM: resumed" -n 1 -o short-unix 2>/dev/null)
-                    if [ -n "$wake_log" ]; then
-                        # Extract just the numeric timestamp from the beginning of the line
-                        local timestamp=$(echo "$wake_log" | sed -E 's/^([0-9]+).*/\1/')
-                        if [ -n "$timestamp" ] && [[ "$timestamp" =~ ^[0-9]+$ ]]; then
-                            last_resume=$timestamp
-                        fi
+                
+                # Method 3: Check kernel PM messages as fallback
+                if [ "$last_resume" -eq 0 ]; then
+                    resume_timestamp=$(journalctl -b -k --grep="PM: suspend exit\|PM: hibernation exit\|PM: restore" \
+                        --output=short-unix -n 1 2>/dev/null | tail -1 | awk '{print int($1)}')
+                    
+                    if [[ "$resume_timestamp" =~ ^[0-9]+$ ]] && [ "$resume_timestamp" -gt 0 ]; then
+                        last_resume=$resume_timestamp
                     fi
                 fi
-            fi
-
-            # Check if we can find resume info in NixOS-specific locations
-            if [ $last_resume -eq 0 ] && [ -d "/run/systemd/system" ]; then
-                # Check systemd sleep state
-                if [ -f "/run/systemd/suspend/active" ] || [ -f "/run/systemd/hibernate/active" ]; then
-                    last_resume=$current_time  # Just woke up
+                
+                # If we found a recent resume event within grace period, trigger it
+                if [ "$last_resume" -gt 0 ] && [ $((current_time - last_resume)) -lt "$GRACE_PERIOD" ]; then
+                    echo "$current_time" > "$BOOT_MARKER_FILE"
+                    return 0
                 fi
             fi
 
-            # If we detected a resume and it's recent, we're in grace period
-            if [ $last_resume -gt 0 ] && [ $((current_time - last_resume)) -lt "$GRACE_PERIOD" ]; then
-                echo "$current_time" > "$BOOT_MARKER_FILE"
-                return 0
-            fi
-
-            # Check if we have a saved boot marker and we're still in grace period
+            # Fallback: Check boot marker for existing grace period
             if [ -f "$BOOT_MARKER_FILE" ]; then
-                local marker_time=$(cat "$BOOT_MARKER_FILE")
+                local marker_time
+                marker_time=$(cat "$BOOT_MARKER_FILE")
                 if [[ "$marker_time" =~ ^[0-9]+$ ]] && [ $((current_time - marker_time)) -lt "$GRACE_PERIOD" ]; then
-                    return 0  # Still in grace period from marker
+                    return 0
                 fi
             fi
 

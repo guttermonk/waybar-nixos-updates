@@ -111,16 +111,63 @@ refresh_waybar() {
 }
 
 check_boot_resume() {
+    # Detects if system recently booted OR resumed from suspend/hibernate
+    # Returns 0 (true) if we're in grace period, 1 (false) otherwise
+    
     local current_time
     current_time=$(date +%s)
     local uptime_seconds
     uptime_seconds=$(awk '{print int($1)}' /proc/uptime)
     local last_boot_time=$((current_time - uptime_seconds))
 
-    if [ ! -f "$BOOT_MARKER_FILE" ] || [ $((current_time - last_boot_time)) -lt "$GRACE_PERIOD" ]; then
+    # Check if this is a recent boot
+    if [ $((current_time - last_boot_time)) -lt "$GRACE_PERIOD" ]; then
         echo "$current_time" > "$BOOT_MARKER_FILE"
         return 0
     fi
+    
+    # Check for recent suspend/hibernate resume using journalctl
+    if command -v journalctl >/dev/null 2>&1; then
+        local last_resume=0
+        
+        # Method 1: Check sleep.target (most reliable - "Stopped target Sleep" = resume)
+        local resume_timestamp
+        resume_timestamp=$(journalctl -b -u sleep.target --output=short-unix 2>/dev/null \
+            | grep "Stopped target Sleep" | tail -1 | awk '{print int($1)}')
+        
+        if [[ "$resume_timestamp" =~ ^[0-9]+$ ]] && [ "$resume_timestamp" -gt 0 ]; then
+            last_resume=$resume_timestamp
+        fi
+        
+        # Method 2: Check systemd suspend/hibernate service timestamps
+        if [ "$last_resume" -eq 0 ]; then
+            resume_timestamp=$(journalctl -b -u systemd-suspend.service -u systemd-hibernate.service \
+                -u systemd-hybrid-sleep.service -u systemd-suspend-then-hibernate.service \
+                --output=short-unix -n 1 2>/dev/null | tail -1 | awk '{print int($1)}')
+            
+            if [[ "$resume_timestamp" =~ ^[0-9]+$ ]] && [ "$resume_timestamp" -gt 0 ]; then
+                last_resume=$resume_timestamp
+            fi
+        fi
+        
+        # Method 3: Check kernel PM messages as fallback
+        if [ "$last_resume" -eq 0 ]; then
+            resume_timestamp=$(journalctl -b -k --grep="PM: suspend exit\|PM: hibernation exit\|PM: restore" \
+                --output=short-unix -n 1 2>/dev/null | tail -1 | awk '{print int($1)}')
+            
+            if [[ "$resume_timestamp" =~ ^[0-9]+$ ]] && [ "$resume_timestamp" -gt 0 ]; then
+                last_resume=$resume_timestamp
+            fi
+        fi
+        
+        # If we found a recent resume event within grace period, trigger it
+        if [ "$last_resume" -gt 0 ] && [ $((current_time - last_resume)) -lt "$GRACE_PERIOD" ]; then
+            echo "$current_time" > "$BOOT_MARKER_FILE"
+            return 0
+        fi
+    fi
+    
+    # Fallback: Check boot marker for existing grace period
     if [ -f "$BOOT_MARKER_FILE" ]; then
         local marker_time
         marker_time=$(cat "$BOOT_MARKER_FILE")
@@ -128,6 +175,8 @@ check_boot_resume() {
             return 0
         fi
     fi
+    
+    # Not in grace period
     return 1
 }
 
