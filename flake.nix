@@ -101,6 +101,7 @@
                 pkgs.systemd
                 pkgs.iproute2
                 pkgs.jq
+                pkgs.nvd
                 pkgs.nixVersions.stable
                 pkgs.libnotify
               ]}

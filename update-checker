@@ -190,8 +190,9 @@
 
     function check_system_rebuilt() {
         # Auto-detect rebuild by comparing /run/current-system to cached path.
-        # Triggers whenever nixos-rebuild switch completes, regardless of what changed.
-        # No flag files or alias modifications needed.
+        # Uses nvd diff on existing store paths (fast, no build needed) to distinguish
+        # package version updates from config-only rebuilds.
+        # Returns 0 only if package versions actually changed.
         local current_system
         current_system=$(readlink /run/current-system 2>/dev/null)
         local cached_system
@@ -202,9 +203,19 @@
             echo "$current_system" > "$SYSTEM_PATH_FILE"
             return 1
         elif [ -n "$current_system" ] && [ "$current_system" != "$cached_system" ]; then
-            # Rebuild detected - update cache
+            # Rebuild detected - update cache then check if packages actually changed
             echo "$current_system" > "$SYSTEM_PATH_FILE"
-            return 0
+            if [ -d "$cached_system" ]; then
+                # Both paths exist - diff them to check if package versions changed.
+                # nvd diff on existing store paths is fast (ms) - no building needed.
+                if nvd diff "$cached_system" "$current_system" 2>/dev/null | grep -q '\[U\]'; then
+                    return 0  # Package versions changed
+                fi
+                return 1  # Config-only rebuild - preserve package state
+            else
+                # Previous path was GC'd - can't diff, assume packages may have changed
+                return 0
+            fi
         fi
         return 1
     }

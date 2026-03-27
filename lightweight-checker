@@ -1128,15 +1128,32 @@ main() {
         # First run - initialize without treating as a rebuild
         echo "$current_system" > "$SYSTEM_PATH_FILE"
     elif [ -n "$current_system" ] && [ "$current_system" != "$cached_system" ]; then
-        # Rebuild detected - update cache, reset package state, force full re-check.
-        # Input state is preserved: stale inputs that weren't updated remain visible.
+        # Rebuild detected - use nvd diff to distinguish package updates from
+        # config-only rebuilds. nvd diff on existing store paths is fast (ms),
+        # since both paths already exist in the nix store - no building needed.
         echo "$current_system" > "$SYSTEM_PATH_FILE"
-        echo "0" > "$STATE_FILE"
-        echo "System updated" > "$LAST_RUN_TOOLTIP"
-        rm -f "$LAST_RUN_FILE"
-        output_json "0" "updated" "System updated"
-        refresh_waybar
-        exit 0
+        local packages_changed=false
+        if [ -d "$cached_system" ]; then
+            # Both paths exist - diff them to check if package versions changed
+            if nvd diff "$cached_system" "$current_system" 2>/dev/null | grep -q '\[U\]'; then
+                packages_changed=true
+            fi
+        else
+            # Previous path was GC'd - can't diff, assume packages may have changed
+            packages_changed=true
+        fi
+
+        if [ "$packages_changed" = true ]; then
+            # Package versions changed - clear state and force immediate re-check.
+            # Input state is preserved: stale inputs that weren't updated remain visible.
+            echo "0" > "$STATE_FILE"
+            echo "System updated" > "$LAST_RUN_TOOLTIP"
+            rm -f "$LAST_RUN_FILE"
+            output_json "0" "updated" "System updated"
+            refresh_waybar
+            exit 0
+        fi
+        # Config-only rebuild - preserve package state, fall through to normal flow
     fi
 
     # Auto-detect flake.lock changes to trigger an immediate input re-check.
