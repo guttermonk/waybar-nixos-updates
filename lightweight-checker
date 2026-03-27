@@ -1172,6 +1172,9 @@ main() {
         if [ "$packages_changed" = true ]; then
             # Package versions changed - clear state and force immediate re-check.
             # Input state is preserved: stale inputs that weren't updated remain visible.
+            # Update flake.lock hash now to avoid a spurious input re-check next run
+            # (flake.lock may have changed as part of this rebuild e.g. via checkup).
+            md5sum "$FLAKE_DIR/flake.lock" 2>/dev/null | cut -d' ' -f1 > "$FLAKE_LOCK_INPUT_HASH_FILE"
             echo "0" > "$STATE_FILE"
             echo "System updated" > "$LAST_RUN_TOOLTIP"
             rm -f "$LAST_RUN_FILE"

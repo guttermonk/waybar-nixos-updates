@@ -683,6 +683,9 @@
               tooltip="System updated"
               echo "$updates" > "$STATE_FILE"
               echo "$tooltip" > "$LAST_RUN_TOOLTIP"
+              # Update flake.lock hash now to avoid a spurious input re-check next run
+              # (flake.lock may have changed as part of this rebuild e.g. via checkup).
+              md5sum "$NIXOS_CONFIG_PATH/flake.lock" 2>/dev/null | cut -d' ' -f1 > "$FLAKE_LOCK_INPUT_HASH_FILE"
               # Input state is preserved: stale inputs that weren't updated remain visible.
               # Removing LAST_RUN_FILE forces a fresh full re-check on the next invocation.
               rm -f "$LAST_RUN_FILE"
