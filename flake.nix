@@ -298,19 +298,20 @@
               waybarConfig = mkOption {
                 type = types.attrs;
                 default = {
-                  exec = checkerBin;
+                  exec = "~/.config/waybar/scripts/update-checker";
                   signal = 12;
-                  on-click = "";
-                  on-click-right = "rm ~/.cache/nix-update-last-run";
+                  on-click = "~/.config/waybar/scripts/update-checker toggle";
+                  on-click-right = "rm ~/.cache/nix-update-last-run && pkill -RTMIN+12 .waybar-wrapped";
                   interval = cfg.updateInterval;
                   tooltip = true;
                   return-type = "json";
-                  format = "{} {icon}";
+                  format = "{icon} {text}";
                   format-icons = {
                     has-updates = "󰚰";
-                    updating = "";
-                    updated = "";
-                    error = "";
+                    updating = "";
+                    updated = "";
+                    error = "";
+                    disabled = "󰔞";
                   };
                 };
                 description = "Waybar module configuration for nix-updates";
