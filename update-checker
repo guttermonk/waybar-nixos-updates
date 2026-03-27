@@ -609,6 +609,11 @@
               tooltip="System updated"
               echo "$updates" > "$STATE_FILE"
               echo "$tooltip" > "$LAST_RUN_TOOLTIP"
+              # Clear input checker state files
+              echo "0" > "$INPUT_STATE_FILE"
+              echo "" > "$INPUT_TOOLTIP_FILE"
+              echo "0" > "$PINNED_STATE_FILE"
+              echo "" > "$PINNED_TOOLTIP_FILE"
               if [ -f "$UPDATE_FLAG" ]; then
                 rm "$UPDATE_FLAG"
               fi
