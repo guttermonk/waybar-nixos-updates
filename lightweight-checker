@@ -1167,6 +1167,11 @@ main() {
             packages_changed=true
         fi
 
+        # Any rebuild invalidates the package-sources cache - the user may have moved
+        # packages between pkgs/pkgs-unstable, which doesn't change flake.lock but
+        # does change which channel a package should be compared against.
+        rm -f "$PACKAGE_SOURCES_CACHE"
+
         if [ "$packages_changed" = true ]; then
             # Package versions changed - clear state and force immediate re-check.
             # Input state is preserved: stale inputs that weren't updated remain visible.
