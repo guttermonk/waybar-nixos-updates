@@ -1131,6 +1131,10 @@ main() {
         # updates nixpkgs/nixpkgs-unstable), other stale inputs should remain visible.
         # Removing LAST_RUN_FILE forces a fresh full check on the next invocation,
         # and refresh_waybar triggers that invocation right away.
+        # Invalidate package-sources cache - user may have moved packages between
+        # pkgs/pkgs-unstable, which doesn't change flake.lock but does change
+        # which channel a package should be compared against.
+        rm -f "$PACKAGE_SOURCES_CACHE"
         echo "0" > "$STATE_FILE"
         echo "System updated" > "$LAST_RUN_TOOLTIP"
         rm -f "$UPDATE_FLAG"
