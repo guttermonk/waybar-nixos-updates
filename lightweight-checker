@@ -662,8 +662,10 @@ extract_package_channels_fast() {
     unstable_pkgs=$(
         {
             # Pattern 1: Direct references like pkgs-unstable.foo
+            # Strip comments before extracting to avoid false positives
             find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
-            xargs -0 grep -hoE "${unstable_id}\\.[a-z][a-zA-Z0-9_-]+" 2>/dev/null | \
+            xargs -0 sed 's/#.*//g' 2>/dev/null | \
+            grep -hoE "${unstable_id}\\.[a-z][a-zA-Z0-9_-]+" 2>/dev/null | \
             sed "s/^${unstable_id}\\.//"
             
             # Pattern 2: (with pkgs-unstable; [ ... ]) blocks
@@ -688,8 +690,10 @@ extract_package_channels_fast() {
     stable_pkgs=$(
         {
             # Pattern 1: Direct references like pkgs.foo (excluding pkgs-unstable, pkgs-stable, etc.)
+            # Strip comments before extracting to avoid false positives
             find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
-            xargs -0 grep -hoP "(?<![a-zA-Z0-9_-])${stable_id}\\.[a-z][a-zA-Z0-9_-]+" 2>/dev/null | \
+            xargs -0 sed 's/#.*//g' 2>/dev/null | \
+            grep -hoP "(?<![a-zA-Z0-9_-])${stable_id}\\.[a-z][a-zA-Z0-9_-]+" 2>/dev/null | \
             grep -v "^${stable_id}-" | \
             sed "s/^${stable_id}\\.//"
             
