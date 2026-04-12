@@ -1163,7 +1163,7 @@ main() {
         local packages_changed=false
         if [ -d "$cached_system" ]; then
             # Both paths exist - diff them to check if package versions changed
-            if nvd diff "$cached_system" "$current_system" 2>/dev/null | grep -q '\[U\]'; then
+            if nvd diff "$cached_system" "$current_system" 2>/dev/null | grep -q '\[U'; then
                 packages_changed=true
             fi
         else

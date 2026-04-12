@@ -210,7 +210,7 @@
             if [ -d "$cached_system" ]; then
                 # Both paths exist - diff them to check if package versions changed.
                 # nvd diff on existing store paths is fast (ms) - no building needed.
-                if nvd diff "$cached_system" "$current_system" 2>/dev/null | grep -q '\[U\]'; then
+                if nvd diff "$cached_system" "$current_system" 2>/dev/null | grep -q '\[U'; then
                     return 0  # Package versions changed
                 fi
                 return 1  # Config-only rebuild - preserve package state
@@ -689,6 +689,10 @@
               # Input state is preserved: stale inputs that weren't updated remain visible.
               # Removing LAST_RUN_FILE forces a fresh full re-check on the next invocation.
               rm -f "$LAST_RUN_FILE"
+              # Output JSON, refresh waybar, and exit immediately
+              echo "{ \"text\":\"$updates\", \"alt\":\"$alt\", \"tooltip\":\"$tooltip\" }"
+              refresh_waybar
+              exit 0
           else
               # Auto-detect flake.lock changes for immediate input re-check.
               # Package state is intentionally preserved - system hasn't been rebuilt yet.
