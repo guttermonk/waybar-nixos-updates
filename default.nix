@@ -310,7 +310,7 @@ let
                 # Show the original tooltip content with disabled indicator and timestamp
                 if [ -n "$existing_tooltip" ] && [ "$existing_tooltip" != "System updated" ]; then
                     # Preserve the original update list with timestamp
-                    tooltip="Updates disabled (Last checked: $last_run_formatted)\n=================================================\n$existing_tooltip"
+                    tooltip="Updates disabled (Last checked: $last_run_formatted)\n─────────────────────────────────────────────────\n$existing_tooltip"
                 else
                     # Fallback if no proper tooltip exists
                     tooltip="Updates disabled ($updates pending)\nLast checked: $last_run_formatted"

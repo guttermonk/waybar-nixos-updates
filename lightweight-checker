@@ -1226,7 +1226,7 @@ main() {
         if [ "$updates" = "0" ] || [ -z "$updates" ]; then
             output_json "$updates" "disabled" "Updates disabled (Last checked: $last_fmt)"
         elif [ -n "$existing" ] && [ "$existing" != "System updated" ]; then
-            output_json "$updates" "disabled" "Updates disabled (Last checked: $last_fmt)\\n=================================================\\n$existing"
+            output_json "$updates" "disabled" "Updates disabled (Last checked: $last_fmt)\\n─────────────────────────────────────────────────\\n$existing"
         else
             output_json "$updates" "disabled" "Updates disabled ($updates pending)\\nLast checked: $last_fmt"
         fi
@@ -1305,10 +1305,10 @@ main() {
     header=$(format_tooltip_header)
 
     if [ "$updates" -ne 0 ] 2>/dev/null; then
-        output_json "$updates" "has-updates" "$header\\n=================================================\\n$tooltip"
+        output_json "$updates" "has-updates" "$header\\n─────────────────────────────────────────────────\\n$tooltip"
     elif [ -n "$tooltip" ] && [ "$tooltip" != "System updated" ]; then
         # Items exist but not counted (mode="show")
-        output_json "0" "updated" "$header\\n=================================================\\n$tooltip"
+        output_json "0" "updated" "$header\\n─────────────────────────────────────────────────\\n$tooltip"
     else
         output_json "0" "updated" "$header"
     fi
