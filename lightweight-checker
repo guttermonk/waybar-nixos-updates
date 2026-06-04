@@ -622,7 +622,10 @@ extract_explicit_packages() {
     local config_dir="$1"
     
     # Common nix/shell keywords and non-package identifiers to filter out
-    local filter_pattern='^(done|else|fi|echo|then|in|let|true|false|null|if|with|import|inherit|rec|self|super|builtins|lib|pkgs|config|options|args|inputs|outputs|system|name|value|enable|default|description|type|example|services|programs|environment|systemd|networking|users|boot|hardware|security|nixpkgs|home|fonts|xdg|gtk|qt|wayland|hyprland|dconf|gnome|kde|prev|final|old|new|src|version|meta|license|homepage|maintainers|platforms|broken|sha256|hash|url|owner|repo|rev|fetchurl|fetchgit|fetchFromGitHub|mkDerivation|stdenv|buildInputs|nativeBuildInputs|propagatedBuildInputs|checkInputs|installPhase|buildPhase|configurePhase|postInstall|preInstall|postBuild|preBuild|makeWrapper|wrapProgram|substituteInPlace|patchShebangs|autoPatchelfHook|pkg|drv|result|override|overrideAttrs|callPackage|writeText|writeScript|writeShellScript|runCommand|symlinkJoin|makeDesktopItem|copyDesktopItems|wrapGAppsHook|gobject|glib|cairo|pango|atk|gdk|pixbuf)$'
+    # NOTE: Only include true Nix language keywords and helper function names here.
+    # Do NOT include names that are also valid nixpkgs packages (e.g., hyprland, gnome, gtk, wayland, etc.)
+    # since Pattern 3 extracts from pkgs.* references which are always legitimate packages.
+    local filter_pattern='^(done|else|fi|echo|then|in|let|true|false|null|if|with|import|inherit|rec|self|super|builtins|lib|pkgs|config|options|args|inputs|outputs|system|name|value|enable|default|description|type|example|services|programs|environment|systemd|networking|users|boot|hardware|security|nixpkgs|home|fonts|xdg|prev|final|old|new|src|version|meta|license|homepage|maintainers|platforms|broken|sha256|hash|url|owner|repo|rev|fetchurl|fetchgit|fetchFromGitHub|mkDerivation|stdenv|buildInputs|nativeBuildInputs|propagatedBuildInputs|checkInputs|installPhase|buildPhase|configurePhase|postInstall|preInstall|postBuild|preBuild|makeWrapper|wrapProgram|substituteInPlace|patchShebangs|autoPatchelfHook|pkg|drv|result|override|overrideAttrs|callPackage|writeText|writeScript|writeShellScript|runCommand|symlinkJoin|makeDesktopItem|copyDesktopItems|wrapGAppsHook)$'
     
     {
         # Pattern 1: Bare identifiers on their own lines (e.g., "  brave  # comment")
