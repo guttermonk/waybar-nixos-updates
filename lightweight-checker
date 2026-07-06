@@ -812,6 +812,7 @@ collect_installed_packages() {
                 version="${version%-doc}"
                 version="${version%-debug}"
                 version="${version%-static}"
+                version="${version%-wrapped}"
                 
                 name_lower="${name,,}"  # Convert to lowercase
                 # Deduplicate - keep first seen (usually the actual package, not deps)
