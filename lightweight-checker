@@ -68,6 +68,7 @@ TOGGLE_FILE="$CACHE_DIR/nix-update-toggle"
 PACKAGE_SOURCES_CACHE="$CACHE_DIR/nix-update-package-sources.json"
 FLAKE_LOCK_HASH_FILE="$CACHE_DIR/nix-update-flake-lock-hash"
 UPDATING_FLAG="$CACHE_DIR/nix-update-updating-flag"
+CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
 EXPLICIT_PACKAGES_CACHE="$CACHE_DIR/nix-update-explicit-packages.txt"
 
 # Input checker state files
@@ -1175,6 +1176,21 @@ toggle_updates() {
     refresh_waybar
 }
 
+refresh_updates() {
+    rm -f "$LAST_RUN_FILE"
+    refresh_waybar
+}
+
+start_background_check() {
+    (
+        flock -n 9 || exit 0
+        touch "$UPDATING_FLAG"
+        check_for_updates_lightweight || true
+        rm -f "$UPDATING_FLAG"
+        refresh_waybar
+    ) 9>"$CHECK_LOCK_FILE" </dev/null >/dev/null 2>&1 &
+}
+
 # ===== Main =====
 main() {
     # Check if system was just rebuilt (via REBUILD_FLAG from update script)
@@ -1261,33 +1277,17 @@ main() {
     current_time=$(date +%s)
 
     if [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
-        # Separating updating and updated phase (like full mode)
-        if [ -f "$UPDATING_FLAG" ]; then
-            # Second phase: actually check for updates
-            if check_for_updates_lightweight; then
-                updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
-            else
-                output_json "?" "error" "Lightweight check failed"
-                rm -f "$UPDATING_FLAG"
-                exit 0
-            fi
-            rm -f "$UPDATING_FLAG"
+        local existing_tooltip
+        existing_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || "")
+        local tooltip
+        if [ "$updates" != "0" ] && [ -n "$existing_tooltip" ] && [ "$existing_tooltip" != "System updated" ]; then
+            tooltip="Checking for updates... Previous check found:\\n─────────────────────────────────────────────\\n$existing_tooltip"
         else
-            # First phase: show "updating" state and trigger re-run
-            local existing_tooltip
-            existing_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || "")
-            local tooltip
-            if [ "$updates" != "0" ] && [ -n "$existing_tooltip" ] && [ "$existing_tooltip" != "System updated" ]; then
-                tooltip="Checking for updates... Previous check found:\\n─────────────────────────────────────────────\\n$existing_tooltip"
-            else
-                tooltip="Checking for updates..."
-            fi
-            touch "$UPDATING_FLAG"
-            output_json "$updates" "updating" "$tooltip"
-            # Signal waybar to refresh, which will trigger second phase
-            refresh_waybar
-            exit 0
+            tooltip="Checking for updates..."
         fi
+        start_background_check
+        output_json "$updates" "updating" "$tooltip"
+        exit 0
     else
         # Throttled - show wait notification if triggered manually
         if [ -t 0 ]; then
@@ -1311,8 +1311,8 @@ main() {
 # Error handler
 trap 'echo "{ \"text\":\"?\", \"alt\":\"error\", \"tooltip\":\"Script error\" }"' ERR
 
-if [ "$1" = "toggle" ]; then
-    toggle_updates
-else
-    main
-fi
+case "${1:-}" in
+    toggle) toggle_updates ;;
+    refresh) refresh_updates ;;
+    *) main ;;
+esac
