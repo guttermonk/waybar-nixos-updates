@@ -1182,13 +1182,16 @@ refresh_updates() {
 }
 
 start_background_check() {
+    setsid -f "$0" check-worker </dev/null >/dev/null 2>&1
+}
+
+run_check_worker() {
     (
         flock -n 9 || exit 0
+        trap 'rm -f "$UPDATING_FLAG"; refresh_waybar' EXIT INT TERM
         touch "$UPDATING_FLAG"
         check_for_updates_lightweight || true
-        rm -f "$UPDATING_FLAG"
-        refresh_waybar
-    ) 9>"$CHECK_LOCK_FILE" </dev/null >/dev/null 2>&1 &
+    ) 9>"$CHECK_LOCK_FILE"
 }
 
 # ===== Main =====
@@ -1314,5 +1317,6 @@ trap 'echo "{ \"text\":\"?\", \"alt\":\"error\", \"tooltip\":\"Script error\" }"
 case "${1:-}" in
     toggle) toggle_updates ;;
     refresh) refresh_updates ;;
+    check-worker) run_check_worker ;;
     *) main ;;
 esac
