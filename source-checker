@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+
+# Optional source-provenance checker for revisions that ordinary package and
+# flake-input checks cannot interpret without an explicit upstream policy.
+
+set -u
+
+FLAKE_DIR="${FLAKE_DIR:-${NIXOS_CONFIG_PATH:-$HOME/.config/nixos}}"
+SOURCE_CHECKS_JSON="${SOURCE_CHECKS_JSON:-[]}"
+
+json_result() {
+    jq -cn --argjson count "$1" --argjson shown "$2" --arg tooltip "$3" \
+        '{count: $count, shown: $shown, tooltip: $tooltip}'
+}
+
+remote_revision() {
+    local repository="$1"
+    local ref="$2"
+    local remote_ref="$ref"
+    [[ "$ref" == "HEAD" ]] || remote_ref="refs/heads/$ref"
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" \
+        git ls-remote "$repository" "$remote_ref" 2>/dev/null | awk 'NR == 1 { print $1 }'
+}
+
+latest_tag() {
+    local repository="$1"
+    local include_pattern="$2"
+    local excluded_json="$3"
+
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote --tags --refs "$repository" 2>/dev/null \
+        | awk '{ sub("refs/tags/", "", $2); print $2 }' \
+        | while IFS= read -r tag; do
+            [[ "$tag" == $include_pattern ]] || continue
+            excluded=false
+            while IFS= read -r pattern; do
+                if [[ "$tag" == $pattern ]]; then
+                    excluded=true
+                    break
+                fi
+            done < <(jq -r '.[]' <<<"$excluded_json")
+            [[ "$excluded" == false ]] && printf '%s\n' "$tag"
+        done \
+        | sort -V \
+        | tail -n 1
+}
+
+flake_input_node() {
+    local input="$1"
+    jq -c --arg input "$input" '
+        . as $lock
+        | $lock.nodes.root.inputs[$input] as $reference
+        | if ($reference | type) == "array" then $reference[0] else $reference end
+        | $lock.nodes[.]
+    ' "$FLAKE_DIR/flake.lock" 2>/dev/null
+}
+
+current_value() {
+    local check="$1"
+    local current_type
+    current_type=$(jq -r '.current' <<<"$check")
+
+    case "$current_type" in
+        flake-input)
+            local node
+            node=$(flake_input_node "$(jq -r '.input' <<<"$check")") || return 1
+            if [[ "$(jq -r '.policy' <<<"$check")" == "tag" ]]; then
+                jq -r '.original.ref // empty' <<<"$node"
+            else
+                jq -r '.locked.rev // empty' <<<"$node"
+            fi
+            ;;
+        local)
+            local path
+            path=$(jq -r '.path' <<<"$check")
+            path=${path/#\~/$HOME}
+            git -C "$path" rev-parse HEAD 2>/dev/null
+            ;;
+        revision)
+            jq -r '.revision // empty' <<<"$check"
+            ;;
+        tag)
+            jq -r '.tag // empty' <<<"$check"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+main() {
+    if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$SOURCE_CHECKS_JSON"; then
+        json_result 0 0 "Invalid sourceChecks configuration"
+        return
+    fi
+
+    local count=0
+    local shown=0
+    local tooltip=""
+
+    while IFS= read -r check; do
+        local mode
+        mode=$(jq -r '.mode' <<<"$check")
+        [[ "$mode" == "disabled" ]] && continue
+
+        local name repository policy current upstream
+        name=$(jq -r '.name' <<<"$check")
+        repository=$(jq -r '.repository' <<<"$check")
+        policy=$(jq -r '.policy' <<<"$check")
+        current=$(current_value "$check")
+
+        case "$policy" in
+            branch)
+                upstream=$(remote_revision "$repository" "$(jq -r '.ref' <<<"$check")")
+                ;;
+            tag)
+                upstream=$(latest_tag \
+                    "$repository" \
+                    "$(jq -r '.tagPattern' <<<"$check")" \
+                    "$(jq -c '.excludeTagPatterns' <<<"$check")")
+                ;;
+            *)
+                upstream=""
+                ;;
+        esac
+
+        [[ -n "$current" && -n "$upstream" && "$current" != "$upstream" ]] || continue
+        shown=$((shown + 1))
+        [[ "$mode" == "count" ]] && count=$((count + 1))
+        [[ -n "$tooltip" ]] && tooltip+="\n"
+        if [[ "$policy" == "tag" ]]; then
+            tooltip+="$name ($current → $upstream)"
+        else
+            tooltip+="$name (${current:0:7} → ${upstream:0:7})"
+        fi
+    done < <(jq -c '.[]' <<<"$SOURCE_CHECKS_JSON")
+
+    json_result "$count" "$shown" "$tooltip"
+}
+
+main

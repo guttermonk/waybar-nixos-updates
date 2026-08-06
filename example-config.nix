@@ -20,7 +20,7 @@
   # Example 1b: Lightweight mode - single channel (fast, simple)
   # programs.waybar-nixos-updates = {
   #   enable = true;
-  #   mode = "lightweight";
+  #   checkMode = "lightweight";
   #   nixosConfigPath = "~/.config/nixos";  # Used for flake.lock and .nix file scanning
   #   nixpkgsChannel = "github:NixOS/nixpkgs/nixos-unstable";
   #   
@@ -32,7 +32,7 @@
   # Best for configs that use both pkgs and pkgs-unstable
   # programs.waybar-nixos-updates = {
   #   enable = true;
-  #   mode = "lightweight";
+  #   checkMode = "lightweight";
   #   nixosConfigPath = "~/.config/nixos";  # Scans .nix files here for package sources
   #   nixpkgsChannel = {
   #     # These identifiers match what you use in your nix files:
@@ -42,6 +42,34 @@
   #   };
   #   # Channels are auto-detected from flake.lock (nixpkgs and nixpkgs-unstable inputs)
   #   # explicitPackagesOnly defaults to true in dual-channel mode
+  # };
+
+  # Example 1e: Generated-output filtering, cost preview, and explicit source policies
+  # programs.waybar-nixos-updates = {
+  #   enable = true;
+  #   checkMode = "lightweight";
+  #   lightweightExcludePatterns = [ "*-fish-completions" "*-man" ];
+  #   dryRunPreview.enable = true;
+  #   sourceChecks = [
+  #     {
+  #       name = "computer-use plugin fork";
+  #       mode = "show";
+  #       current = "flake-input";
+  #       input = "computer-use";
+  #       repository = "https://github.com/upstream/computer-use";
+  #       policy = "branch";
+  #       ref = "main";
+  #     }
+  #     {
+  #       name = "fixed package release";
+  #       mode = "count";
+  #       current = "tag";
+  #       tag = "v1.4.2";
+  #       repository = "https://github.com/example/package";
+  #       policy = "tag";
+  #       tagPattern = "v1.*";
+  #     }
+  #   ];
   # };
 
   # Example 1d: With flake input staleness checking

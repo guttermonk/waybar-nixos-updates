@@ -269,7 +269,6 @@ if [ -f "$INPUT_UPDATE_FLAG" ]; then
 fi
 
 if [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
-</thinking>
     if run_checks; then
         updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
     else

@@ -177,6 +177,7 @@ When using the Home Manager module, you can configure these options:
   - `"show"`: Check and show in separate "Pinned:" section, but don't count
   - `"count"`: Check, show, and include in waybar count
   - Pinned inputs are those with `original.rev` set in flake.lock
+- `sourceChecks`: Explicit upstream policies for sources ordinary package checks cannot interpret. Each check selects `"disabled"`, `"show"`, or `"count"`; a current source (`flake-input`, `revision`, `tag`, or `local`); and either a canonical branch or release-tag policy. This covers intentional pins, fixed revisions in package expressions, local checkouts, named release lines, and forks without guessing intent.
 
 **Both modes:**
 - `nixosConfigPath`: Path to your NixOS configuration flake directory (default: `~/.config/nixos`)
@@ -198,6 +199,9 @@ When using the Home Manager module, you can configure these options:
     ```
   - In dual-channel mode, `nixosConfigPath` is scanned for `.nix` files to determine package sources, and flake refs are auto-detected from your `flake.lock`
 - `explicitPackagesOnly`: Only report updates for packages explicitly defined in your config files (default: `true` in dual-channel mode, `false` otherwise)
+- `lightweightExcludePatterns`: Store-output shell patterns ignored before version parsing (default: `[ "*-fish-completions" ]`)
+- `dryRunPreview.enable`: Update a temporary lock file and run `nix build --dry-run`, adding derivation, download, and size estimates to the tooltip without changing the update count or real lock file
+- `dryRunPreview.target`: Build target for the preview; `${hostname}` is replaced at run time
 
 **Lightweight mode features:**
 - **Home-manager packages**: Automatically detected and included (no config needed)

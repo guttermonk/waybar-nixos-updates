@@ -29,6 +29,8 @@
             mkdir -p $out/bin
             cp update-checker $out/bin/update-checker
             chmod +x $out/bin/update-checker
+            cp source-checker $out/bin/source-checker
+            chmod +x $out/bin/source-checker
             
             # Install icons
             mkdir -p $out/share/icons/waybar-nixos-updates
@@ -38,7 +40,7 @@
             
             # Wrap the script with required dependencies
             wrapProgram $out/bin/update-checker \
-              --prefix PATH : ${pkgs.lib.makeBinPath [
+              --prefix PATH : "$out/bin:${pkgs.lib.makeBinPath [
                 pkgs.coreutils
                 pkgs.findutils
                 pkgs.libnotify
@@ -52,7 +54,8 @@
                 pkgs.systemd
                 pkgs.iproute2
                 pkgs.inetutils
-              ]}
+                pkgs.git
+              ]}"
             
             runHook postInstall
           '';
@@ -83,6 +86,8 @@
             mkdir -p $out/bin
             cp lightweight-checker $out/bin/lightweight-checker
             chmod +x $out/bin/lightweight-checker
+            cp source-checker dry-run-preview $out/bin/
+            chmod +x $out/bin/source-checker $out/bin/dry-run-preview
             
             # Install icons (for notifications)
             mkdir -p $out/share/icons/waybar-nixos-updates
@@ -91,7 +96,7 @@
             fi
             
             wrapProgram $out/bin/lightweight-checker \
-              --prefix PATH : ${pkgs.lib.makeBinPath [
+              --prefix PATH : "$out/bin:${pkgs.lib.makeBinPath [
                 pkgs.coreutils
                 pkgs.findutils
                 pkgs.gnugrep
@@ -103,7 +108,8 @@
                 pkgs.jq
                 pkgs.nixVersions.stable
                 pkgs.libnotify
-              ]}
+                pkgs.git
+              ]}"
             
             runHook postInstall
           '';
@@ -176,6 +182,28 @@
             checkerBin = if isLightweight
               then "${self.packages.${pkgs.stdenv.hostPlatform.system}.lightweight}/bin/lightweight-checker"
               else "${cfg.package}/bin/update-checker";
+            sourceCheckType = types.submodule {
+              options = {
+                name = mkOption { type = types.str; description = "Display name."; };
+                mode = mkOption { type = types.enum [ "disabled" "show" "count" ]; default = "show"; };
+                current = mkOption {
+                  type = types.enum [ "flake-input" "revision" "tag" "local" ];
+                  description = "Where the configured source version comes from.";
+                };
+                input = mkOption { type = types.nullOr types.str; default = null; };
+                revision = mkOption { type = types.nullOr types.str; default = null; };
+                tag = mkOption { type = types.nullOr types.str; default = null; };
+                path = mkOption { type = types.nullOr types.str; default = null; };
+                repository = mkOption { type = types.str; description = "Canonical upstream Git repository URL."; };
+                policy = mkOption { type = types.enum [ "branch" "tag" ]; };
+                ref = mkOption { type = types.str; default = "HEAD"; };
+                tagPattern = mkOption { type = types.str; default = "*"; };
+                excludeTagPatterns = mkOption {
+                  type = types.listOf types.str;
+                  default = [ "*-alpha*" "*-beta*" "*-rc*" "*-pre*" ];
+                };
+              };
+            };
           in {
             options.programs.waybar-nixos-updates = {
               enable = mkEnableOption "waybar-nixos-updates";
@@ -274,6 +302,27 @@
                   false otherwise. Set explicitly to override the default.
                 '';
               };
+
+              lightweightExcludePatterns = mkOption {
+                type = types.listOf types.str;
+                default = [ "*-fish-completions" ];
+                description = "Shell patterns for generated store outputs ignored before lightweight version parsing.";
+              };
+
+              dryRunPreview = {
+                enable = mkEnableOption "a non-mutating update build-cost preview in lightweight mode";
+                target = mkOption {
+                  type = types.str;
+                  default = ".#nixosConfigurations.\${hostname}.config.system.build.toplevel";
+                  description = "Flake target to preview; literal \${hostname} is replaced at run time.";
+                };
+              };
+
+              sourceChecks = mkOption {
+                type = types.listOf sourceCheckType;
+                default = [ ];
+                description = "Explicit checks for fixed revisions, release tags, local checkouts, forks, and flake input policies.";
+              };
               
               inputChecker = {
                 mode = mkOption {
@@ -351,6 +400,10 @@
                   export NOTIFICATIONS_ENABLED="${if cfg.notifications then "true" else "false"}"
                   export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
+                  export LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON=${escapeShellArg (builtins.toJSON cfg.lightweightExcludePatterns)}
+                  export SOURCE_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.sourceChecks)}
+                  export DRY_RUN_PREVIEW="${if cfg.dryRunPreview.enable then "true" else "false"}"
+                  export DRY_RUN_TARGET="${builtins.replaceStrings ["\${hostname}"] ["$(hostname)"] cfg.dryRunPreview.target}"
                   ${if builtins.isString cfg.nixpkgsChannel then ''
                   export NIXPKGS_CHANNEL="${cfg.nixpkgsChannel}"
                   ${if cfg.explicitPackagesOnly != null then ''
@@ -375,6 +428,7 @@
                   export NOTIFICATIONS_ENABLED="${if cfg.notifications then "true" else "false"}"
                   export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
+                  export SOURCE_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.sourceChecks)}
                   exec ${checkerBin} "$@"
                 '';
               };

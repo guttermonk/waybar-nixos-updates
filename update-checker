@@ -11,6 +11,7 @@
     # Input checker: "disabled" | "show" | "count"
     INPUT_CHECKER_MODE="${INPUT_CHECKER_MODE:-disabled}"
     INPUT_CHECKER_PINNED="${INPUT_CHECKER_PINNED:-disabled}"
+    SOURCE_CHECKS_JSON="${SOURCE_CHECKS_JSON:-[]}"
     STATE_FILE="$CACHE_DIR/nix-update-state"
     LAST_RUN_FILE="$CACHE_DIR/nix-update-last-run"
     LAST_RUN_TOOLTIP="$CACHE_DIR/nix-update-tooltip"
@@ -447,9 +448,21 @@
                 pinned_count_for_total=$pinned_count
             fi
         fi
+
+        local source_count=0
+        local source_shown=0
+        local source_tooltip=""
+        if [ "$(jq 'length' <<<"$SOURCE_CHECKS_JSON" 2>/dev/null || echo 0)" -gt 0 ]; then
+            local source_result
+            source_result=$(source-checker)
+            source_count=$(jq -r '.count' <<<"$source_result")
+            source_shown=$(jq -r '.shown' <<<"$source_result")
+            source_tooltip=$(jq -r '.tooltip' <<<"$source_result")
+            source_tooltip=${source_tooltip//$'\n'/\\n}
+        fi
         
         # Calculate total count (only items with mode="count")
-        local total_count=$((pkg_count + input_count_for_total + pinned_count_for_total))
+        local total_count=$((pkg_count + input_count_for_total + pinned_count_for_total + source_count))
         
         # Save results
         echo "$total_count" > "$STATE_FILE"
@@ -460,6 +473,7 @@
         [ "$pkg_count" -gt 0 ] && has_items_to_show=true
         [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ "$input_count" -gt 0 ] && has_items_to_show=true
         [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ "$pinned_count" -gt 0 ] && has_items_to_show=true
+        [ "$source_shown" -gt 0 ] && has_items_to_show=true
         
         if [ "$has_items_to_show" = false ]; then
             echo "System updated" > "$LAST_RUN_TOOLTIP"
@@ -472,6 +486,7 @@
             [ "$pkg_count" -gt 0 ] && section_count=$((section_count + 1))
             [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ "$input_count" -gt 0 ] && section_count=$((section_count + 1))
             [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ "$pinned_count" -gt 0 ] && section_count=$((section_count + 1))
+            [ "$source_shown" -gt 0 ] && section_count=$((section_count + 1))
             local has_multiple_sections=false
             [ "$section_count" -gt 1 ] && has_multiple_sections=true
             
@@ -507,6 +522,14 @@
                     else
                         final_tooltip="$pinned_tooltip"
                     fi
+                fi
+            fi
+
+            if [ "$source_shown" -gt 0 ]; then
+                if [ -n "$final_tooltip" ]; then
+                    final_tooltip="$final_tooltip\\n\\nSources:\\n$source_tooltip"
+                else
+                    final_tooltip="Sources:\\n$source_tooltip"
                 fi
             fi
             

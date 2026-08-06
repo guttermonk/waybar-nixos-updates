@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+FLAKE_DIR="${FLAKE_DIR:-${NIXOS_CONFIG_PATH:-$HOME/.config/nixos}}"
+DRY_RUN_TARGET="${DRY_RUN_TARGET:-.#nixosConfigurations.$(hostname).config.system.build.toplevel}"
+
+tempdir=$(mktemp -d)
+trap 'rm -rf "$tempdir"' EXIT
+
+cp -a "$FLAKE_DIR"/. "$tempdir" || exit 1
+(
+    cd "$tempdir" || exit 1
+    nix flake update >/dev/null 2>&1 || exit 1
+    nix build --dry-run "$DRY_RUN_TARGET" 2>&1
+) | sed $'s/\033\[[0-9;]*m//g'
