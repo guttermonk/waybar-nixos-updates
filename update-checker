@@ -571,6 +571,12 @@
         pkill -x -RTMIN+12 .waybar-wrapped
     }
 
+    function refresh_updates() {
+        # Clear cached results and force a re-check on the next poll
+        rm -f "$STATE_FILE" "$LAST_RUN_FILE" "$LAST_RUN_TOOLTIP" "$UPDATING_FLAG"
+        refresh_waybar
+    }
+
     # ===== Main Function =====
     function main() {
         init_files
@@ -720,9 +726,8 @@
     trap 'echo "{ \"text\":\"?\", \"alt\":\"error\", \"tooltip\":\"Script error occurred\" }" >&2' ERR
     
     # Check for command-line arguments
-    if [ "$1" = "toggle" ]; then
-        toggle_updates
-    else
-        # Execute main function
-        main
-    fi
+    case "${1:-}" in
+        toggle) toggle_updates ;;
+        refresh) refresh_updates ;;
+        *) main ;;
+    esac

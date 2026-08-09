@@ -249,7 +249,7 @@ In json (if adding directly to the config file):
     "exec": "$HOME/bin/update-checker", // <--- path to script
     "signal": 12,
     "on-click": "$HOME/bin/update-checker toggle", // toggle update checking
-    "on-click-right": "rm ~/.cache/nix-update-last-run && pkill -RTMIN+12 waybar", // force an update
+    "on-click-right": "$HOME/bin/update-checker refresh", // force an update
     "interval": 3600, // refresh every hour
     "tooltip": true,
     "return-type": "json",
@@ -270,7 +270,7 @@ In nix (if adding it "the nix way" through home-manager):
   exec = "$HOME/bin/update-checker";  # Or "${pkgs.waybar-nixos-updates}/bin/update-checker" if using the flake
   signal = 12;
   on-click = "$HOME/bin/update-checker toggle";  # Toggle update checking
-  on-click-right = "rm ~/.cache/nix-update-last-run && pkill -RTMIN+12 waybar";
+  on-click-right = "$HOME/bin/update-checker refresh";  # Force an update
   interval = 3600;
   tooltip = true;
   return-type = "json";
