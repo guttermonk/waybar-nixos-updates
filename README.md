@@ -163,6 +163,7 @@ When using the Home Manager module, you can configure these options:
 - `notifications`: Whether to show desktop notifications (default: true)
 - `skipAfterBoot`: Whether to skip update checks right after boot/resume (default: true)
 - `gracePeriod`: Time in seconds to wait after boot/resume before checking (default: 60)
+- `clockFormat`: Clock format for tooltip timestamps - `"24h"` (e.g. `14:23`, default) or `"12h"` (e.g. `2:23 PM`)
 - `inputChecker.mode`: How to handle stale flake inputs (default: `"disabled"`)
   - `"disabled"`: Don't check inputs (no resources used)
   - `"show"`: Check and show in tooltip, but don't include in count
@@ -212,6 +213,7 @@ You can also modify these environment variables or set them at the top of the sc
 - `NOTIFICATIONS_ENABLED`: Set to "false" to disable desktop notifications (default: "true")
 - `SKIP_AFTER_BOOT`: Whether to skip update checks right after boot/resume (default: true)
 - `GRACE_PERIOD`: Time in seconds to wait after boot/resume before checking (default: 60)
+- `CLOCK_FORMAT`: Clock format for tooltip timestamps: "24h" | "12h" (default: "24h")
 - `INPUT_CHECKER_MODE`: How to handle stale inputs: "disabled" | "show" | "count" (default: "disabled")
 - `INPUT_CHECKER_PINNED`: How to handle pinned inputs: "disabled" | "show" | "count" (default: "disabled")
 
@@ -409,40 +411,25 @@ The flake provides the following outputs:
    - Verify the correct script is being executed: check waybar config `exec` path
 
 ### ⚡ System Integration
-You can integrate the updater with your system by modifying your flake update script and your rebuild script to pass the UPDATE_FLAG variable and the REBUILD_FLAG variable, respectively.
+No integration is required. The checker automatically detects both rebuilds and flake input updates on its own - you do **not** need to modify your rebuild script or `nix flake update` aliases, and there are no flag files to `touch`.
 
-#### Your Flake Update Script and the UPDATE_FLAG
-You can integrate your system to control the UPDATE_FLAG, which is saved in the "nix-update-update-flag" cache file. If you have UPDATE_LOCK_FILE set to "true", no further action is required. The program will detect if your lock file has been updated. If you have UPDATE_LOCK_FILE set to "false", the "nix-update-update-flag" file will signal that your lock file has been updated.
+#### Automatic Rebuild Detection
+The checker caches the `/run/current-system` path (in `nix-update-system-path`) and compares it on each run. When it changes, the system has been rebuilt. It then runs `nvd diff` on the two existing store paths (fast - no building) to distinguish a real package update from a config-only rebuild:
+- **Package versions changed:** the count is reset to `0` ("System updated"), and the next check runs on the normal `updateInterval` schedule.
+- **Config-only rebuild:** the existing package state is preserved, so a config change doesn't clear a pending update count.
 
-To integrate the update checker with your system, add the following to the update script you use to update your system's lock file (i.e. your "nix flake update" script), so that the output of nvd diff is piped in:
-`| tee >(if grep -qe '\\[U'; then touch \"$HOME/.cache/nix-update-update-flag\"; else rm -f \"$HOME/.cache/nix-update-update-flag\"; fi) &&`
+#### Automatic Input-Update Detection
+The checker caches a hash of your `flake.lock` (in `nix-update-flake-lock-input-hash`). When the hash changes - i.e. any input was updated via `nix flake update`, regardless of which command or alias ran - it triggers an immediate input re-check while preserving package state.
 
-For example, here's my personal flake update script:
-```nix
-checkup =
-  "pushd ~/.config/nixos &&
-  nix flake update nixpkgs nixpkgs-unstable &&
-  nix build .#nixosConfigurations.'hyprnix'.config.system.build.toplevel &&
-  nvd diff /run/current-system ./result | tee >(if grep -qe '\\[U'; then touch \"$HOME/.cache/nix-update-update-flag\"; else rm -f \"$HOME/.cache/nix-update-update-flag\"; fi) &&
-  popd";
-```
-
-#### 🏗️ Your Rebuild Script and the REBUILD_FLAG
-The REBUILD_FLAG, which is saved in the "nix-update-rebuild-flag" cache file, signals this script to run after your system has been rebuilt. Add this to your update script to create the REBUILD_FLAG and send a signal to waybar to refresh after updating:
-`if [ -f \"$HOME/.cache/nix-update-update-flag\" ]; then touch \"$HOME/.cache/nix-update-rebuild-flag\" && pkill -x -RTMIN+12 .waybar-wrapped; fi &&`
-
-This works with the `signal: 12` parameter in the Waybar configuration, which causes Waybar to run the script when it receives RTMIN+12 signal.
-
-For another example, here's my personal rebuild script:
+Because of the above, a rebuild/update script can be as simple as:
 ```nix
 nixup =
   "pushd ~/.config/nixos &&
   echo \"NixOS rebuilding...\" &&
   sudo nixos-rebuild switch --upgrade --flake .#hyprnix &&
-  if [ -f \"$HOME/.cache/nix-update-update-flag\" ]; then touch \"$HOME/.cache/nix-update-rebuild-flag\" &&
-  pkill -x -RTMIN+12 .waybar-wrapped; fi &&
   popd";
 ```
+Waybar will reflect the new state on its next poll (or immediately if you send it the `RTMIN+12` signal via `pkill -x -RTMIN+12 .waybar-wrapped`).
 
 ## ℹ️ Additional Information
 Some additional things to expect in regards to 1) what notifications you'll receive, 2) what files will be written, 3) and how the script uses your network connection.
@@ -467,8 +454,8 @@ The script uses several cache files in your ~/.cache directory:
 - `nix-update-tooltip`: Contains the tooltip text with update details
 - `nix-update-boot-marker`: Used to detect system boot/resume events
 - `nix-update-toggle`: Stores the enabled/disabled state for update checking
-- `nix-update-update-flag`: Signals that your lock file has been updated
-- `nix-update-rebuild-flag`: Signals that your system has been rebuilt
+- `nix-update-system-path`: Caches the last-seen `/run/current-system` path, used to auto-detect rebuilds
+- `nix-update-flake-lock-input-hash`: Caches a hash of `flake.lock`, used to auto-detect input updates
 - `nix-update-updating-flag`: Signals that an update process is currently performing
 
 ### 🔒 Privacy and Security Considerations
