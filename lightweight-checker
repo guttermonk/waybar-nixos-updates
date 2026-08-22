@@ -37,6 +37,8 @@ UNSTABLE_IDENTIFIER="${UNSTABLE_IDENTIFIER:-pkgs-unstable}"
 SKIP_AFTER_BOOT="${SKIP_AFTER_BOOT:-true}"
 GRACE_PERIOD="${GRACE_PERIOD:-60}"
 NOTIFICATIONS_ENABLED="${NOTIFICATIONS_ENABLED:-true}"
+# Clock format for tooltip timestamps: "24h" (14:23) or "12h" (2:23 PM)
+CLOCK_FORMAT="${CLOCK_FORMAT:-24h}"
 
 # Input checker integration
 # Mode: "disabled" | "show" | "count"
@@ -77,19 +79,11 @@ INPUT_TOOLTIP_FILE="$CACHE_DIR/nix-update-input-tooltip"
 PINNED_STATE_FILE="$CACHE_DIR/nix-update-pinned-state"
 PINNED_TOOLTIP_FILE="$CACHE_DIR/nix-update-pinned-tooltip"
 
-# Rebuild integration flags (for compatibility with update scripts)
-# The UPDATE_FLAG signals that your lock file has been updated.
-# The REBUILD_FLAG signals this script to clear updates after system rebuild.
-# Add this to your update script:
-# touch "$HOME/.cache/nix-update-rebuild-flag" && pkill -x -RTMIN+12 .waybar-wrapped
-UPDATE_FLAG="$CACHE_DIR/nix-update-update-flag"
-REBUILD_FLAG="$CACHE_DIR/nix-update-rebuild-flag"
-
-# The INPUT_UPDATE_FLAG signals that flake inputs were updated (e.g. nix flake update).
-# Forces an immediate input re-check WITHOUT clearing package state, since the
-# system hasn't been rebuilt yet. Add this to any alias that runs nix flake update:
-# touch "$HOME/.cache/nix-update-input-update-flag" && pkill -x -RTMIN+12 .waybar-wrapped
-INPUT_UPDATE_FLAG="$CACHE_DIR/nix-update-input-update-flag"
+# Auto-detection cache files - no flag files or alias modifications needed.
+# Stores the last seen /run/current-system path to auto-detect rebuilds.
+SYSTEM_PATH_FILE="$CACHE_DIR/nix-update-system-path"
+# Stores the flake.lock hash to auto-detect input updates.
+FLAKE_LOCK_INPUT_HASH_FILE="$CACHE_DIR/nix-update-flake-lock-input-hash"
 
 # ===== Initialize =====
 mkdir -p "$CACHE_DIR"
@@ -214,6 +208,28 @@ calc_next_update() {
     local next_update=$((UPDATE_INTERVAL - (current_time - last_run)))
     local next_update_min=$((next_update / 60))
     echo "$next_update_min"
+}
+
+format_tooltip_header() {
+    local last_run
+    last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
+    local time_fmt
+    if [ "$CLOCK_FORMAT" = "12h" ]; then
+        time_fmt="+%I:%M %p"
+    else
+        time_fmt="+%H:%M"
+    fi
+
+    local last_checked next_check
+    if [ "$last_run" = "0" ]; then
+        last_checked="never"
+        next_check="soon"
+    else
+        last_checked=$(date -d "@$last_run" "$time_fmt")
+        next_check=$(date -d "@$((last_run + UPDATE_INTERVAL))" "$time_fmt")
+    fi
+
+    echo "Last checked: $last_checked · Next check: $next_check"
 }
 
 # ===== Flake Input Checking =====
@@ -611,7 +627,10 @@ extract_explicit_packages() {
     local config_dir="$1"
     
     # Common nix/shell keywords and non-package identifiers to filter out
-    local filter_pattern='^(done|else|fi|echo|then|in|let|true|false|null|if|with|import|inherit|rec|self|super|builtins|lib|pkgs|config|options|args|inputs|outputs|system|name|value|enable|default|description|type|example|services|programs|environment|systemd|networking|users|boot|hardware|security|nixpkgs|home|fonts|xdg|gtk|qt|wayland|hyprland|dconf|gnome|kde|prev|final|old|new|src|version|meta|license|homepage|maintainers|platforms|broken|sha256|hash|url|owner|repo|rev|fetchurl|fetchgit|fetchFromGitHub|mkDerivation|stdenv|buildInputs|nativeBuildInputs|propagatedBuildInputs|checkInputs|installPhase|buildPhase|configurePhase|postInstall|preInstall|postBuild|preBuild|makeWrapper|wrapProgram|substituteInPlace|patchShebangs|autoPatchelfHook|pkg|drv|result|override|overrideAttrs|callPackage|writeText|writeScript|writeShellScript|runCommand|symlinkJoin|makeDesktopItem|copyDesktopItems|wrapGAppsHook|gobject|glib|cairo|pango|atk|gdk|pixbuf)$'
+    # NOTE: Only include true Nix language keywords and helper function names here.
+    # Do NOT include names that are also valid nixpkgs packages (e.g., hyprland, gnome, gtk, wayland, etc.)
+    # since Pattern 3 extracts from pkgs.* references which are always legitimate packages.
+    local filter_pattern='^(done|else|fi|echo|then|in|let|true|false|null|if|with|import|inherit|rec|self|super|builtins|lib|pkgs|config|options|args|inputs|outputs|system|name|value|enable|default|description|type|example|services|programs|environment|systemd|networking|users|boot|hardware|security|nixpkgs|home|fonts|xdg|prev|final|old|new|src|version|meta|license|homepage|maintainers|platforms|broken|sha256|hash|url|owner|repo|rev|fetchurl|fetchgit|fetchFromGitHub|mkDerivation|stdenv|buildInputs|nativeBuildInputs|propagatedBuildInputs|checkInputs|installPhase|buildPhase|configurePhase|postInstall|preInstall|postBuild|preBuild|makeWrapper|wrapProgram|substituteInPlace|patchShebangs|autoPatchelfHook|pkg|drv|result|override|overrideAttrs|callPackage|writeText|writeScript|writeShellScript|runCommand|symlinkJoin|makeDesktopItem|copyDesktopItems|wrapGAppsHook)$'
     
     {
         # Pattern 1: Bare identifiers on their own lines (e.g., "  brave  # comment")
@@ -801,6 +820,7 @@ collect_installed_packages() {
                 version="${version%-doc}"
                 version="${version%-debug}"
                 version="${version%-static}"
+                version="${version%-wrapped}"
                 
                 name_lower="${name,,}"  # Convert to lowercase
                 # Deduplicate - keep first seen (usually the actual package, not deps)
@@ -1196,36 +1216,76 @@ run_check_worker() {
 
 # ===== Main =====
 main() {
-    # Check if system was just rebuilt (via REBUILD_FLAG from update script)
-    if [ -f "$REBUILD_FLAG" ]; then
-        # System was rebuilt - clear package state but re-check inputs immediately.
-        # Inputs are NOT zeroed: if only some inputs were updated (e.g. checkup only
-        # updates nixpkgs/nixpkgs-unstable), other stale inputs should remain visible.
-        # Removing LAST_RUN_FILE forces a fresh full check on the next invocation,
-        # and refresh_waybar triggers that invocation right away.
-        # Invalidate package-sources cache - user may have moved packages between
-        # pkgs/pkgs-unstable, which doesn't change flake.lock but does change
-        # which channel a package should be compared against.
+    # Auto-detect rebuild by comparing /run/current-system to cached path.
+    # Triggers whenever nixos-rebuild switch completes, regardless of what changed.
+    # No flag files or alias modifications needed.
+    local current_system
+    current_system=$(readlink /run/current-system 2>/dev/null)
+    local cached_system
+    cached_system=$(cat "$SYSTEM_PATH_FILE" 2>/dev/null || echo "")
+
+    if [ -n "$current_system" ] && [ -z "$cached_system" ]; then
+        # First run - initialize without treating as a rebuild
+        echo "$current_system" > "$SYSTEM_PATH_FILE"
+    elif [ -n "$current_system" ] && [ "$current_system" != "$cached_system" ]; then
+        # Rebuild detected - use nvd diff to distinguish package updates from
+        # config-only rebuilds. nvd diff on existing store paths is fast (ms),
+        # since both paths already exist in the nix store - no building needed.
+        echo "$current_system" > "$SYSTEM_PATH_FILE"
+        local packages_changed=false
+        if [ -d "$cached_system" ]; then
+            # Both paths exist - diff them to check if package versions changed
+            if nvd diff "$cached_system" "$current_system" 2>/dev/null | grep -q '\[U'; then
+                packages_changed=true
+            fi
+        else
+            # Previous path was GC'd - can't diff, assume packages may have changed
+            packages_changed=true
+        fi
+
+        # Any rebuild invalidates the package-sources cache - the user may have moved
+        # packages between pkgs/pkgs-unstable, which doesn't change flake.lock but
+        # does change which channel a package should be compared against.
         rm -f "$PACKAGE_SOURCES_CACHE"
-        echo "0" > "$STATE_FILE"
-        echo "System updated" > "$LAST_RUN_TOOLTIP"
-        rm -f "$UPDATE_FLAG"
-        rm -f "$REBUILD_FLAG"
-        rm -f "$INPUT_UPDATE_FLAG"
-        rm -f "$LAST_RUN_FILE"
-        output_json "0" "updated" "System updated"
-        refresh_waybar
-        exit 0
+
+        if [ "$packages_changed" = true ]; then
+            # Package versions changed - reset count to 0 and mark as just-checked.
+            # Input state is preserved: stale inputs that weren't updated remain visible.
+            # Update flake.lock hash now to avoid a spurious input re-check next run
+            # (flake.lock may have changed as part of this rebuild e.g. via checkup).
+            md5sum "$FLAKE_DIR/flake.lock" 2>/dev/null | cut -d' ' -f1 > "$FLAKE_LOCK_INPUT_HASH_FILE"
+            echo "0" > "$STATE_FILE"
+            echo "System updated" > "$LAST_RUN_TOOLTIP"
+            # Stamp LAST_RUN_FILE with "now" so the interval throttle treats the rebuild
+            # as a completed check and skips an immediate re-check; the next check runs on
+            # the normal updateInterval schedule.
+            echo "$(date +%s)" > "$LAST_RUN_FILE"
+            output_json "0" "updated" "System updated"
+            refresh_waybar
+            exit 0
+        fi
+        # Config-only rebuild - preserve package state, fall through to normal flow
     fi
 
-    # Check if flake inputs were updated (via INPUT_UPDATE_FLAG from flakeup/checkup).
-    # Package state is intentionally preserved - the system hasn't been rebuilt yet.
-    # Removing LAST_RUN_FILE lets the normal interval check trigger immediately,
-    # which will re-check inputs and show any that are still stale.
-    if [ -f "$INPUT_UPDATE_FLAG" ]; then
-        rm -f "$INPUT_UPDATE_FLAG"
-        rm -f "$LAST_RUN_FILE"
-        # Fall through - interval check will now trigger immediately
+    # Auto-detect flake.lock changes to trigger an immediate input re-check.
+    # Triggers whenever any input is updated via nix flake update, regardless
+    # of which alias or command was used. No flag files needed.
+    local flake_lock="$FLAKE_DIR/flake.lock"
+    if [ -f "$flake_lock" ]; then
+        local current_flake_hash
+        current_flake_hash=$(md5sum "$flake_lock" 2>/dev/null | cut -d' ' -f1)
+        local cached_flake_hash
+        cached_flake_hash=$(cat "$FLAKE_LOCK_INPUT_HASH_FILE" 2>/dev/null || echo "")
+
+        if [ -z "$cached_flake_hash" ]; then
+            # First run - initialize without triggering re-check
+            echo "$current_flake_hash" > "$FLAKE_LOCK_INPUT_HASH_FILE"
+        elif [ "$current_flake_hash" != "$cached_flake_hash" ]; then
+            # flake.lock changed - force input re-check, preserve package state
+            echo "$current_flake_hash" > "$FLAKE_LOCK_INPUT_HASH_FILE"
+            rm -f "$LAST_RUN_FILE"
+            # Fall through - interval check will now trigger immediately
+        fi
     fi
     
     # Disabled?
@@ -1300,14 +1360,16 @@ main() {
 
     local tooltip
     tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "System updated")
-    
+    local header
+    header=$(format_tooltip_header)
+
     if [ "$updates" -ne 0 ] 2>/dev/null; then
-        output_json "$updates" "has-updates" "$tooltip"
+        output_json "$updates" "has-updates" "$header\\n─────────────────────────────────────────────────\\n$tooltip"
     elif [ -n "$tooltip" ] && [ "$tooltip" != "System updated" ]; then
         # Items exist but not counted (mode="show")
-        output_json "0" "updated" "$tooltip"
+        output_json "0" "updated" "$header\\n─────────────────────────────────────────────────\\n$tooltip"
     else
-        output_json "0" "updated" "System updated"
+        output_json "0" "updated" "$header"
     fi
 }
 
