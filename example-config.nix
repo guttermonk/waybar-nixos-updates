@@ -20,7 +20,7 @@
   # Example 1b: Lightweight mode - single channel (fast, simple)
   # programs.waybar-nixos-updates = {
   #   enable = true;
-  #   mode = "lightweight";
+  #   checkMode = "lightweight";
   #   nixosConfigPath = "~/.config/nixos";  # Used for flake.lock and .nix file scanning
   #   nixpkgsChannel = "github:NixOS/nixpkgs/nixos-unstable";
   #   
@@ -32,7 +32,7 @@
   # Best for configs that use both pkgs and pkgs-unstable
   # programs.waybar-nixos-updates = {
   #   enable = true;
-  #   mode = "lightweight";
+  #   checkMode = "lightweight";
   #   nixosConfigPath = "~/.config/nixos";  # Scans .nix files here for package sources
   #   nixpkgsChannel = {
   #     # These identifiers match what you use in your nix files:
