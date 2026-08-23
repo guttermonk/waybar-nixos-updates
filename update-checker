@@ -13,6 +13,9 @@
     # Input checker: "disabled" | "show" | "count"
     INPUT_CHECKER_MODE="${INPUT_CHECKER_MODE:-disabled}"
     INPUT_CHECKER_PINNED="${INPUT_CHECKER_PINNED:-disabled}"
+    # Explicit upstream policies for sources the package and input checks cannot
+    # interpret on their own. Empty list means the source checker never runs.
+    SOURCE_CHECKS_JSON="${SOURCE_CHECKS_JSON:-[]}"
     STATE_FILE="$CACHE_DIR/nix-update-state"
     LAST_RUN_FILE="$CACHE_DIR/nix-update-last-run"
     LAST_RUN_TOOLTIP="$CACHE_DIR/nix-update-tooltip"
@@ -516,19 +519,36 @@
             fi
         fi
         
+        local source_count=0
+        local source_shown=0
+        local source_tooltip=""
+        if [ "$(jq 'length' <<<"$SOURCE_CHECKS_JSON" 2>/dev/null || echo 0)" -gt 0 ]; then
+            local source_result
+            source_result=$(source-checker 2>/dev/null)
+            # Fall back to zeroes rather than letting an empty or malformed
+            # result propagate into arithmetic and numeric tests below.
+            source_count=$(jq -r '.count // 0' <<<"$source_result" 2>/dev/null || echo 0)
+            source_shown=$(jq -r '.shown // 0' <<<"$source_result" 2>/dev/null || echo 0)
+            source_tooltip=$(jq -r '.tooltip // ""' <<<"$source_result" 2>/dev/null || echo "")
+            [[ "$source_count" =~ ^[0-9]+$ ]] || source_count=0
+            [[ "$source_shown" =~ ^[0-9]+$ ]] || source_shown=0
+            source_tooltip=${source_tooltip//$'\n'/\\n}
+        fi
+
         # Calculate total count (only items with mode="count")
-        local total_count=$((pkg_count + input_count_for_total + pinned_count_for_total))
-        
+        local total_count=$((pkg_count + input_count_for_total + pinned_count_for_total + source_count))
+
         # Save results
         echo "$total_count" > "$STATE_FILE"
         echo "$(date +%s)" > "$LAST_RUN_FILE"
-    
+
         # Check if there's anything to show (including "show" mode items)
         local has_items_to_show=false
         [ "$pkg_count" -gt 0 ] && has_items_to_show=true
         [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ "$input_count" -gt 0 ] && has_items_to_show=true
         [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ "$pinned_count" -gt 0 ] && has_items_to_show=true
-        
+        [ "$source_shown" -gt 0 ] && has_items_to_show=true
+
         if [ "$has_items_to_show" = false ]; then
             echo "System updated" > "$LAST_RUN_TOOLTIP"
             send_notification "updates-complete" "Update Check Complete" "No updates available" -e
@@ -540,6 +560,7 @@
             [ "$pkg_count" -gt 0 ] && section_count=$((section_count + 1))
             [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ "$input_count" -gt 0 ] && section_count=$((section_count + 1))
             [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ "$pinned_count" -gt 0 ] && section_count=$((section_count + 1))
+            [ "$source_shown" -gt 0 ] && section_count=$((section_count + 1))
             local has_multiple_sections=false
             [ "$section_count" -gt 1 ] && has_multiple_sections=true
             
@@ -577,9 +598,22 @@
                     fi
                 fi
             fi
-            
+
+            # Build sources section
+            if [ "$source_shown" -gt 0 ]; then
+                if [ -n "$final_tooltip" ]; then
+                    final_tooltip="$final_tooltip\\n\\nSources:\\n$source_tooltip"
+                else
+                    if [ "$has_multiple_sections" = true ]; then
+                        final_tooltip="Sources:\\n$source_tooltip"
+                    else
+                        final_tooltip="$source_tooltip"
+                    fi
+                fi
+            fi
+
             echo "$final_tooltip" > "$LAST_RUN_TOOLTIP"
-            
+
             if [ "$total_count" -eq 0 ]; then
                 send_notification "updates-complete" "Update Check Complete" "No countable updates" -e
             elif [ "$total_count" -eq 1 ]; then

@@ -55,6 +55,35 @@
   #   lightweightExcludePatterns = [ "*-fish-completions" "*-zsh-completions" ];
   # };
 
+  # Example 1f: Explicit upstream policies for sources the ordinary checks
+  # cannot interpret - a fork tracking a branch, and a pinned release line.
+  # Each check declares intent, so an intentional pin is not reported as drift.
+  # programs.waybar-nixos-updates = {
+  #   enable = true;
+  #   checkMode = "lightweight";
+  #   sourceChecks = [
+  #     {
+  #       name = "my fork of foo";
+  #       mode = "show";          # tooltip only, not added to the count
+  #       current = "flake-input";
+  #       input = "foo";          # input name as it appears in flake.lock
+  #       repository = "https://github.com/upstream/foo";
+  #       policy = "branch";
+  #       ref = "main";
+  #     }
+  #     {
+  #       name = "bar (pinned release)";
+  #       mode = "count";
+  #       current = "tag";
+  #       tag = "v1.4.2";
+  #       repository = "https://github.com/example/bar";
+  #       policy = "tag";
+  #       tagPattern = "v1.*";    # stay on the v1 line
+  #       # excludeTagPatterns defaults to filtering alpha/beta/rc/pre
+  #     }
+  #   ];
+  # };
+
   # Example 1d: With flake input staleness checking
   # Combines package updates with stale input detection in one tooltip
   # programs.waybar-nixos-updates = {

@@ -29,6 +29,8 @@
             mkdir -p $out/bin
             cp update-checker $out/bin/update-checker
             chmod +x $out/bin/update-checker
+            cp source-checker $out/bin/source-checker
+            chmod +x $out/bin/source-checker
             
             # Install icons
             mkdir -p $out/share/icons/waybar-nixos-updates
@@ -38,7 +40,7 @@
             
             # Wrap the script with required dependencies
             wrapProgram $out/bin/update-checker \
-              --prefix PATH : ${pkgs.lib.makeBinPath [
+              --prefix PATH : "$out/bin:${pkgs.lib.makeBinPath [
                 pkgs.coreutils
                 pkgs.findutils
                 pkgs.libnotify
@@ -52,7 +54,8 @@
                 pkgs.systemd
                 pkgs.iproute2
                 pkgs.inetutils
-              ]}
+                pkgs.git  # source-checker
+              ]}"
             
             runHook postInstall
           '';
@@ -83,6 +86,8 @@
             mkdir -p $out/bin
             cp lightweight-checker $out/bin/lightweight-checker
             chmod +x $out/bin/lightweight-checker
+            cp source-checker $out/bin/source-checker
+            chmod +x $out/bin/source-checker
             
             # Install icons (for notifications)
             mkdir -p $out/share/icons/waybar-nixos-updates
@@ -91,7 +96,7 @@
             fi
             
             wrapProgram $out/bin/lightweight-checker \
-              --prefix PATH : ${pkgs.lib.makeBinPath [
+              --prefix PATH : "$out/bin:${pkgs.lib.makeBinPath [
                 pkgs.coreutils
                 pkgs.findutils
                 pkgs.gnugrep
@@ -105,7 +110,8 @@
                 pkgs.nixVersions.stable
                 pkgs.libnotify
                 pkgs.util-linux  # flock, setsid - background check serialisation
-              ]}
+                pkgs.git  # source-checker
+              ]}"
 
             runHook postInstall
           '';
@@ -178,6 +184,66 @@
             checkerBin = if isLightweight
               then "${self.packages.${pkgs.stdenv.hostPlatform.system}.lightweight}/bin/lightweight-checker"
               else "${cfg.package}/bin/update-checker";
+            sourceCheckType = types.submodule {
+              options = {
+                name = mkOption {
+                  type = types.str;
+                  description = "Display name shown in the tooltip.";
+                };
+                mode = mkOption {
+                  type = types.enum [ "disabled" "show" "count" ];
+                  default = "show";
+                  description = "Whether to skip this check, show it only, or also add it to the waybar count.";
+                };
+                current = mkOption {
+                  type = types.enum [ "flake-input" "revision" "tag" "local" ];
+                  description = "Where the currently configured version comes from.";
+                };
+                input = mkOption {
+                  type = types.nullOr types.str;
+                  default = null;
+                  description = "Flake input name, when current = \"flake-input\".";
+                };
+                revision = mkOption {
+                  type = types.nullOr types.str;
+                  default = null;
+                  description = "Pinned commit, when current = \"revision\".";
+                };
+                tag = mkOption {
+                  type = types.nullOr types.str;
+                  default = null;
+                  description = "Pinned tag, when current = \"tag\".";
+                };
+                path = mkOption {
+                  type = types.nullOr types.str;
+                  default = null;
+                  description = "Local git checkout, when current = \"local\".";
+                };
+                repository = mkOption {
+                  type = types.str;
+                  description = "Canonical upstream Git repository URL to compare against.";
+                };
+                policy = mkOption {
+                  type = types.enum [ "branch" "tag" ];
+                  description = "Whether upstream is the tip of a branch or the latest matching tag.";
+                };
+                ref = mkOption {
+                  type = types.str;
+                  default = "HEAD";
+                  description = "Branch to track, when policy = \"branch\".";
+                };
+                tagPattern = mkOption {
+                  type = types.str;
+                  default = "*";
+                  description = "Shell pattern the tag must match, when policy = \"tag\".";
+                };
+                excludeTagPatterns = mkOption {
+                  type = types.listOf types.str;
+                  default = [ "*-alpha*" "*-beta*" "*-rc*" "*-pre*" ];
+                  description = "Tag patterns to ignore, so prereleases don't register as updates.";
+                };
+              };
+            };
           in {
             options.programs.waybar-nixos-updates = {
               enable = mkEnableOption "waybar-nixos-updates";
@@ -287,6 +353,21 @@
                 '';
               };
 
+              sourceChecks = mkOption {
+                type = types.listOf sourceCheckType;
+                default = [ ];
+                description = ''
+                  Explicit upstream policies for sources the ordinary package and flake-input
+                  checks cannot interpret on their own: fixed revisions in package expressions,
+                  local checkouts, named release lines, and forks.
+
+                  Each check needs a current source and an upstream policy, so intent is stated
+                  rather than guessed. Checks run git ls-remote against the upstream repository,
+                  bounded by SOURCE_CHECK_TIMEOUT (default 60s) per call, and are skipped
+                  entirely when there is no network.
+                '';
+              };
+
               lightweightExcludePatterns = mkOption {
                 type = types.listOf types.str;
                 default = [ "*-fish-completions" ];
@@ -384,6 +465,7 @@
                   export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
                   export LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON=${escapeShellArg (builtins.toJSON cfg.lightweightExcludePatterns)}
+                  export SOURCE_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.sourceChecks)}
                   ${if builtins.isString cfg.nixpkgsChannel then ''
                   export NIXPKGS_CHANNEL="${cfg.nixpkgsChannel}"
                   ${if cfg.explicitPackagesOnly != null then ''
@@ -409,6 +491,7 @@
                   export CLOCK_FORMAT="${cfg.clockFormat}"
                   export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
+                  export SOURCE_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.sourceChecks)}
                   exec ${checkerBin} "$@"
                 '';
               };
