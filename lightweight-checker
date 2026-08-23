@@ -85,6 +85,12 @@ BOOT_MARKER_FILE="$CACHE_DIR/nix-update-boot-marker"
 TOGGLE_FILE="$CACHE_DIR/nix-update-toggle"
 PACKAGE_SOURCES_CACHE="$CACHE_DIR/nix-update-package-sources.json"
 FLAKE_LOCK_HASH_FILE="$CACHE_DIR/nix-update-flake-lock-hash"
+# Set by `refresh` to request a check before the interval is up. A flag rather
+# than deleting LAST_RUN_FILE, because that file is also where the tooltip's
+# "Last checked" time comes from - removing it to force a check would erase the
+# very timestamp the header needs to display.
+FORCE_CHECK_FLAG="$CACHE_DIR/nix-update-force-check"
+
 # Held for the duration of a background check so only one runs at a time.
 # The file holds "<pgid> <start-epoch>" of the worker that owns it.
 CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
@@ -233,7 +239,11 @@ calc_next_update() {
     echo "$next_update_min"
 }
 
+# With no argument: "Last checked: X · Next check: Y".
+# With "checking":  "Last checked: X · Checking for updates..." - the layout
+# stays put while a check runs, so only the right-hand half changes.
 format_tooltip_header() {
+    local state="${1:-idle}"
     local last_run
     last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
     local time_fmt
@@ -252,7 +262,11 @@ format_tooltip_header() {
         next_check=$(date -d "@$((last_run + UPDATE_INTERVAL))" "$time_fmt")
     fi
 
-    echo "Last checked: $last_checked · Next check: $next_check"
+    if [ "$state" = "checking" ]; then
+        echo "Last checked: $last_checked · Checking for updates..."
+    else
+        echo "Last checked: $last_checked · Next check: $next_check"
+    fi
 }
 
 # ===== Flake Input Checking =====
@@ -1217,11 +1231,11 @@ toggle_updates() {
     refresh_waybar
 }
 
-# Force a re-check on the next poll. Deliberately keeps the previous count and
-# tooltip so the widget shows the last known result while the check runs,
-# rather than blanking. Matches update-checker's refresh.
+# Force a re-check on the next poll. Deliberately keeps the previous count,
+# tooltip and last-checked time so the widget shows the last known result while
+# the check runs, rather than blanking. Matches update-checker's refresh.
 refresh_updates() {
-    rm -f "$LAST_RUN_FILE"
+    touch "$FORCE_CHECK_FLAG"
     refresh_waybar
 }
 
@@ -1395,19 +1409,35 @@ main() {
     local current_time
     current_time=$(date +%s)
 
-    if [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
+    # Report the checking state for as long as a worker is actually alive, not
+    # just on the poll that started it - otherwise a manual refresh inside the
+    # interval would flip straight back to "Next check" while still running.
+    local checking=false
+    if worker_running; then
+        checking=true
+    elif [ -f "$FORCE_CHECK_FLAG" ] || [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
+        # Cleared here rather than in the worker: the request has been honoured
+        # once a check is under way, and leaving it set would re-trigger on
+        # every poll if that check fails.
+        rm -f "$FORCE_CHECK_FLAG"
         # The check runs detached rather than inline: it can take a while, and
         # blocking here stalls the waybar module. The worker signals waybar when
         # it finishes, and that poll picks the result up from the state files.
+        start_background_check
+        checking=true
+    fi
+
+    if [ "$checking" = true ]; then
         local existing_tooltip
         existing_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
+        local header
+        header=$(format_tooltip_header checking)
         local tooltip
-        if [ "$updates" != "0" ] && [ -n "$existing_tooltip" ] && [ "$existing_tooltip" != "System updated" ]; then
-            tooltip="Checking for updates... Previous check found:\\n─────────────────────────────────────────────────\\n$existing_tooltip"
+        if [ -n "$existing_tooltip" ] && [ "$existing_tooltip" != "System updated" ]; then
+            tooltip="$header\\n─────────────────────────────────────────────────\\n$existing_tooltip"
         else
-            tooltip="Checking for updates..."
+            tooltip="$header"
         fi
-        start_background_check
         output_json "$updates" "updating" "$tooltip"
         exit 0
     else

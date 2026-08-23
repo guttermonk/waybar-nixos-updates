@@ -52,6 +52,11 @@
     # The UPDATING_FLAG signals if upgrade process is currently performing
     # This is required to force waybar module to render while we wait for nixos rebuild.
     UPDATING_FLAG="$CACHE_DIR/nix-update-updating-flag"
+    # Set by `refresh` to request a check before the interval is up. A flag
+    # rather than deleting LAST_RUN_FILE, because that file is also where the
+    # tooltip's "Last checked" time comes from - removing it to force a check
+    # would erase the very timestamp the header needs to display.
+    FORCE_CHECK_FLAG="$CACHE_DIR/nix-update-force-check"
 
 
     # ===== Initialize Files =====
@@ -260,7 +265,11 @@
         echo "$next_update_min"
     }
 
+    # With no argument: "Last checked: X · Next check: Y".
+    # With "checking":  "Last checked: X · Checking for updates..." - the layout
+    # stays put while a check runs, so only the right-hand half changes.
     function format_tooltip_header() {
+        local state="${1:-idle}"
         local last_run
         last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
         local time_fmt
@@ -279,7 +288,11 @@
             next_check=$(date -d "@$((last_run + UPDATE_INTERVAL))" "$time_fmt")
         fi
 
-        echo "Last checked: $last_checked · Next check: $next_check"
+        if [ "$state" = "checking" ]; then
+            echo "Last checked: $last_checked · Checking for updates..."
+        else
+            echo "Last checked: $last_checked · Next check: $next_check"
+        fi
     }
 
     function var_setter() {
@@ -665,7 +678,11 @@
     # runs, rather than blanking. Matches lightweight-checker's refresh.
     # UPDATING_FLAG is cleared so the two-phase check restarts from phase one.
     function refresh_updates() {
-        rm -f "$LAST_RUN_FILE" "$UPDATING_FLAG"
+        # refresh is dispatched without going through main, so init_files has
+        # not run and the cache dir may not exist yet.
+        mkdir -p "$CACHE_DIR"
+        touch "$FORCE_CHECK_FLAG"
+        rm -f "$UPDATING_FLAG"
         pkill -x -RTMIN+12 .waybar-wrapped
     }
 
@@ -762,9 +779,13 @@
 
              
               # Decide whether to show saved state or perform new check
-              if [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
+              if [ -f "$FORCE_CHECK_FLAG" ] || [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
                   # Separating updating and updated phase
                   if [ -f "$UPDATING_FLAG" ]; then
+                      # The check is happening now, so the refresh request has
+                      # been honoured. Cleared here rather than after the check
+                      # so a failing check does not re-trigger on every poll.
+                      rm -f "$FORCE_CHECK_FLAG"
                       # Time to check for updates
                       if check_for_updates; then
                           updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
@@ -781,12 +802,14 @@
                   else
                       updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
                       alt="updating"
-                      # Show previous updates while checking for new ones
-                      local existing_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || "")
-                      if [ "$updates" != "0" ] && [ -n "$existing_tooltip" ] && [ "$existing_tooltip" != "System updated" ]; then
-                          tooltip="Checking for updates... Previous check found:\n─────────────────────────────────────────────\n$existing_tooltip"
+                      # Show previous updates while checking for new ones, under
+                      # the same header layout as the idle state.
+                      local existing_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
+                      local header=$(format_tooltip_header checking)
+                      if [ -n "$existing_tooltip" ] && [ "$existing_tooltip" != "System updated" ]; then
+                          tooltip="$header\n─────────────────────────────────────────────────\n$existing_tooltip"
                       else
-                          tooltip="Checking for updates..."
+                          tooltip="$header"
                       fi
                       touch "$UPDATING_FLAG"
                       # Rerun same script just to show updating status and

@@ -410,7 +410,7 @@ The flake provides the following outputs:
 5. **Module shows "updating" indefinitely**
    - In lightweight mode a background check may still be running; it holds `~/.cache/nix-update-check.lock` for its duration
    - A check still holding the lock after 15 minutes is treated as wedged — its process group is killed and the next check proceeds. Override with `MAX_CHECK_SECONDS`.
-   - Force a fresh check: `update-checker refresh`
+   - Force a fresh check: `update-checker refresh` — this keeps the current count, tooltip and last-checked time on screen, and swaps the header's "Next check" for "Checking for updates..." while it runs
    - In full mode, clear the updating flag: `rm ~/.cache/nix-update-updating-flag`
    - Restart waybar: `pkill waybar && waybar &`
 
@@ -466,6 +466,7 @@ The script uses several cache files in your ~/.cache directory:
 - `nix-update-flake-lock-input-hash`: Caches a hash of `flake.lock`, used to auto-detect input updates
 - `nix-update-updating-flag`: Signals that a check is mid-run (full mode only)
 - `nix-update-check.lock`: Held while a background check runs, so only one runs at a time (lightweight mode only)
+- `nix-update-force-check`: Set by `refresh` to request a check before the interval is up; cleared once that check starts
 
 ### 🔒 Privacy and Security Considerations
 The script checks network connectivity locally using the `ip` command to verify network interfaces and routing tables. This approach:
