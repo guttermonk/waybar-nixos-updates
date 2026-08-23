@@ -76,7 +76,15 @@ BOOT_MARKER_FILE="$CACHE_DIR/nix-update-boot-marker"
 TOGGLE_FILE="$CACHE_DIR/nix-update-toggle"
 PACKAGE_SOURCES_CACHE="$CACHE_DIR/nix-update-package-sources.json"
 FLAKE_LOCK_HASH_FILE="$CACHE_DIR/nix-update-flake-lock-hash"
-UPDATING_FLAG="$CACHE_DIR/nix-update-updating-flag"
+# Held for the duration of a background check so only one runs at a time.
+# The file holds "<pgid> <start-epoch>" of the worker that owns it.
+CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
+
+# A check still holding the lock after this long is treated as wedged and killed.
+# The lock fd is inherited by every process the check spawns, so an orphaned nix
+# or git child can keep holding it after the worker itself is gone - without this
+# escape hatch that would block all future checks permanently.
+MAX_CHECK_SECONDS="${MAX_CHECK_SECONDS:-900}"
 EXPLICIT_PACKAGES_CACHE="$CACHE_DIR/nix-update-explicit-packages.txt"
 
 # Input checker state files
@@ -1162,6 +1170,59 @@ toggle_updates() {
     refresh_waybar
 }
 
+# Force a re-check on the next poll. Deliberately keeps the previous count and
+# tooltip so the widget shows the last known result while the check runs,
+# rather than blanking. Matches update-checker's refresh.
+refresh_updates() {
+    rm -f "$LAST_RUN_FILE"
+    refresh_waybar
+}
+
+# True while a background check holds the lock. A lock held past
+# MAX_CHECK_SECONDS is considered wedged: its process group is killed and this
+# reports "not running" so the next check can proceed.
+worker_running() {
+    # Lock free means nothing is running.
+    flock -n "$CHECK_LOCK_FILE" true 2>/dev/null && return 1
+
+    local pgid started now
+    # Racing a worker between its truncate and its write - assume it is live.
+    read -r pgid started < "$CHECK_LOCK_FILE" 2>/dev/null || return 0
+    [[ "$pgid" =~ ^[0-9]+$ && "$started" =~ ^[0-9]+$ ]] || return 0
+
+    now=$(date +%s)
+    if [ $((now - started)) -gt "$MAX_CHECK_SECONDS" ]; then
+        # setsid put the worker in its own process group, so this reaches the
+        # check and every child that inherited the lock fd.
+        kill -TERM "-$pgid" 2>/dev/null
+        sleep 1
+        kill -KILL "-$pgid" 2>/dev/null
+        return 1
+    fi
+    return 0
+}
+
+start_background_check() {
+    # Only an optimisation to avoid spawn churn on every poll - the worker's own
+    # flock is what actually guarantees a single check at a time.
+    worker_running && return 0
+    setsid -f "$0" check-worker </dev/null >/dev/null 2>&1 || true
+}
+
+run_check_worker() {
+    (
+        # Another worker got there first; leave its run alone.
+        flock -n 9 || exit 0
+        # Record owner and start time so a wedged check can be identified.
+        # setsid makes the worker its own process group leader, so this pgid
+        # covers every child the check spawns.
+        printf '%s %s\n' "$(($(ps -o pgid= -p $$)))" "$(date +%s)" >&9
+        # Refresh even on failure so the widget leaves the "checking" state.
+        trap 'refresh_waybar' EXIT INT TERM
+        check_for_updates_lightweight || true
+    ) 9>"$CHECK_LOCK_FILE"
+}
+
 # ===== Main =====
 main() {
     # Auto-detect rebuild by comparing /run/current-system to cached path.
@@ -1288,33 +1349,20 @@ main() {
     current_time=$(date +%s)
 
     if [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
-        # Separating updating and updated phase (like full mode)
-        if [ -f "$UPDATING_FLAG" ]; then
-            # Second phase: actually check for updates
-            if check_for_updates_lightweight; then
-                updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
-            else
-                output_json "?" "error" "Lightweight check failed"
-                rm -f "$UPDATING_FLAG"
-                exit 0
-            fi
-            rm -f "$UPDATING_FLAG"
+        # The check runs detached rather than inline: it can take a while, and
+        # blocking here stalls the waybar module. The worker signals waybar when
+        # it finishes, and that poll picks the result up from the state files.
+        local existing_tooltip
+        existing_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
+        local tooltip
+        if [ "$updates" != "0" ] && [ -n "$existing_tooltip" ] && [ "$existing_tooltip" != "System updated" ]; then
+            tooltip="Checking for updates... Previous check found:\\n─────────────────────────────────────────────────\\n$existing_tooltip"
         else
-            # First phase: show "updating" state and trigger re-run
-            local existing_tooltip
-            existing_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || "")
-            local tooltip
-            if [ "$updates" != "0" ] && [ -n "$existing_tooltip" ] && [ "$existing_tooltip" != "System updated" ]; then
-                tooltip="Checking for updates... Previous check found:\\n=============================================\\n$existing_tooltip"
-            else
-                tooltip="Checking for updates..."
-            fi
-            touch "$UPDATING_FLAG"
-            output_json "$updates" "updating" "$tooltip"
-            # Signal waybar to refresh, which will trigger second phase
-            refresh_waybar
-            exit 0
+            tooltip="Checking for updates..."
         fi
+        start_background_check
+        output_json "$updates" "updating" "$tooltip"
+        exit 0
     else
         # Throttled - show wait notification if triggered manually
         if [ -t 0 ]; then
@@ -1340,8 +1388,9 @@ main() {
 # Error handler
 trap 'echo "{ \"text\":\"?\", \"alt\":\"error\", \"tooltip\":\"Script error\" }"' ERR
 
-if [ "$1" = "toggle" ]; then
-    toggle_updates
-else
-    main
-fi
+case "${1:-}" in
+    toggle)       toggle_updates ;;
+    refresh)      refresh_updates ;;
+    check-worker) run_check_worker ;;
+    *)            main ;;
+esac

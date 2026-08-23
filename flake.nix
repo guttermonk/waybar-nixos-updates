@@ -104,8 +104,9 @@
                 pkgs.nvd
                 pkgs.nixVersions.stable
                 pkgs.libnotify
+                pkgs.util-linux  # flock, setsid - background check serialisation
               ]}
-            
+
             runHook postInstall
           '';
           
@@ -335,7 +336,7 @@
                   exec-on-event = false;
                   signal = 12;
                   on-click = "~/.config/waybar/scripts/update-checker toggle";
-                  on-click-right = "rm -f ~/.cache/nix-update-{state,last-run,tooltip,updating-flag} && pkill -RTMIN+12 .waybar-wrapped";
+                  on-click-right = "~/.config/waybar/scripts/update-checker refresh";
                   interval = cfg.updateInterval;
                   tooltip = true;
                   return-type = "json";

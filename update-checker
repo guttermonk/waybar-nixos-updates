@@ -616,6 +616,15 @@
         pkill -x -RTMIN+12 .waybar-wrapped
     }
 
+    # Force a re-check on the next poll. Deliberately keeps the previous count
+    # and tooltip so the widget shows the last known result while the check
+    # runs, rather than blanking. Matches lightweight-checker's refresh.
+    # UPDATING_FLAG is cleared so the two-phase check restarts from phase one.
+    function refresh_updates() {
+        rm -f "$LAST_RUN_FILE" "$UPDATING_FLAG"
+        pkill -x -RTMIN+12 .waybar-wrapped
+    }
+
     # ===== Main Function =====
     function main() {
         init_files
@@ -764,9 +773,8 @@
     trap 'echo "{ \"text\":\"?\", \"alt\":\"error\", \"tooltip\":\"Script error occurred\" }" >&2' ERR
     
     # Check for command-line arguments
-    if [ "$1" = "toggle" ]; then
-        toggle_updates
-    else
-        # Execute main function
-        main
-    fi
+    case "${1:-}" in
+        toggle)  toggle_updates ;;
+        refresh) refresh_updates ;;
+        *)       main ;;
+    esac

@@ -248,7 +248,7 @@ In json (if adding directly to the config file):
     "exec": "$HOME/bin/update-checker", // <--- path to script
     "signal": 12,
     "on-click": "$HOME/bin/update-checker toggle", // toggle update checking
-    "on-click-right": "rm ~/.cache/nix-update-last-run && pkill -RTMIN+12 waybar", // force an update
+    "on-click-right": "$HOME/bin/update-checker refresh", // force an update
     "interval": 3600, // refresh every hour
     "tooltip": true,
     "return-type": "json",
@@ -269,7 +269,7 @@ In nix (if adding it "the nix way" through home-manager):
   exec = "$HOME/bin/update-checker";  # Or "${pkgs.waybar-nixos-updates}/bin/update-checker" if using the flake
   signal = 12;
   on-click = "$HOME/bin/update-checker toggle";  # Toggle update checking
-  on-click-right = "rm ~/.cache/nix-update-last-run && pkill -RTMIN+12 waybar";
+  on-click-right = "$HOME/bin/update-checker refresh";  # Force an update
   interval = 3600;
   tooltip = true;
   return-type = "json";
@@ -404,7 +404,10 @@ The flake provides the following outputs:
    - Common causes: missing dependencies, flake evaluation errors, network issues
 
 5. **Module shows "updating" indefinitely**
-   - Remove the updating flag: `rm ~/.cache/nix-update-updating-flag`
+   - In lightweight mode a background check may still be running; it holds `~/.cache/nix-update-check.lock` for its duration
+   - A check still holding the lock after 15 minutes is treated as wedged — its process group is killed and the next check proceeds. Override with `MAX_CHECK_SECONDS`.
+   - Force a fresh check: `update-checker refresh`
+   - In full mode, clear the updating flag: `rm ~/.cache/nix-update-updating-flag`
    - Restart waybar: `pkill waybar && waybar &`
 
 6. **Configuration changes not taking effect**
@@ -457,7 +460,8 @@ The script uses several cache files in your ~/.cache directory:
 - `nix-update-toggle`: Stores the enabled/disabled state for update checking
 - `nix-update-system-path`: Caches the last-seen `/run/current-system` path, used to auto-detect rebuilds
 - `nix-update-flake-lock-input-hash`: Caches a hash of `flake.lock`, used to auto-detect input updates
-- `nix-update-updating-flag`: Signals that an update process is currently performing
+- `nix-update-updating-flag`: Signals that a check is mid-run (full mode only)
+- `nix-update-check.lock`: Held while a background check runs, so only one runs at a time (lightweight mode only)
 
 ### 🔒 Privacy and Security Considerations
 The script checks network connectivity locally using the `ip` command to verify network interfaces and routing tables. This approach:
