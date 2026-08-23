@@ -470,6 +470,7 @@ The script uses several cache files in your ~/.cache directory:
 - `nix-update-updating-flag`: Signals that a check is mid-run (full mode only)
 - `nix-update-check.lock`: Held while a background check runs, so only one runs at a time (lightweight mode only)
 - `nix-update-error`: Present when the last check failed, holding the reason; makes the module show its error state instead of a healthy count. Removed by the next successful check.
+- `nix-update-diagnostic` / `.prev`: What the last two checks actually resolved — channels, package-to-channel mapping size, and for each reported package which channel it was compared against versus which one the mapping put it in. The previous run is kept because a wrong result is usually followed immediately by a correct one, which would otherwise overwrite the evidence. If the module reports something you don't expect, `cat ~/.cache/nix-update-diagnostic.prev` is the place to start.
 - `nix-update-force-check`: Set by `refresh` to request a check before the interval is up; cleared once that check starts
 
 ### 🔒 Privacy and Security Considerations

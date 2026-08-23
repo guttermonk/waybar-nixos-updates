@@ -95,6 +95,13 @@ FORCE_CHECK_FLAG="$CACHE_DIR/nix-update-force-check"
 # rendering the failure as a healthy result. Cleared by the next good check.
 ERROR_FILE="$CACHE_DIR/nix-update-error"
 
+# Records what each check actually saw. The previous run is kept alongside the
+# current one, because the failure worth diagnosing here is a bad check
+# immediately followed by a good one - keeping only the latest would always
+# overwrite the interesting half.
+DIAG_FILE="$CACHE_DIR/nix-update-diagnostic"
+DIAG_PREV_FILE="$CACHE_DIR/nix-update-diagnostic.prev"
+
 # Held for the duration of a background check so only one runs at a time.
 # The file holds "<pgid> <start-epoch>" of the worker that owns it.
 CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
@@ -870,6 +877,60 @@ report_eval_failure() {
     send_notification "updates-failed" "Update Check Failed" "$detail"
 }
 
+# Captures the inputs a check actually resolved, so a wrong result can be
+# explained after the fact rather than reproduced. Called once per check, after
+# classification, with the reported packages as a JSON array.
+write_diagnostic() {
+    local changed="$1"
+
+    [ -f "$DIAG_FILE" ] && command cp -f "$DIAG_FILE" "$DIAG_PREV_FILE" 2>/dev/null
+
+    {
+        echo "when:              $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "script:            ${BASH_SOURCE[0]}"
+        echo "dual_channel:      $DUAL_CHANNEL_MODE"
+        echo "stable_identifier: $STABLE_IDENTIFIER"
+        echo "unstable_id:       $UNSTABLE_IDENTIFIER"
+        echo "stable_channel:    ${STABLE_CHANNEL:-unset}"
+        echo "unstable_channel:  ${UNSTABLE_CHANNEL:-unset}"
+        echo "explicit_only:     $EXPLICIT_PACKAGES_ONLY"
+        echo "flake_dir:         $FLAKE_DIR"
+        echo "system_path:       $(readlink /run/current-system 2>/dev/null)"
+        echo "hm_generation:     $(get_home_manager_generation 2>/dev/null || echo none)"
+
+        if [ -f "$PACKAGE_SOURCES_CACHE" ]; then
+            echo "mapping:           stable=$(jq -r '.stable|length' "$PACKAGE_SOURCES_CACHE" 2>/dev/null) unstable=$(jq -r '.unstable|length' "$PACKAGE_SOURCES_CACHE" 2>/dev/null)"
+        else
+            echo "mapping:           MISSING"
+        fi
+
+        # For each reported package, the bucket it was placed in and whether the
+        # mapping actually contained it - the pair that goes wrong when an
+        # unstable package is compared against stable.
+        echo "reported:"
+        if [ -n "$changed" ] && [ "$changed" != "[]" ]; then
+            local pname pchannel pdir
+            while IFS=$'\t' read -r pname pchannel pdir; do
+                [ -z "$pname" ] && continue
+                local in_map="unknown"
+                if [ -f "$PACKAGE_SOURCES_CACHE" ]; then
+                    if jq -e --arg p "${pname,,}" '.unstable|map(ascii_downcase)|index($p)' "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
+                        in_map="unstable"
+                    elif jq -e --arg p "${pname,,}" '.stable|map(ascii_downcase)|index($p)' "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
+                        in_map="stable"
+                    else
+                        in_map="not-in-mapping"
+                    fi
+                fi
+                printf '  %-24s compared-as=%-9s in-mapping=%-14s %s\n' \
+                    "$pname" "$pchannel" "$in_map" "$pdir"
+            done < <(jq -r '.[] | [.name, .channel, .direction] | @tsv' <<<"$changed" 2>/dev/null)
+        else
+            echo "  (none)"
+        fi
+    } > "$DIAG_FILE" 2>/dev/null
+}
+
 # A store name is <pname>-<version>-<output>, so the version we parse can carry
 # a trailing output name: bind-9.20.26-host, libressl-4.2.1-nc,
 # shadow-4.19.4-su. Left in place it never matches the channel's version and
@@ -1163,7 +1224,10 @@ check_for_updates_lightweight() {
             [ .[] | select((.name | ascii_downcase) as $n | $explicit | index($n)) ]
         ')
     fi
-    
+
+    # After filtering, so the record matches what the tooltip actually showed.
+    write_diagnostic "$changed_json"
+
     local pkg_count
     pkg_count=$(echo "$changed_json" | jq 'length')
     
