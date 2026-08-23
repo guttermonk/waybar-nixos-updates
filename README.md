@@ -180,7 +180,8 @@ When using the Home Manager module, you can configure these options:
   - Pinned inputs are those with `original.rev` set in flake.lock
 - `sourceChecks`: Explicit upstream policies for sources the package and input checks can't interpret on their own — fixed revisions in package expressions, local checkouts, named release lines, and forks. Each entry states a current source (`flake-input`, `revision`, `tag`, or `local`), an upstream `repository`, and a `policy` of `branch` or `tag`, so intent is declared rather than guessed. Set `mode` per entry to `"disabled"`, `"show"`, or `"count"`.
   - Checks run `git ls-remote`, bounded by `SOURCE_CHECK_TIMEOUT` (default 60s) per call, and are skipped entirely when there is no default route
-  - Misconfiguration is reported in the tooltip rather than passing silently: `current revision not found`, `upstream unreachable`, `unknown policy`
+  - Misconfiguration is reported in the tooltip rather than passing silently: `current revision not found`, `upstream unreachable`, `unknown policy`, `Invalid sourceChecks configuration`
+  - Only an *unset* `SOURCE_CHECKS_JSON` means "no checks configured". An empty or malformed value is reported as invalid rather than read as an empty list, so a broken environment can't look like a clean result
 
 **Both modes:**
 - `nixosConfigPath`: Path to your NixOS configuration flake directory (default: `~/.config/nixos`)

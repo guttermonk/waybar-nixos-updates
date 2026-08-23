@@ -6,7 +6,10 @@
 set -u
 
 FLAKE_DIR="${FLAKE_DIR:-${NIXOS_CONFIG_PATH:-$HOME/.config/nixos}}"
-SOURCE_CHECKS_JSON="${SOURCE_CHECKS_JSON:-[]}"
+# Deliberately ${VAR-default}, not ${VAR:-default}: only an *unset* value means
+# "no checks configured". An empty value is a broken one, and must fall through
+# to the validation below rather than being silently read as an empty list.
+SOURCE_CHECKS_JSON="${SOURCE_CHECKS_JSON-[]}"
 
 # Per-repository ceiling for git ls-remote. These run serially, one or more per
 # configured check, inside the lock held by the background worker - an unbounded
@@ -104,11 +107,16 @@ current_value() {
 }
 
 main() {
+    # shown=1 so this actually reaches the tooltip. Callers render the Sources
+    # section only when shown > 0, so reporting a broken configuration with
+    # shown=0 would leave it looking identical to a clean check.
     if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$SOURCE_CHECKS_JSON"; then
-        json_result 0 0 "Invalid sourceChecks configuration"
+        json_result 0 1 "Invalid sourceChecks configuration"
         return
     fi
 
+    # Left silent on purpose: the callers already surface loss of network on
+    # their own, and this is a transient condition rather than a broken config.
     if ! have_network; then
         json_result 0 0 "Sources not checked (no network)"
         return

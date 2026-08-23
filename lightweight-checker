@@ -49,15 +49,20 @@ INPUT_CHECKER_MODE="${INPUT_CHECKER_MODE:-disabled}"
 INPUT_CHECKER_PINNED="${INPUT_CHECKER_PINNED:-disabled}"
 
 # Explicit upstream policies for sources the package and input checks cannot
-# interpret on their own. Empty list means the source checker never runs.
-SOURCE_CHECKS_JSON="${SOURCE_CHECKS_JSON:-[]}"
+# interpret on their own. An empty list means the source checker never runs.
+# Deliberately ${VAR-default}, not ${VAR:-default}: only an *unset* value means
+# "no checks configured". An empty value is a broken one, and must reach
+# source-checker to be reported rather than passing as a clean result.
+SOURCE_CHECKS_JSON="${SOURCE_CHECKS_JSON-[]}"
 
 # Shell patterns for generated store outputs that are skipped before version
 # parsing. Without this, an output like "atuin-18.7.1-fish-completions" parses
 # its suffix as part of the version and reports a phantom update.
 # Parsed once here rather than per entry - extract_packages runs over hundreds
 # of store references per check.
-LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON="${LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON:-[\"*-fish-completions\"]}"
+# ${VAR-default} rather than ${VAR:-default}, so an explicit empty value means
+# "no exclusions" instead of quietly reverting to the default list.
+LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON="${LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON-[\"*-fish-completions\"]}"
 EXCLUDE_PATTERNS=()
 if [ -n "$LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON" ]; then
     mapfile -t EXCLUDE_PATTERNS < <(jq -r '.[]?' <<<"$LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON" 2>/dev/null)
@@ -1084,7 +1089,14 @@ check_for_updates_lightweight() {
     local source_count=0
     local source_shown=0
     local source_tooltip=""
-    if [ "$(jq 'length' <<<"$SOURCE_CHECKS_JSON" 2>/dev/null || echo 0)" -gt 0 ]; then
+    # -1 marks a value that is set but is not a JSON array. It still has to
+    # reach source-checker so the problem gets reported - gating on length alone
+    # let an empty or malformed value skip the check entirely and read as
+    # "nothing configured", indistinguishable from a clean result.
+    local source_checks_len
+    source_checks_len=$(jq 'if type == "array" then length else -1 end' <<<"$SOURCE_CHECKS_JSON" 2>/dev/null)
+    [[ "$source_checks_len" =~ ^-?[0-9]+$ ]] || source_checks_len=-1
+    if [ "$source_checks_len" -ne 0 ]; then
         local source_result
         source_result=$(source-checker 2>/dev/null)
         # Fall back to zeroes rather than letting an empty or malformed result
