@@ -677,10 +677,45 @@
     # and tooltip so the widget shows the last known result while the check
     # runs, rather than blanking. Matches lightweight-checker's refresh.
     # UPDATING_FLAG is cleared so the two-phase check restarts from phase one.
+    # True only while the process running the check is still alive. The check
+    # runs inline, so UPDATING_FLAG names a real process: "pending" means phase
+    # one has run but the checking poll has not started yet, which is a
+    # sub-second window and counts as not running.
+    function check_in_progress() {
+        [ -f "$UPDATING_FLAG" ] || return 1
+
+        local pid starttime
+        read -r pid starttime < "$UPDATING_FLAG" 2>/dev/null || return 1
+        [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+
+        # Process gone: the check is over, however it ended.
+        [ -d "/proc/$pid" ] || return 1
+
+        # Same pid, different process - only possible after pid wraparound, but
+        # cheap to rule out.
+        if [[ "$starttime" =~ ^[0-9]+$ ]]; then
+            local live
+            live=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)
+            [ "$live" = "$starttime" ] || return 1
+        fi
+        return 0
+    }
+
     function refresh_updates() {
         # refresh is dispatched without going through main, so init_files has
         # not run and the cache dir may not exist yet.
         mkdir -p "$CACHE_DIR"
+
+        # A check is already under way. Say so rather than appearing to ignore
+        # the click. This tests the checking process itself, so a check that
+        # died without clearing the flag is detected at once instead of after
+        # some assumed timeout.
+        if check_in_progress; then
+            send_notification "updates-wait" "Please Wait" \
+                "An update check is already running. Wait for it to finish before checking again." -e
+            return 0
+        fi
+
         touch "$FORCE_CHECK_FLAG"
         rm -f "$UPDATING_FLAG"
         pkill -x -RTMIN+12 .waybar-wrapped
@@ -786,6 +821,12 @@
                       # been honoured. Cleared here rather than after the check
                       # so a failing check does not re-trigger on every poll.
                       rm -f "$FORCE_CHECK_FLAG"
+                      # Claim the flag for this process. The check runs inline,
+                      # so this pid is alive for exactly as long as the check
+                      # is, which lets refresh test liveness precisely rather
+                      # than guessing from elapsed time. starttime pins the
+                      # identity so a recycled pid cannot be mistaken for it.
+                      echo "$$ $(awk '{print $22}' /proc/$$/stat 2>/dev/null)" > "$UPDATING_FLAG"
                       # Time to check for updates
                       if check_for_updates; then
                           updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
@@ -811,7 +852,9 @@
                       else
                           tooltip="$header"
                       fi
-                      touch "$UPDATING_FLAG"
+                      # The checking process is the next poll, not this one, so
+                      # there is no pid to record yet.
+                      echo "pending" > "$UPDATING_FLAG"
                       # Rerun same script just to show updating status and
                       # run update process in separate thread
                       refresh_waybar
