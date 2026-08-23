@@ -154,6 +154,11 @@ imports = [ ./path-to-waybar-nixos-updates/default.nix ];
 
 For a manual installation, download the `update-checker` script, put it in your [PATH](https://unix.stackexchange.com/a/26059) and make it executable (`chmod +x update-checker`). Add the icons to your ~/.icons folder.
 
+Two optional features are separate helper scripts that `update-checker` invokes by name, so they must be on your `PATH` too if you use them — the flake handles this for you, a manual install does not:
+
+- `source-checker` — required by `sourceChecks`
+- `preview` — required by the update-cost preview (`update-checker preview`, bound to middle-click)
+
 ### ⚙️ Configuration Options
 
 When using the Home Manager module, you can configure these options:
@@ -248,7 +253,7 @@ The script supports toggling update checks on/off. When disabled, it will show t
 
 ### 🎨 Waybar Integration
 
-If you're using the Home Manager module, the waybar configuration is automatically provided through `config.programs.waybar-nixos-updates.waybarConfig`. Otherwise, configure manually:
+If you're using the Home Manager module, the waybar configuration is automatically provided through `config.programs.waybar-nixos-updates.waybarConfig`. It emits `on-click-middle` only when `dryRunPreview.enable = true`, so the preview cannot be triggered by accident on a default configuration. Otherwise, configure manually:
 
 To configure manually, add one of the following configurations to your Waybar config (`~/.config/waybar/config`).
 
@@ -259,6 +264,9 @@ In json (if adding directly to the config file):
     "signal": 12,
     "on-click": "$HOME/bin/update-checker toggle", // toggle update checking
     "on-click-right": "$HOME/bin/update-checker refresh", // force an update
+    // Optional: on-demand update-cost preview. Omit this line to leave the
+    // feature unbound. Requires the `preview` helper script on your PATH.
+    "on-click-middle": "$HOME/bin/update-checker preview",
     "interval": 3600, // refresh every hour
     "tooltip": true,
     "return-type": "json",
@@ -280,6 +288,9 @@ In nix (if adding it "the nix way" through home-manager):
   signal = 12;
   on-click = "$HOME/bin/update-checker toggle";  # Toggle update checking
   on-click-right = "$HOME/bin/update-checker refresh";  # Force an update
+  # Optional: on-demand update-cost preview. Omit this line to leave the
+  # feature unbound. Requires the `preview` helper script on your PATH.
+  on-click-middle = "$HOME/bin/update-checker preview";
   interval = 3600;
   tooltip = true;
   return-type = "json";
