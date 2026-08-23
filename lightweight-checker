@@ -870,6 +870,31 @@ report_eval_failure() {
     send_notification "updates-failed" "Update Check Failed" "$detail"
 }
 
+# A store name is <pname>-<version>-<output>, so the version we parse can carry
+# a trailing output name: bind-9.20.26-host, libressl-4.2.1-nc,
+# shadow-4.19.4-su. Left in place it never matches the channel's version and
+# reports a permanent phantom change.
+#
+# Output names are arbitrary per package, so this is structural rather than a
+# list of them: a final segment that is purely alphabetic is an output name,
+# except for the alphabetic markers that really are part of a version. Anything
+# containing a digit (rc1, 2025-12-12, p15) is left alone.
+VERSION_MARKERS='^(alpha|beta|rc|pre|dev|git|svn|hg|snapshot|unstable|final|stable|release|nightly|patch|post)$'
+
+strip_output_suffix() {
+    local version="$1"
+    local last="${version##*-}"
+
+    # No trailing segment at all.
+    [ "$last" = "$version" ] && { printf '%s' "$version"; return; }
+
+    if [[ "$last" =~ ^[a-zA-Z]+$ ]] && ! [[ "${last,,}" =~ $VERSION_MARKERS ]]; then
+        printf '%s' "${version%-*}"
+        return
+    fi
+    printf '%s' "$version"
+}
+
 # ===== Package Collection =====
 collect_installed_packages() {
     local -A packages
@@ -893,14 +918,8 @@ collect_installed_packages() {
                 name="${BASH_REMATCH[1]}"
                 version="${BASH_REMATCH[2]}"
                 
-                # Strip common output suffixes from version (e.g., "0.44.0-terminfo" -> "0.44.0")
-                version="${version%-terminfo}"
-                version="${version%-man}"
-                version="${version%-doc}"
-                version="${version%-debug}"
-                version="${version%-static}"
-                version="${version%-wrapped}"
-                
+                version=$(strip_output_suffix "$version")
+
                 name_lower="${name,,}"  # Convert to lowercase
                 # Deduplicate - keep first seen (usually the actual package, not deps)
                 if [ -z "${packages[$name_lower]+x}" ]; then
