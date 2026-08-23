@@ -159,6 +159,8 @@ For a manual installation, download the `update-checker` script, put it in your 
 When using the Home Manager module, you can configure these options:
 
 - `checkMode`: Update check strategy - `"full"` (default) or `"lightweight"`
+  - In lightweight mode, versions are compared with Nix's own ordering (`builtins.compareVersions`), so `5.3p9 → 5.3p15` is correctly an upgrade and `1.16.1 → 1.3.6` is not
+  - A pending change where the channel is *behind* what you have installed is reported and marked `(downgrade)` rather than hidden — moving a package from `pkgs-unstable` to `pkgs` is a deliberate change worth seeing before you rebuild
 - `updateInterval`: Time in seconds between update checks (default: 3600)
 - `notifications`: Whether to show desktop notifications (default: true)
 - `skipAfterBoot`: Whether to skip update checks right after boot/resume (default: true)
