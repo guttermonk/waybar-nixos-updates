@@ -91,6 +91,10 @@ FLAKE_LOCK_HASH_FILE="$CACHE_DIR/nix-update-flake-lock-hash"
 # very timestamp the header needs to display.
 FORCE_CHECK_FLAG="$CACHE_DIR/nix-update-force-check"
 
+# Set when a check fails, so the module can show an error state instead of
+# rendering the failure as a healthy result. Cleared by the next good check.
+ERROR_FILE="$CACHE_DIR/nix-update-error"
+
 # Held for the duration of a background check so only one runs at a time.
 # The file holds "<pgid> <start-epoch>" of the worker that owns it.
 CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
@@ -830,6 +834,42 @@ get_package_channel() {
     echo "stable"
 }
 
+# Records a failed evaluation. Deliberately does not touch STATE_FILE: a check
+# that could not run has learned nothing, and zeroing the count here made a
+# failure render as "0 updates, system up to date" - the healthy state.
+report_eval_failure() {
+    local err_file="$1"
+    local detail=""
+
+    # nix opens with a bare "error:" and puts the actual cause on a later,
+    # indented "error:" line, after the stack trace. Take the last one that has
+    # content, which is the most specific; anything else is trace or chatter.
+    if [ -s "$err_file" ]; then
+        detail=$(sed 's/\x1b\[[0-9;]*m//g' "$err_file" \
+            | grep -E '^[[:space:]]*error:[[:space:]]*[^[:space:]]' \
+            | tail -1 \
+            | sed 's/^[[:space:]]*error:[[:space:]]*//; s/[[:space:]]*$//' \
+            | cut -c1-200)
+    fi
+
+    # A dropped connection is by far the most common cause and is not worth
+    # showing a nix backtrace for.
+    if ! check_network; then
+        detail="no network connection"
+    fi
+
+    [ -z "$detail" ] && detail="nix eval failed"
+    echo "$detail" > "$ERROR_FILE"
+    echo "Update check failed:\\n$detail" > "$LAST_RUN_TOOLTIP"
+    # Stamp the run even though it failed. The worker signals waybar as it
+    # exits, and without this the next poll sees the interval still elapsed and
+    # immediately starts another doomed check - a tight retry loop for as long
+    # as the cause persists. The normal interval applies instead, and a
+    # right-click still forces an immediate retry.
+    echo "$(date +%s)" > "$LAST_RUN_FILE"
+    send_notification "updates-failed" "Update Check Failed" "$detail"
+}
+
 # ===== Package Collection =====
 collect_installed_packages() {
     local -A packages
@@ -948,6 +988,7 @@ check_for_updates_lightweight() {
     local pkg_count=${#current_versions[@]}
     if [ "$pkg_count" -eq 0 ]; then
         echo "0" > "$STATE_FILE"
+        rm -f "$ERROR_FILE"
         echo "$(date +%s)" > "$LAST_RUN_FILE"
         echo "System updated" > "$LAST_RUN_TOOLTIP"
         send_notification "updates-complete" "Update Check Complete" "No packages found to check" -e
@@ -973,15 +1014,17 @@ check_for_updates_lightweight() {
             echo '}'
         } > "$tmpexpr"
         
-        local eval_result
-        eval_result=$(nix eval --json --file "$tmpexpr" --apply "f: f \"$channel\"" 2>/dev/null)
-        
-        if [ $? -ne 0 ] || [ -z "$eval_result" ]; then
-            echo "0" > "$STATE_FILE"
-            echo "Eval failed" > "$LAST_RUN_TOOLTIP"
-            send_notification "updates-failed" "Update Check Failed" "Nix eval failed - check tooltip for details"
+        local eval_result eval_err
+        eval_err=$(mktemp)
+        eval_result=$(nix eval --json --file "$tmpexpr" --apply "f: f \"$channel\"" 2>"$eval_err")
+        local eval_rc=$?
+
+        if [ "$eval_rc" -ne 0 ] || [ -z "$eval_result" ]; then
+            report_eval_failure "$eval_err"
+            rm -f "$eval_err"
             return 1
         fi
+        rm -f "$eval_err"
     else
         # Dual channel mode - separate packages by source
         local -A stable_pkgs
@@ -1019,15 +1062,17 @@ check_for_updates_lightweight() {
             echo '}'
         } > "$tmpexpr"
         
-        local eval_result
-        eval_result=$(nix eval --json --file "$tmpexpr" --apply "f: f { stableRef = \"$STABLE_CHANNEL\"; unstableRef = \"$UNSTABLE_CHANNEL\"; }" 2>/dev/null)
-        
-        if [ $? -ne 0 ] || [ -z "$eval_result" ]; then
-            echo "0" > "$STATE_FILE"
-            echo "Eval failed" > "$LAST_RUN_TOOLTIP"
-            send_notification "updates-failed" "Update Check Failed" "Nix eval failed - check tooltip for details"
+        local eval_result eval_err
+        eval_err=$(mktemp)
+        eval_result=$(nix eval --json --file "$tmpexpr" --apply "f: f { stableRef = \"$STABLE_CHANNEL\"; unstableRef = \"$UNSTABLE_CHANNEL\"; }" 2>"$eval_err")
+        local eval_rc=$?
+
+        if [ "$eval_rc" -ne 0 ] || [ -z "$eval_result" ]; then
+            report_eval_failure "$eval_err"
+            rm -f "$eval_err"
             return 1
         fi
+        rm -f "$eval_err"
     fi
     
     # Compare versions using jq
@@ -1126,6 +1171,7 @@ check_for_updates_lightweight() {
     # Calculate total count (only items with mode="count")
     local total_count=$((pkg_count + input_count_for_total + pinned_count_for_total + source_count))
     echo "$total_count" > "$STATE_FILE"
+    rm -f "$ERROR_FILE"
     echo "$(date +%s)" > "$LAST_RUN_FILE"
 
     # Check if there's anything to show (including "show" mode items)
@@ -1288,6 +1334,16 @@ run_check_worker() {
         printf '%s %s\n' "$(($(ps -o pgid= -p $$)))" "$(date +%s)" >&9
         # Refresh even on failure so the widget leaves the "checking" state.
         trap 'refresh_waybar' EXIT INT TERM
+        # main checked the network before spawning this worker, but that was a
+        # different process and possibly a while ago - a rebuild restarting the
+        # network, or a suspend, lands squarely in that gap. The evaluation
+        # fetches nixpkgs, so it fails outright without a connection.
+        if ! check_network; then
+            echo "no network connection" > "$ERROR_FILE"
+            echo "Update check failed:\\nno network connection" > "$LAST_RUN_TOOLTIP"
+            echo "$(date +%s)" > "$LAST_RUN_FILE"
+            exit 0
+        fi
         check_for_updates_lightweight || true
     ) 9>"$CHECK_LOCK_FILE"
 }
@@ -1459,6 +1515,13 @@ main() {
     tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "System updated")
     local header
     header=$(format_tooltip_header)
+
+    # The last check failed. Show the error state and keep whatever count the
+    # last good check found, rather than reporting a healthy "0".
+    if [ -f "$ERROR_FILE" ]; then
+        output_json "$updates" "error" "$header\\n─────────────────────────────────────────────────\\n$tooltip"
+        exit 0
+    fi
 
     if [ "$updates" -ne 0 ] 2>/dev/null; then
         output_json "$updates" "has-updates" "$header\\n─────────────────────────────────────────────────\\n$tooltip"

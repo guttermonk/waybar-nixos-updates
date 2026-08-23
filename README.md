@@ -467,6 +467,7 @@ The script uses several cache files in your ~/.cache directory:
 - `nix-update-flake-lock-input-hash`: Caches a hash of `flake.lock`, used to auto-detect input updates
 - `nix-update-updating-flag`: Signals that a check is mid-run (full mode only)
 - `nix-update-check.lock`: Held while a background check runs, so only one runs at a time (lightweight mode only)
+- `nix-update-error`: Present when the last check failed, holding the reason; makes the module show its error state instead of a healthy count. Removed by the next successful check.
 - `nix-update-force-check`: Set by `refresh` to request a check before the interval is up; cleared once that check starts
 
 ### 🔒 Privacy and Security Considerations
