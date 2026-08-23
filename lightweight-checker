@@ -1324,6 +1324,14 @@ toggle_updates() {
 # tooltip and last-checked time so the widget shows the last known result while
 # the check runs, rather than blanking. Matches update-checker's refresh.
 refresh_updates() {
+    # A check is already under way. Say so rather than appearing to ignore the
+    # click, and do not set the force flag: leaving it set would queue a second,
+    # redundant check to fire the moment this one finishes.
+    if worker_running; then
+        send_notification "updates-wait" "Please Wait" \
+            "An update check is already running. Wait for it to finish before checking again." -e
+        return 0
+    fi
     touch "$FORCE_CHECK_FLAG"
     refresh_waybar
 }
