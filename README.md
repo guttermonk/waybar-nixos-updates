@@ -164,6 +164,8 @@ Two optional features are separate helper scripts that `update-checker` invokes 
 When using the Home Manager module, you can configure these options:
 
 - `checkMode`: Update check strategy - `"full"` (default) or `"lightweight"`
+  - In lightweight mode, versions are compared with Nix's own ordering (`builtins.compareVersions`), so `5.3p9 → 5.3p15` is correctly an upgrade and `1.16.1 → 1.3.6` is not
+  - A pending change where the channel is *behind* what you have installed is reported and marked `(downgrade)` rather than hidden — moving a package from `pkgs-unstable` to `pkgs` is a deliberate change worth seeing before you rebuild
 - `updateInterval`: Time in seconds between update checks (default: 3600)
 - `notifications`: Whether to show desktop notifications (default: true)
 - `skipAfterBoot`: Whether to skip update checks right after boot/resume (default: true)
@@ -484,6 +486,8 @@ The script uses several cache files in your ~/.cache directory:
 - `nix-update-flake-lock-input-hash`: Caches a hash of `flake.lock`, used to auto-detect input updates
 - `nix-update-updating-flag`: Signals that a check is mid-run (full mode only)
 - `nix-update-check.lock`: Held while a background check runs, so only one runs at a time (lightweight mode only)
+- `nix-update-error`: Present when the last check failed, holding the reason; makes the module show its error state instead of a healthy count. Removed by the next successful check.
+- `nix-update-diagnostic` / `.prev`: What the last two checks actually resolved — channels, package-to-channel mapping size, and for each reported package which channel it was compared against versus which one the mapping put it in. The previous run is kept because a wrong result is usually followed immediately by a correct one, which would otherwise overwrite the evidence. If the module reports something you don't expect, `cat ~/.cache/nix-update-diagnostic.prev` is the place to start.
 - `nix-update-force-check`: Set by `refresh` to request a check before the interval is up; cleared once that check starts
 - `nix-update-preview`: Last update-cost preview, with the `flake.lock` hash and system path it was computed against; removed when `dryRunPreview.enable` is `false`
 

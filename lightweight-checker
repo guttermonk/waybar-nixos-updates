@@ -99,6 +99,22 @@ FORCE_CHECK_FLAG="$CACHE_DIR/nix-update-force-check"
 # Result of the last update-cost preview, written by the preview script.
 PREVIEW_FILE="$CACHE_DIR/nix-update-preview"
 
+# Set when a check fails, so the module can show an error state instead of
+# rendering the failure as a healthy result. Cleared by the next good check.
+ERROR_FILE="$CACHE_DIR/nix-update-error"
+
+# Set when a rebuild is detected, asking the next check to re-derive the
+# package-to-channel mapping. A request rather than a deletion, so it cannot
+# disturb a check already in progress.
+REPARSE_REQUEST_FLAG="$CACHE_DIR/nix-update-reparse-request"
+
+# Records what each check actually saw. The previous run is kept alongside the
+# current one, because the failure worth diagnosing here is a bad check
+# immediately followed by a good one - keeping only the latest would always
+# overwrite the interesting half.
+DIAG_FILE="$CACHE_DIR/nix-update-diagnostic"
+DIAG_PREV_FILE="$CACHE_DIR/nix-update-diagnostic.prev"
+
 # Held for the duration of a background check so only one runs at a time.
 # The file holds "<pgid> <start-epoch>" of the worker that owns it.
 CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
@@ -628,7 +644,10 @@ detect_channels_from_flake() {
 # ===== Config Parsing =====
 should_reparse_config() {
     local flake_lock="$FLAKE_DIR/flake.lock"
-    
+
+    # A rebuild asked for this; packages may have moved between channels.
+    [ -f "$REPARSE_REQUEST_FLAG" ] && return 0
+
     # No cache exists
     [ ! -f "$PACKAGE_SOURCES_CACHE" ] && return 0
     [ ! -f "$FLAKE_LOCK_HASH_FILE" ] && return 0
@@ -888,35 +907,171 @@ update_package_sources_cache() {
         if [ -f "$flake_lock" ]; then
             md5sum "$flake_lock" 2>/dev/null | cut -d' ' -f1 > "$FLAKE_LOCK_HASH_FILE"
         fi
+
+        # The reparse that a rebuild asked for has now happened.
+        rm -f "$REPARSE_REQUEST_FLAG"
     fi
     
     return 0
 }
 
+# Package-to-channel mapping, read once per check and held in memory.
+#
+# It used to be re-read from disk for every package, which was two jq processes
+# each across several hundred packages, and - worse - meant a check depended on
+# that file surviving for its whole duration. main deletes the file when it
+# detects a rebuild, from a different process than the detached worker, so a
+# rebuild landing mid-check silently reclassified every remaining package as
+# stable and reported everything installed from unstable as a change.
+declare -A PKG_CHANNEL_MAP
+PKG_CHANNEL_MAP_LOADED=false
+
+load_package_channel_map() {
+    PKG_CHANNEL_MAP=()
+    PKG_CHANNEL_MAP_LOADED=false
+
+    [ "$DUAL_CHANNEL_MODE" = "true" ] || return 0
+    [ -f "$PACKAGE_SOURCES_CACHE" ] || return 1
+
+    local name channel
+    # unstable first, so a name appearing in both keeps unstable precedence.
+    while IFS=$'\t' read -r name channel; do
+        [ -n "$name" ] && PKG_CHANNEL_MAP["$name"]="$channel"
+    done < <(jq -r '
+        (.unstable[]? | [ascii_downcase, "unstable"] | @tsv),
+        (.stable[]?   | [ascii_downcase, "stable"]   | @tsv)
+    ' "$PACKAGE_SOURCES_CACHE" 2>/dev/null)
+
+    [ "${#PKG_CHANNEL_MAP[@]}" -gt 0 ] || return 1
+    PKG_CHANNEL_MAP_LOADED=true
+    return 0
+}
+
 get_package_channel() {
-    local pkg_name="$1"
-    local pkg_lower="${pkg_name,,}"  # Convert to lowercase for comparison
-    
-    # If no config parsing, everything uses single channel
-    if [ "$DUAL_CHANNEL_MODE" != "true" ] || [ ! -f "$PACKAGE_SOURCES_CACHE" ]; then
+    local pkg_lower="${1,,}"
+
+    if [ "$DUAL_CHANNEL_MODE" != "true" ] || [ "$PKG_CHANNEL_MAP_LOADED" != true ]; then
         echo "single"
         return
     fi
-    
-    # Check if package is in unstable list (case-insensitive)
-    if jq -e --arg pkg "$pkg_lower" '.unstable | map(ascii_downcase) | index($pkg)' "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
-        echo "unstable"
-        return
-    fi
-    
-    # Check if package is in stable list (case-insensitive)
-    if jq -e --arg pkg "$pkg_lower" '.stable | map(ascii_downcase) | index($pkg)' "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
-        echo "stable"
-        return
-    fi
-    
+
     # Unknown - default to stable
-    echo "stable"
+    echo "${PKG_CHANNEL_MAP[$pkg_lower]:-stable}"
+}
+
+# Records a failed evaluation. Deliberately does not touch STATE_FILE: a check
+# that could not run has learned nothing, and zeroing the count here made a
+# failure render as "0 updates, system up to date" - the healthy state.
+report_eval_failure() {
+    local err_file="$1"
+    local detail=""
+
+    # nix opens with a bare "error:" and puts the actual cause on a later,
+    # indented "error:" line, after the stack trace. Take the last one that has
+    # content, which is the most specific; anything else is trace or chatter.
+    if [ -s "$err_file" ]; then
+        detail=$(sed 's/\x1b\[[0-9;]*m//g' "$err_file" \
+            | grep -E '^[[:space:]]*error:[[:space:]]*[^[:space:]]' \
+            | tail -1 \
+            | sed 's/^[[:space:]]*error:[[:space:]]*//; s/[[:space:]]*$//' \
+            | cut -c1-200)
+    fi
+
+    # A dropped connection is by far the most common cause and is not worth
+    # showing a nix backtrace for.
+    if ! check_network; then
+        detail="no network connection"
+    fi
+
+    [ -z "$detail" ] && detail="nix eval failed"
+    echo "$detail" > "$ERROR_FILE"
+    echo "Update check failed:\\n$detail" > "$LAST_RUN_TOOLTIP"
+    # Stamp the run even though it failed. The worker signals waybar as it
+    # exits, and without this the next poll sees the interval still elapsed and
+    # immediately starts another doomed check - a tight retry loop for as long
+    # as the cause persists. The normal interval applies instead, and a
+    # right-click still forces an immediate retry.
+    echo "$(date +%s)" > "$LAST_RUN_FILE"
+    send_notification "updates-failed" "Update Check Failed" "$detail"
+}
+
+# Captures the inputs a check actually resolved, so a wrong result can be
+# explained after the fact rather than reproduced. Called once per check, after
+# classification, with the reported packages as a JSON array.
+write_diagnostic() {
+    local changed="$1"
+
+    [ -f "$DIAG_FILE" ] && command cp -f "$DIAG_FILE" "$DIAG_PREV_FILE" 2>/dev/null
+
+    {
+        echo "when:              $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "script:            ${BASH_SOURCE[0]}"
+        echo "dual_channel:      $DUAL_CHANNEL_MODE"
+        echo "stable_identifier: $STABLE_IDENTIFIER"
+        echo "unstable_id:       $UNSTABLE_IDENTIFIER"
+        echo "stable_channel:    ${STABLE_CHANNEL:-unset}"
+        echo "unstable_channel:  ${UNSTABLE_CHANNEL:-unset}"
+        echo "explicit_only:     $EXPLICIT_PACKAGES_ONLY"
+        echo "flake_dir:         $FLAKE_DIR"
+        echo "system_path:       $(readlink /run/current-system 2>/dev/null)"
+        echo "hm_generation:     $(get_home_manager_generation 2>/dev/null || echo none)"
+
+        if [ -f "$PACKAGE_SOURCES_CACHE" ]; then
+            echo "mapping:           stable=$(jq -r '.stable|length' "$PACKAGE_SOURCES_CACHE" 2>/dev/null) unstable=$(jq -r '.unstable|length' "$PACKAGE_SOURCES_CACHE" 2>/dev/null)"
+        else
+            echo "mapping:           MISSING"
+        fi
+
+        # For each reported package, the bucket it was placed in and whether the
+        # mapping actually contained it - the pair that goes wrong when an
+        # unstable package is compared against stable.
+        echo "reported:"
+        if [ -n "$changed" ] && [ "$changed" != "[]" ]; then
+            local pname pchannel pdir
+            while IFS=$'\t' read -r pname pchannel pdir; do
+                [ -z "$pname" ] && continue
+                local in_map="unknown"
+                if [ -f "$PACKAGE_SOURCES_CACHE" ]; then
+                    if jq -e --arg p "${pname,,}" '.unstable|map(ascii_downcase)|index($p)' "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
+                        in_map="unstable"
+                    elif jq -e --arg p "${pname,,}" '.stable|map(ascii_downcase)|index($p)' "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
+                        in_map="stable"
+                    else
+                        in_map="not-in-mapping"
+                    fi
+                fi
+                printf '  %-24s compared-as=%-9s in-mapping=%-14s %s\n' \
+                    "$pname" "$pchannel" "$in_map" "$pdir"
+            done < <(jq -r '.[] | [.name, .channel, .direction] | @tsv' <<<"$changed" 2>/dev/null)
+        else
+            echo "  (none)"
+        fi
+    } > "$DIAG_FILE" 2>/dev/null
+}
+
+# A store name is <pname>-<version>-<output>, so the version we parse can carry
+# a trailing output name: bind-9.20.26-host, libressl-4.2.1-nc,
+# shadow-4.19.4-su. Left in place it never matches the channel's version and
+# reports a permanent phantom change.
+#
+# Output names are arbitrary per package, so this is structural rather than a
+# list of them: a final segment that is purely alphabetic is an output name,
+# except for the alphabetic markers that really are part of a version. Anything
+# containing a digit (rc1, 2025-12-12, p15) is left alone.
+VERSION_MARKERS='^(alpha|beta|rc|pre|dev|git|svn|hg|snapshot|unstable|final|stable|release|nightly|patch|post)$'
+
+strip_output_suffix() {
+    local version="$1"
+    local last="${version##*-}"
+
+    # No trailing segment at all.
+    [ "$last" = "$version" ] && { printf '%s' "$version"; return; }
+
+    if [[ "$last" =~ ^[a-zA-Z]+$ ]] && ! [[ "${last,,}" =~ $VERSION_MARKERS ]]; then
+        printf '%s' "${version%-*}"
+        return
+    fi
+    printf '%s' "$version"
 }
 
 # ===== Package Collection =====
@@ -942,14 +1097,8 @@ collect_installed_packages() {
                 name="${BASH_REMATCH[1]}"
                 version="${BASH_REMATCH[2]}"
                 
-                # Strip common output suffixes from version (e.g., "0.44.0-terminfo" -> "0.44.0")
-                version="${version%-terminfo}"
-                version="${version%-man}"
-                version="${version%-doc}"
-                version="${version%-debug}"
-                version="${version%-static}"
-                version="${version%-wrapped}"
-                
+                version=$(strip_output_suffix "$version")
+
                 name_lower="${name,,}"  # Convert to lowercase
                 # Deduplicate - keep first seen (usually the actual package, not deps)
                 if [ -z "${packages[$name_lower]+x}" ]; then
@@ -1002,7 +1151,23 @@ check_for_updates_lightweight() {
     
     if [ "$DUAL_CHANNEL_MODE" = "true" ]; then
         update_package_sources_cache
-        
+
+        # Read the mapping into memory now, so the rest of the check cannot be
+        # affected by the file being removed underneath it. Without this mapping
+        # every package falls back to "stable", so anything installed from
+        # unstable is compared against the wrong channel and shows a bogus
+        # change. One unknown package is a nuisance; no mapping at all inverts
+        # the whole list, so refuse rather than report nonsense.
+        if ! load_package_channel_map; then
+            local why="could not map packages to channels"
+            [ -f "$PACKAGE_SOURCES_CACHE" ] || why="package-to-channel cache missing"
+            echo "$why" > "$ERROR_FILE"
+            echo "Update check failed:\\n$why" > "$LAST_RUN_TOOLTIP"
+            echo "$(date +%s)" > "$LAST_RUN_FILE"
+            send_notification "updates-failed" "Update Check Failed" "$why"
+            return 1
+        fi
+
         if ! detect_channels_from_flake; then
             # Fallback to single channel if detection fails
             single_channel_mode=true
@@ -1037,6 +1202,7 @@ check_for_updates_lightweight() {
     local pkg_count=${#current_versions[@]}
     if [ "$pkg_count" -eq 0 ]; then
         echo "0" > "$STATE_FILE"
+        rm -f "$ERROR_FILE"
         echo "$(date +%s)" > "$LAST_RUN_FILE"
         echo "System updated" > "$LAST_RUN_TOOLTIP"
         send_notification "updates-complete" "Update Check Complete" "No packages found to check" -e
@@ -1055,22 +1221,29 @@ check_for_updates_lightweight() {
             echo 'let'
             echo '  pkgs = (builtins.getFlake flakeRef).legacyPackages.x86_64-linux;'
             echo '  try = attr: let r = builtins.tryEval (pkgs.${attr}.version or "?"); in if r.success then r.value else "?";'
+            # nix's own version ordering, computed here because the candidate
+            # version is already in hand: 1 means the channel is ahead of what
+            # is installed, -1 means behind. String comparison gets this wrong
+            # (5.3p9 vs 5.3p15, 1.16.1 vs 1.3.6).
+            echo '  cmp = v: installed: if v == "?" then 0 else builtins.compareVersions v installed;'
             echo 'in {'
             for name in "${!current_versions[@]}"; do
-                echo "  \"$name\" = { version = try \"$name\"; channel = \"single\"; };"
+                echo "  \"$name\" = let v = try \"$name\"; in { version = v; channel = \"single\"; cmp = cmp v \"${current_versions[$name]}\"; };"
             done
             echo '}'
         } > "$tmpexpr"
         
-        local eval_result
-        eval_result=$(nix eval --json --file "$tmpexpr" --apply "f: f \"$channel\"" 2>/dev/null)
-        
-        if [ $? -ne 0 ] || [ -z "$eval_result" ]; then
-            echo "0" > "$STATE_FILE"
-            echo "Eval failed" > "$LAST_RUN_TOOLTIP"
-            send_notification "updates-failed" "Update Check Failed" "Nix eval failed - check tooltip for details"
+        local eval_result eval_err
+        eval_err=$(mktemp)
+        eval_result=$(nix eval --json --file "$tmpexpr" --apply "f: f \"$channel\"" 2>"$eval_err")
+        local eval_rc=$?
+
+        if [ "$eval_rc" -ne 0 ] || [ -z "$eval_result" ]; then
+            report_eval_failure "$eval_err"
+            rm -f "$eval_err"
             return 1
         fi
+        rm -f "$eval_err"
     else
         # Dual channel mode - separate packages by source
         local -A stable_pkgs
@@ -1095,28 +1268,35 @@ check_for_updates_lightweight() {
             echo '  unstablePkgs = (builtins.getFlake unstableRef).legacyPackages.x86_64-linux;'
             echo '  tryStable = attr: let r = builtins.tryEval (stablePkgs.${attr}.version or "?"); in if r.success then r.value else "?";'
             echo '  tryUnstable = attr: let r = builtins.tryEval (unstablePkgs.${attr}.version or "?"); in if r.success then r.value else "?";'
+            # nix's own version ordering, computed here because the candidate
+            # version is already in hand: 1 means the channel is ahead of what
+            # is installed, -1 means behind. String comparison gets this wrong
+            # (5.3p9 vs 5.3p15, 1.16.1 vs 1.3.6).
+            echo '  cmp = v: installed: if v == "?" then 0 else builtins.compareVersions v installed;'
             echo 'in {'
-            
+
             for name in "${!stable_pkgs[@]}"; do
-                echo "  \"$name\" = { version = tryStable \"$name\"; channel = \"stable\"; };"
+                echo "  \"$name\" = let v = tryStable \"$name\"; in { version = v; channel = \"stable\"; cmp = cmp v \"${stable_pkgs[$name]}\"; };"
             done
-            
+
             for name in "${!unstable_pkgs[@]}"; do
-                echo "  \"$name\" = { version = tryUnstable \"$name\"; channel = \"unstable\"; };"
+                echo "  \"$name\" = let v = tryUnstable \"$name\"; in { version = v; channel = \"unstable\"; cmp = cmp v \"${unstable_pkgs[$name]}\"; };"
             done
             
             echo '}'
         } > "$tmpexpr"
         
-        local eval_result
-        eval_result=$(nix eval --json --file "$tmpexpr" --apply "f: f { stableRef = \"$STABLE_CHANNEL\"; unstableRef = \"$UNSTABLE_CHANNEL\"; }" 2>/dev/null)
-        
-        if [ $? -ne 0 ] || [ -z "$eval_result" ]; then
-            echo "0" > "$STATE_FILE"
-            echo "Eval failed" > "$LAST_RUN_TOOLTIP"
-            send_notification "updates-failed" "Update Check Failed" "Nix eval failed - check tooltip for details"
+        local eval_result eval_err
+        eval_err=$(mktemp)
+        eval_result=$(nix eval --json --file "$tmpexpr" --apply "f: f { stableRef = \"$STABLE_CHANNEL\"; unstableRef = \"$UNSTABLE_CHANNEL\"; }" 2>"$eval_err")
+        local eval_rc=$?
+
+        if [ "$eval_rc" -ne 0 ] || [ -z "$eval_result" ]; then
+            report_eval_failure "$eval_err"
+            rm -f "$eval_err"
             return 1
         fi
+        rm -f "$eval_err"
     fi
     
     # Compare versions using jq
@@ -1143,8 +1323,12 @@ check_for_updates_lightweight() {
         [ to_entries[] |
           select(.value.version != "?") |
           select($current[.key] != null) |
-          select(.value.version != $current[.key]) |
-          {name: .key, current: $current[.key], new: .value.version, channel: .value.channel, display: ($display[.key] // .key)}
+          # cmp, not string inequality: versions that differ only in formatting
+          # compare equal and are not a pending change.
+          select((.value.cmp // 0) != 0) |
+          {name: .key, current: $current[.key], new: .value.version, channel: .value.channel,
+           direction: (if (.value.cmp // 0) > 0 then "upgrade" else "downgrade" end),
+           display: ($display[.key] // .key)}
         ] | sort_by(.name)
     ')
     
@@ -1159,7 +1343,10 @@ check_for_updates_lightweight() {
             [ .[] | select((.name | ascii_downcase) as $n | $explicit | index($n)) ]
         ')
     fi
-    
+
+    # After filtering, so the record matches what the tooltip actually showed.
+    write_diagnostic "$changed_json"
+
     local pkg_count
     pkg_count=$(echo "$changed_json" | jq 'length')
     
@@ -1215,6 +1402,7 @@ check_for_updates_lightweight() {
     # Calculate total count (only items with mode="count")
     local total_count=$((pkg_count + input_count_for_total + pinned_count_for_total + source_count))
     echo "$total_count" > "$STATE_FILE"
+    rm -f "$ERROR_FILE"
     echo "$(date +%s)" > "$LAST_RUN_FILE"
 
     # Check if there's anything to show (including "show" mode items)
@@ -1242,10 +1430,19 @@ check_for_updates_lightweight() {
         # Build packages section
         if [ "$pkg_count" -gt 0 ]; then
             local pkg_tooltip
+            # Downgrades are labelled rather than hidden: moving a package from
+            # pkgs-unstable to pkgs is a deliberate change the user needs to see
+            # before rebuilding, and an unlabelled arrow reads as progress.
             if [ "$single_channel_mode" = true ]; then
-                pkg_tooltip=$(echo "$changed_json" | jq -r '.[] | "\(.display): \(.current) → \(.new)"' | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
+                pkg_tooltip=$(echo "$changed_json" | jq -r '
+                    .[] | "\(.display): \(.current) → \(.new)" +
+                          (if .direction == "downgrade" then " (downgrade)" else "" end)' \
+                    | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
             else
-                pkg_tooltip=$(echo "$changed_json" | jq -r '.[] | "\(.display): \(.current) → \(.new) (\(.channel))"' | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
+                pkg_tooltip=$(echo "$changed_json" | jq -r '
+                    .[] | "\(.display): \(.current) → \(.new) (\(.channel)" +
+                          (if .direction == "downgrade" then ", downgrade)" else ")" end)' \
+                    | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
             fi
             if [ "$has_multiple_sections" = true ]; then
                 tooltip_text="Packages:\\n$pkg_tooltip"
@@ -1377,6 +1574,16 @@ run_check_worker() {
         printf '%s %s\n' "$(($(ps -o pgid= -p $$)))" "$(date +%s)" >&9
         # Refresh even on failure so the widget leaves the "checking" state.
         trap 'refresh_waybar' EXIT INT TERM
+        # main checked the network before spawning this worker, but that was a
+        # different process and possibly a while ago - a rebuild restarting the
+        # network, or a suspend, lands squarely in that gap. The evaluation
+        # fetches nixpkgs, so it fails outright without a connection.
+        if ! check_network; then
+            echo "no network connection" > "$ERROR_FILE"
+            echo "Update check failed:\\nno network connection" > "$LAST_RUN_TOOLTIP"
+            echo "$(date +%s)" > "$LAST_RUN_FILE"
+            exit 0
+        fi
         check_for_updates_lightweight || true
     ) 9>"$CHECK_LOCK_FILE"
 }
@@ -1413,7 +1620,10 @@ main() {
         # Any rebuild invalidates the package-sources cache - the user may have moved
         # packages between pkgs/pkgs-unstable, which doesn't change flake.lock but
         # does change which channel a package should be compared against.
-        rm -f "$PACKAGE_SOURCES_CACHE"
+        # Requested rather than deleted: a check may be running in another
+        # process right now, and removing the file from under it is what made a
+        # rebuild landing mid-check reclassify everything as stable.
+        touch "$REPARSE_REQUEST_FLAG"
 
         if [ "$packages_changed" = true ]; then
             # Package versions changed - reset count to 0 and mark as just-checked.
@@ -1554,6 +1764,16 @@ main() {
     # Built here rather than during the check, so a preview requested between
     # checks shows up on the very next poll instead of waiting for one.
     build_preview_section
+
+    # The last check failed. Show the error state and keep whatever count the
+    # last good check found, rather than reporting a healthy "0". An already
+    # computed cost is independent of that failure, so it still shows.
+    if [ -f "$ERROR_FILE" ]; then
+        local err_body="$tooltip"
+        [ -n "$PREVIEW_SECTION" ] && err_body="$err_body\\n\\n$PREVIEW_SECTION"
+        output_json "$updates" "error" "$header\\n─────────────────────────────────────────────────\\n$err_body"
+        exit 0
+    fi
 
     local body=""
     if [ "$updates" -ne 0 ] 2>/dev/null; then
