@@ -99,6 +99,11 @@ ERROR_FILE="$CACHE_DIR/nix-update-error"
 # current one, because the failure worth diagnosing here is a bad check
 # immediately followed by a good one - keeping only the latest would always
 # overwrite the interesting half.
+# Set when a rebuild is detected, asking the next check to re-derive the
+# package-to-channel mapping. A request rather than a deletion, so it cannot
+# disturb a check already in progress.
+REPARSE_REQUEST_FLAG="$CACHE_DIR/nix-update-reparse-request"
+
 DIAG_FILE="$CACHE_DIR/nix-update-diagnostic"
 DIAG_PREV_FILE="$CACHE_DIR/nix-update-diagnostic.prev"
 
@@ -550,7 +555,10 @@ detect_channels_from_flake() {
 # ===== Config Parsing =====
 should_reparse_config() {
     local flake_lock="$FLAKE_DIR/flake.lock"
-    
+
+    # A rebuild asked for this; packages may have moved between channels.
+    [ -f "$REPARSE_REQUEST_FLAG" ] && return 0
+
     # No cache exists
     [ ! -f "$PACKAGE_SOURCES_CACHE" ] && return 0
     [ ! -f "$FLAKE_LOCK_HASH_FILE" ] && return 0
@@ -810,35 +818,56 @@ update_package_sources_cache() {
         if [ -f "$flake_lock" ]; then
             md5sum "$flake_lock" 2>/dev/null | cut -d' ' -f1 > "$FLAKE_LOCK_HASH_FILE"
         fi
+
+        # The reparse that a rebuild asked for has now happened.
+        rm -f "$REPARSE_REQUEST_FLAG"
     fi
     
     return 0
 }
 
+# Package-to-channel mapping, read once per check and held in memory.
+#
+# It used to be re-read from disk for every package, which was two jq processes
+# each across several hundred packages, and - worse - meant a check depended on
+# that file surviving for its whole duration. main deletes the file when it
+# detects a rebuild, from a different process than the detached worker, so a
+# rebuild landing mid-check silently reclassified every remaining package as
+# stable and reported everything installed from unstable as a change.
+declare -A PKG_CHANNEL_MAP
+PKG_CHANNEL_MAP_LOADED=false
+
+load_package_channel_map() {
+    PKG_CHANNEL_MAP=()
+    PKG_CHANNEL_MAP_LOADED=false
+
+    [ "$DUAL_CHANNEL_MODE" = "true" ] || return 0
+    [ -f "$PACKAGE_SOURCES_CACHE" ] || return 1
+
+    local name channel
+    # unstable first, so a name appearing in both keeps unstable precedence.
+    while IFS=$'\t' read -r name channel; do
+        [ -n "$name" ] && PKG_CHANNEL_MAP["$name"]="$channel"
+    done < <(jq -r '
+        (.unstable[]? | [ascii_downcase, "unstable"] | @tsv),
+        (.stable[]?   | [ascii_downcase, "stable"]   | @tsv)
+    ' "$PACKAGE_SOURCES_CACHE" 2>/dev/null)
+
+    [ "${#PKG_CHANNEL_MAP[@]}" -gt 0 ] || return 1
+    PKG_CHANNEL_MAP_LOADED=true
+    return 0
+}
+
 get_package_channel() {
-    local pkg_name="$1"
-    local pkg_lower="${pkg_name,,}"  # Convert to lowercase for comparison
-    
-    # If no config parsing, everything uses single channel
-    if [ "$DUAL_CHANNEL_MODE" != "true" ] || [ ! -f "$PACKAGE_SOURCES_CACHE" ]; then
+    local pkg_lower="${1,,}"
+
+    if [ "$DUAL_CHANNEL_MODE" != "true" ] || [ "$PKG_CHANNEL_MAP_LOADED" != true ]; then
         echo "single"
         return
     fi
-    
-    # Check if package is in unstable list (case-insensitive)
-    if jq -e --arg pkg "$pkg_lower" '.unstable | map(ascii_downcase) | index($pkg)' "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
-        echo "unstable"
-        return
-    fi
-    
-    # Check if package is in stable list (case-insensitive)
-    if jq -e --arg pkg "$pkg_lower" '.stable | map(ascii_downcase) | index($pkg)' "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
-        echo "stable"
-        return
-    fi
-    
+
     # Unknown - default to stable
-    echo "stable"
+    echo "${PKG_CHANNEL_MAP[$pkg_lower]:-stable}"
 }
 
 # Records a failed evaluation. Deliberately does not touch STATE_FILE: a check
@@ -1034,12 +1063,13 @@ check_for_updates_lightweight() {
     if [ "$DUAL_CHANNEL_MODE" = "true" ]; then
         update_package_sources_cache
 
-        # Without this mapping every package falls back to "stable", so anything
-        # installed from unstable is compared against the wrong channel and shows
-        # a bogus change. One unknown package is a nuisance; no mapping at all
-        # inverts the whole list, so refuse rather than report nonsense.
-        if ! jq -e '(.stable | length) + (.unstable | length) > 0' \
-                "$PACKAGE_SOURCES_CACHE" >/dev/null 2>&1; then
+        # Read the mapping into memory now, so the rest of the check cannot be
+        # affected by the file being removed underneath it. Without this mapping
+        # every package falls back to "stable", so anything installed from
+        # unstable is compared against the wrong channel and shows a bogus
+        # change. One unknown package is a nuisance; no mapping at all inverts
+        # the whole list, so refuse rather than report nonsense.
+        if ! load_package_channel_map; then
             local why="could not map packages to channels"
             [ -f "$PACKAGE_SOURCES_CACHE" ] || why="package-to-channel cache missing"
             echo "$why" > "$ERROR_FILE"
@@ -1501,7 +1531,10 @@ main() {
         # Any rebuild invalidates the package-sources cache - the user may have moved
         # packages between pkgs/pkgs-unstable, which doesn't change flake.lock but
         # does change which channel a package should be compared against.
-        rm -f "$PACKAGE_SOURCES_CACHE"
+        # Requested rather than deleted: a check may be running in another
+        # process right now, and removing the file from under it is what made a
+        # rebuild landing mid-check reclassify everything as stable.
+        touch "$REPARSE_REQUEST_FLAG"
 
         if [ "$packages_changed" = true ]; then
             # Package versions changed - reset count to 0 and mark as just-checked.
