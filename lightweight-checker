@@ -48,6 +48,17 @@ CLOCK_FORMAT="${CLOCK_FORMAT:-24h}"
 INPUT_CHECKER_MODE="${INPUT_CHECKER_MODE:-disabled}"
 INPUT_CHECKER_PINNED="${INPUT_CHECKER_PINNED:-disabled}"
 
+# Shell patterns for generated store outputs that are skipped before version
+# parsing. Without this, an output like "atuin-18.7.1-fish-completions" parses
+# its suffix as part of the version and reports a phantom update.
+# Parsed once here rather than per entry - extract_packages runs over hundreds
+# of store references per check.
+LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON="${LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON:-[\"*-fish-completions\"]}"
+EXCLUDE_PATTERNS=()
+if [ -n "$LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON" ]; then
+    mapfile -t EXCLUDE_PATTERNS < <(jq -r '.[]?' <<<"$LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON" 2>/dev/null)
+fi
+
 # Filter to only packages explicitly defined in config files
 # This reduces false positives from system dependencies
 # Defaults to "true" when dual channel mode is enabled, "false" otherwise
@@ -796,6 +807,11 @@ collect_installed_packages() {
     # Helper to extract packages from store paths
     extract_packages() {
         while IFS= read -r entry; do
+            # Skip configured generated outputs before any version parsing
+            local pattern
+            for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+                [[ "$entry" == $pattern ]] && continue 2
+            done
             # Skip common output suffixes that aren't the main package
             case "$entry" in *-man|*-bin|*-doc|*-info|*-dev|*-lib|*-terminfo|*-debug|*-static) continue ;; esac
             # Skip entries with "unstable" in the name (date-versioned)

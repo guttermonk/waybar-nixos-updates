@@ -44,6 +44,17 @@
   #   # explicitPackagesOnly defaults to true in dual-channel mode
   # };
 
+  # Example 1e: Excluding generated store outputs from the lightweight count
+  # Outputs like "atuin-18.7.1-fish-completions" parse their suffix as part of
+  # the version and show up as phantom updates. Patterns match the whole name,
+  # so keep them anchored - "*-completions" would also drop nix-bash-completions.
+  # programs.waybar-nixos-updates = {
+  #   enable = true;
+  #   checkMode = "lightweight";
+  #   nixosConfigPath = "~/.config/nixos";
+  #   lightweightExcludePatterns = [ "*-fish-completions" "*-zsh-completions" ];
+  # };
+
   # Example 1d: With flake input staleness checking
   # Combines package updates with stale input detection in one tooltip
   # programs.waybar-nixos-updates = {

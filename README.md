@@ -199,6 +199,7 @@ When using the Home Manager module, you can configure these options:
     ```
   - In dual-channel mode, `nixosConfigPath` is scanned for `.nix` files to determine package sources, and flake refs are auto-detected from your `flake.lock`
 - `explicitPackagesOnly`: Only report updates for packages explicitly defined in your config files (default: `true` in dual-channel mode, `false` otherwise)
+- `lightweightExcludePatterns`: Shell patterns for generated store outputs to skip before version parsing (default: `[ "*-fish-completions" ]`). Outputs like `atuin-18.7.1-fish-completions` otherwise have their suffix read as part of the version, showing a phantom update. Keep patterns anchored — `*-completions` would also drop real packages such as `nix-bash-completions`.
 
 **Lightweight mode features:**
 - **Home-manager packages**: Automatically detected and included (no config needed)

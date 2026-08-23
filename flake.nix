@@ -285,7 +285,26 @@
                   false otherwise. Set explicitly to override the default.
                 '';
               };
-              
+
+              lightweightExcludePatterns = mkOption {
+                type = types.listOf types.str;
+                default = [ "*-fish-completions" ];
+                example = [ "*-fish-completions" "*-zsh-completions" ];
+                description = ''
+                  Shell patterns matched against store output names and skipped before
+                  version parsing (lightweight mode only).
+
+                  Generated outputs such as "atuin-18.7.1-fish-completions" otherwise have
+                  their suffix parsed as part of the version, producing a phantom update in
+                  both the count and the tooltip. Patterns are matched against the whole
+                  name, so keep them anchored - "*-completions" would also drop genuine
+                  packages like nix-bash-completions.
+
+                  This is distinct from explicitPackagesOnly, which filters package names
+                  rather than output suffixes.
+                '';
+              };
+
               inputChecker = {
                 mode = mkOption {
                   type = types.enum [ "disabled" "show" "count" ];
@@ -363,6 +382,7 @@
                   export CLOCK_FORMAT="${cfg.clockFormat}"
                   export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
+                  export LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON=${escapeShellArg (builtins.toJSON cfg.lightweightExcludePatterns)}
                   ${if builtins.isString cfg.nixpkgsChannel then ''
                   export NIXPKGS_CHANNEL="${cfg.nixpkgsChannel}"
                   ${if cfg.explicitPackagesOnly != null then ''
