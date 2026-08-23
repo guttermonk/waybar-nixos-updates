@@ -55,6 +55,23 @@
   #   lightweightExcludePatterns = [ "*-fish-completions" "*-zsh-completions" ];
   # };
 
+  # Example 1g: On-demand update-cost preview (middle-click)
+  # Reports what updating your flake inputs and rebuilding would actually cost,
+  # without changing your flake.lock. Off by default because it is a full system
+  # evaluation - a few minutes and over a gigabyte of memory - so it never runs
+  # on a timer. Set back to false to remove it and clear any stored result.
+  # programs.waybar-nixos-updates = {
+  #   enable = true;
+  #   checkMode = "lightweight";
+  #   dryRunPreview.enable = true;
+  #   # dryRunPreview.target = ".#nixosConfigurations.\${hostname}.config.system.build.toplevel";
+  # };
+  #
+  # Tooltip while calculating:  Update cost:
+  #                             calculating... (~3 min)
+  # Tooltip once complete:      Update cost (14:23):
+  #                             21 to build · 53 to download (46.9 MiB download, 159.8 MiB unpacked)
+
   # Example 1f: Explicit upstream policies for sources the ordinary checks
   # cannot interpret - a fork tracking a branch, and a pinned release line.
   # Each check declares intent, so an intentional pin is not reported as drift.

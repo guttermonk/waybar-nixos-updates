@@ -203,6 +203,12 @@ When using the Home Manager module, you can configure these options:
     ```
   - In dual-channel mode, `nixosConfigPath` is scanned for `.nix` files to determine package sources, and flake refs are auto-detected from your `flake.lock`
 - `explicitPackagesOnly`: Only report updates for packages explicitly defined in your config files (default: `true` in dual-channel mode, `false` otherwise)
+- `dryRunPreview.enable`: Adds an on-demand update-cost preview on **middle-click** (default: `false`). Resolves a temporary lock file and runs a Nix dry-run to report how many derivations would be built and how much would be downloaded if you updated your flake inputs and rebuilt. Your `flake.lock` and configuration are never modified, and the update count is unchanged.
+  - Never runs on a timer. A preview is a full system evaluation — roughly 2–3 minutes and well over a gigabyte of memory — so it only runs when you ask for it.
+  - The result is stamped with the time it was taken and is discarded automatically once it stops being true: either `flake.lock` changes or you rebuild.
+  - Setting this back to `false` removes the binding *and* clears any result already computed.
+  - Shares a lock with the background check, so the two never evaluate at once. Middle-clicking during a check reports `check in progress — try again shortly` rather than queueing.
+  - `dryRunPreview.target`: flake target to price; literal `${hostname}` is replaced at run time. A leading `.#` resolves against `nixosConfigPath`, not your shell's working directory.
 - `lightweightExcludePatterns`: Shell patterns for generated store outputs to skip before version parsing (default: `[ "*-fish-completions" ]`). Outputs like `atuin-18.7.1-fish-completions` otherwise have their suffix read as part of the version, showing a phantom update. Keep patterns anchored — `*-completions` would also drop real packages such as `nix-bash-completions`.
 
 **Lightweight mode features:**
@@ -467,6 +473,7 @@ The script uses several cache files in your ~/.cache directory:
 - `nix-update-updating-flag`: Signals that a check is mid-run (full mode only)
 - `nix-update-check.lock`: Held while a background check runs, so only one runs at a time (lightweight mode only)
 - `nix-update-force-check`: Set by `refresh` to request a check before the interval is up; cleared once that check starts
+- `nix-update-preview`: Last update-cost preview, with the `flake.lock` hash and system path it was computed against; removed when `dryRunPreview.enable` is `false`
 
 ### 🔒 Privacy and Security Considerations
 The script checks network connectivity locally using the `ip` command to verify network interfaces and routing tables. This approach:

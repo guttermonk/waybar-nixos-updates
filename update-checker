@@ -19,6 +19,10 @@
     # means "no checks configured". An empty value is a broken one, and must
     # reach source-checker to be reported rather than passing as a clean result.
     SOURCE_CHECKS_JSON="${SOURCE_CHECKS_JSON-[]}"
+    # On-demand update-cost preview, bound to middle-click when enabled. Off by
+    # default: a preview is a full system evaluation costing minutes, so it
+    # never runs on a timer.
+    DRY_RUN_PREVIEW="${DRY_RUN_PREVIEW:-false}"
     STATE_FILE="$CACHE_DIR/nix-update-state"
     LAST_RUN_FILE="$CACHE_DIR/nix-update-last-run"
     LAST_RUN_TOOLTIP="$CACHE_DIR/nix-update-tooltip"
@@ -57,6 +61,8 @@
     # tooltip's "Last checked" time comes from - removing it to force a check
     # would erase the very timestamp the header needs to display.
     FORCE_CHECK_FLAG="$CACHE_DIR/nix-update-force-check"
+    # Result of the last update-cost preview, written by the preview script.
+    PREVIEW_FILE="$CACHE_DIR/nix-update-preview"
 
 
     # ===== Initialize Files =====
@@ -293,6 +299,87 @@
         else
             echo "Last checked: $last_checked · Next check: $next_check"
         fi
+    }
+
+    # Renders the "Update cost" tooltip section and reports, via
+    # PREVIEW_HAS_STATE, whether there is real state behind it. A bare
+    # "middle-click to calculate" affordance must not by itself give a fully
+    # updated system a tooltip, so only actual state counts towards showing one.
+    PREVIEW_SECTION=""
+    PREVIEW_HAS_STATE=false
+    function build_preview_section() {
+        PREVIEW_SECTION=""
+        PREVIEW_HAS_STATE=false
+
+        # Disabled: drop any result so turning the feature off also clears what
+        # it left behind, rather than stranding a number with no way to dismiss.
+        if [ "$DRY_RUN_PREVIEW" != "true" ]; then
+            rm -f "$PREVIEW_FILE"
+            return 0
+        fi
+
+        if [ ! -f "$PREVIEW_FILE" ]; then
+            PREVIEW_SECTION="Update cost:\nmiddle-click to calculate"
+            return 0
+        fi
+
+        local status="" timestamp="" lock_hash="" system_path="" reason="" cost=""
+        local key value
+        while IFS='=' read -r key value; do
+            case "$key" in
+                status)      status="$value" ;;
+                timestamp)   timestamp="$value" ;;
+                lock_hash)   lock_hash="$value" ;;
+                system_path) system_path="$value" ;;
+                reason)      reason="$value" ;;
+                cost)        cost="$value" ;;
+            esac
+        done < "$PREVIEW_FILE"
+
+        PREVIEW_HAS_STATE=true
+        local body
+        case "$status" in
+            calculating)
+                body="calculating... (~3 min)"
+                ;;
+            declined)
+                body="check in progress — try again shortly"
+                # Cleared on read: the click has been answered, and the message
+                # should not outlive the check it refers to.
+                rm -f "$PREVIEW_FILE"
+                ;;
+            failed)
+                body="unavailable${reason:+ — $reason}"
+                ;;
+            done)
+                local live_lock live_system
+                live_lock=$(sha256sum "$NIXOS_CONFIG_PATH/flake.lock" 2>/dev/null | cut -d' ' -f1)
+                live_system=$(readlink -f /run/current-system 2>/dev/null)
+                # Inputs first: when both moved, that is the change that governs
+                # what a prospective update would cost.
+                if [ "$lock_hash" != "$live_lock" ]; then
+                    body="inputs changed — middle-click to recalculate"
+                elif [ "$system_path" != "$live_system" ]; then
+                    body="outdated since rebuild — middle-click to recalculate"
+                else
+                    local when=""
+                    if [ -n "$timestamp" ] && [ "$timestamp" != "0" ]; then
+                        if [ "$CLOCK_FORMAT" = "12h" ]; then
+                            when=$(date -d "@$timestamp" "+%I:%M %p" 2>/dev/null)
+                        else
+                            when=$(date -d "@$timestamp" "+%H:%M" 2>/dev/null)
+                        fi
+                    fi
+                    PREVIEW_SECTION="Update cost${when:+ ($when)}:\n$cost"
+                    return 0
+                fi
+                ;;
+            *)
+                body="unavailable"
+                ;;
+        esac
+
+        PREVIEW_SECTION="Update cost:\n$body"
     }
 
     function var_setter() {
@@ -832,6 +919,19 @@
             send_notification "updates-failed" "Update Check Failed" "Not connected to the internet"
         fi
 
+        # Built here rather than during the check, so a preview requested
+        # between checks shows up on the very next poll instead of waiting.
+        build_preview_section
+        if [ -n "$PREVIEW_SECTION" ]; then
+            # The affordance hint alone must not conjure a tooltip for an
+            # otherwise up-to-date system; only real preview state earns one.
+            if [ -n "$tooltip" ]; then
+                tooltip="$tooltip\n\n$PREVIEW_SECTION"
+            elif [ "$PREVIEW_HAS_STATE" = true ]; then
+                tooltip="$PREVIEW_SECTION"
+            fi
+        fi
+
         # Output JSON for Waybar
         echo "{ \"text\":\"$updates\", \"alt\":\"$alt\", \"tooltip\":\"$tooltip\" }"
     }
@@ -843,5 +943,6 @@
     case "${1:-}" in
         toggle)  toggle_updates ;;
         refresh) refresh_updates ;;
+        preview) shift; preview "${@:-start}" ;;
         *)       main ;;
     esac

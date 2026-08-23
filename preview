@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+
+# Update-cost preview: prices a prospective input update without applying it.
+#
+# Answers "if I ran nix flake update and rebuilt, what would it cost?" by
+# resolving a temporary lock file and asking nix for a dry-run build plan.
+# The real flake.lock is never written.
+#
+# Deliberately on demand only. A full system evaluation costs minutes and a
+# lot of memory, so this runs when asked and never on a timer.
+
+set -uo pipefail
+
+FLAKE_DIR="${FLAKE_DIR:-${NIXOS_CONFIG_PATH:-$HOME/.config/nixos}}"
+CACHE_DIR="${CACHE_DIR:-$HOME/.cache}"
+PREVIEW_TARGET="${PREVIEW_TARGET:-.#nixosConfigurations.$(hostname).config.system.build.toplevel}"
+
+PREVIEW_FILE="$CACHE_DIR/nix-update-preview"
+
+# Shared with the background update check so the two never evaluate at once -
+# each costs well over a gigabyte of RAM.
+CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
+
+# Cleanup is registered at top level rather than inside the function that
+# creates the directory: an EXIT trap runs after the function's locals are gone.
+tempdir=""
+cleanup() { [ -n "$tempdir" ] && rm -rf "$tempdir"; }
+trap cleanup EXIT
+
+refresh_waybar() {
+    pkill -x -RTMIN+12 .waybar-wrapped >/dev/null 2>&1 || true
+}
+
+have_network() {
+    ip route 2>/dev/null | grep -q "^default"
+}
+
+current_lock_hash() {
+    sha256sum "$FLAKE_DIR/flake.lock" 2>/dev/null | cut -d' ' -f1
+}
+
+current_system_path() {
+    readlink -f /run/current-system 2>/dev/null
+}
+
+# The state file is read by both checkers at output time. Values are written
+# one per line as key=value; cost is last because it is the only free-form one.
+write_state() {
+    local status="$1" cost="${2:-}" reason="${3:-}"
+    mkdir -p "$CACHE_DIR"
+    {
+        printf 'status=%s\n' "$status"
+        printf 'timestamp=%s\n' "$(date +%s)"
+        printf 'lock_hash=%s\n' "$(current_lock_hash)"
+        printf 'system_path=%s\n' "$(current_system_path)"
+        printf 'reason=%s\n' "$reason"
+        printf 'cost=%s\n' "$cost"
+    } > "$PREVIEW_FILE"
+}
+
+# Turns nix's dry-run plan into a single line. The counts exist only as
+# human-readable text - nix build --dry-run --json reports the top-level
+# derivation and nothing about what would be built or fetched - so this scrapes
+# stderr. A format change must therefore read as "unavailable" and never as a
+# plausible-looking zero.
+summarise_plan() {
+    local plan="$1"
+    local builds fetches sizes
+
+    builds=$(sed -nE 's/^these ([0-9]+) derivations? will be built:$/\1/p; s/^this derivation will be built:$/1/p' <<<"$plan" | tail -1)
+    fetches=$(sed -nE 's/^these ([0-9]+) paths? will be fetched.*$/\1/p; s/^this path will be fetched.*$/1/p' <<<"$plan" | tail -1)
+    sizes=$(sed -nE 's/^these [0-9]+ paths? will be fetched \((.*)\):$/\1/p; s/^this path will be fetched \((.*)\):$/\1/p' <<<"$plan" | tail -1)
+
+    # nix omits both lines when there is genuinely nothing to do. That is a
+    # real answer, and a different one from failing to understand the output.
+    if [ -z "$builds" ] && [ -z "$fetches" ]; then
+        if grep -q "will be built\|will be fetched" <<<"$plan"; then
+            return 1  # the lines are there but did not parse
+        fi
+        printf 'nothing to build or download'
+        return 0
+    fi
+
+    local out="${builds:-0} to build · ${fetches:-0} to download"
+    [ -n "$sizes" ] && out+=" ($sizes)"
+    printf '%s' "$out"
+}
+
+run_preview() {
+    if [ ! -f "$FLAKE_DIR/flake.lock" ]; then
+        write_state failed "" "no flake.lock at $FLAKE_DIR"
+        refresh_waybar
+        return 1
+    fi
+
+    if ! have_network; then
+        write_state failed "" "no network"
+        refresh_waybar
+        return 1
+    fi
+
+    tempdir=$(mktemp -d) || return 1
+
+    # A leading "." means the configured flake, not the working directory:
+    # this is invoked from waybar, whose cwd is arbitrary.
+    local target="$PREVIEW_TARGET"
+    case "$target" in
+        .#*) target="$FLAKE_DIR#${target#.#}" ;;
+    esac
+
+    # Resolve an updated lock beside the real one rather than copying the tree.
+    # --output-lock-file writes only the lock, so the configuration and its
+    # working tree are untouched.
+    local update_err
+    if ! update_err=$(nix flake update --flake "$FLAKE_DIR" \
+            --output-lock-file "$tempdir/flake.lock" 2>&1); then
+        write_state failed "" "$(tail -1 <<<"$update_err")"
+        refresh_waybar
+        return 1
+    fi
+
+    local plan
+    if ! plan=$(nix build --dry-run --reference-lock-file "$tempdir/flake.lock" \
+            "$target" 2>&1 >/dev/null); then
+        write_state failed "" "$(tail -1 <<<"$plan")"
+        refresh_waybar
+        return 1
+    fi
+
+    # Strip any ANSI nix may have emitted before matching on line starts.
+    plan=$(sed $'s/\033\\[[0-9;]*m//g' <<<"$plan")
+
+    local cost
+    if ! cost=$(summarise_plan "$plan"); then
+        write_state failed "" "unexpected nix output"
+        refresh_waybar
+        return 1
+    fi
+
+    write_state done "$cost"
+    refresh_waybar
+}
+
+# Entry point used by the click binding: report immediately, evaluate detached.
+start() {
+    mkdir -p "$CACHE_DIR"
+
+    # A check and a preview are each a full system evaluation. Decline rather
+    # than queue, so a click never fires a job minutes after it was forgotten.
+    if ! flock -n "$CHECK_LOCK_FILE" true 2>/dev/null; then
+        write_state declined
+        refresh_waybar
+        return 0
+    fi
+
+    write_state calculating
+    refresh_waybar
+    setsid -f "$0" worker </dev/null >/dev/null 2>&1 || true
+}
+
+worker() {
+    (
+        flock -n 9 || exit 0
+        printf '%s %s\n' "$(($(ps -o pgid= -p $$)))" "$(date +%s)" >&9
+        run_preview || true
+    ) 9>"$CHECK_LOCK_FILE"
+}
+
+case "${1:-start}" in
+    start)  start ;;
+    worker) worker ;;
+    run)    run_preview ;;   # synchronous, for terminal use
+    clear)  rm -f "$PREVIEW_FILE"; refresh_waybar ;;
+    *)      echo "usage: preview [start|run|clear]" >&2; exit 2 ;;
+esac

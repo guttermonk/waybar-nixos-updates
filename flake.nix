@@ -31,6 +31,8 @@
             chmod +x $out/bin/update-checker
             cp source-checker $out/bin/source-checker
             chmod +x $out/bin/source-checker
+            cp preview $out/bin/preview
+            chmod +x $out/bin/preview
             
             # Install icons
             mkdir -p $out/share/icons/waybar-nixos-updates
@@ -88,6 +90,8 @@
             chmod +x $out/bin/lightweight-checker
             cp source-checker $out/bin/source-checker
             chmod +x $out/bin/source-checker
+            cp preview $out/bin/preview
+            chmod +x $out/bin/preview
             
             # Install icons (for notifications)
             mkdir -p $out/share/icons/waybar-nixos-updates
@@ -353,6 +357,26 @@
                 '';
               };
 
+              dryRunPreview = {
+                enable = mkEnableOption ''
+                  an on-demand update-cost preview, bound to middle-click.
+
+                  Resolves a temporary lock file and runs a Nix dry-run to report how
+                  many derivations would be built and how much would be downloaded if
+                  you updated your flake inputs and rebuilt. Your flake.lock and
+                  configuration are never modified, and the update count is unchanged.
+
+                  Off by default, and never runs on a timer: a preview is a full system
+                  evaluation costing a few minutes and well over a gigabyte of memory.
+                  Setting this back to false also clears any result already computed.
+                '';
+                target = mkOption {
+                  type = types.str;
+                  default = ".#nixosConfigurations.\${hostname}.config.system.build.toplevel";
+                  description = "Flake target to price; literal \${hostname} is replaced at run time.";
+                };
+              };
+
               sourceChecks = mkOption {
                 type = types.listOf sourceCheckType;
                 default = [ ];
@@ -419,6 +443,11 @@
                   on-click = "~/.config/waybar/scripts/update-checker toggle";
                   on-click-right = "~/.config/waybar/scripts/update-checker refresh";
                   interval = cfg.updateInterval;
+                } // optionalAttrs cfg.dryRunPreview.enable {
+                  # Only bound when the preview is enabled, so it cannot be
+                  # triggered by accident on a default configuration.
+                  on-click-middle = "~/.config/waybar/scripts/update-checker preview";
+                } // {
                   tooltip = true;
                   return-type = "json";
                   format = "{icon} {text}";
@@ -466,6 +495,8 @@
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
                   export LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON=${escapeShellArg (builtins.toJSON cfg.lightweightExcludePatterns)}
                   export SOURCE_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.sourceChecks)}
+                  export DRY_RUN_PREVIEW="${if cfg.dryRunPreview.enable then "true" else "false"}"
+                  export PREVIEW_TARGET="${builtins.replaceStrings ["\${hostname}"] ["$(hostname)"] cfg.dryRunPreview.target}"
                   ${if builtins.isString cfg.nixpkgsChannel then ''
                   export NIXPKGS_CHANNEL="${cfg.nixpkgsChannel}"
                   ${if cfg.explicitPackagesOnly != null then ''
@@ -492,6 +523,8 @@
                   export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
                   export SOURCE_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.sourceChecks)}
+                  export DRY_RUN_PREVIEW="${if cfg.dryRunPreview.enable then "true" else "false"}"
+                  export PREVIEW_TARGET="${builtins.replaceStrings ["\${hostname}"] ["$(hostname)"] cfg.dryRunPreview.target}"
                   exec ${checkerBin} "$@"
                 '';
               };
