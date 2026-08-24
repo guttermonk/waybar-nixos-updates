@@ -96,6 +96,10 @@ FLAKE_LOCK_HASH_FILE="$CACHE_DIR/nix-update-flake-lock-hash"
 # very timestamp the header needs to display.
 FORCE_CHECK_FLAG="$CACHE_DIR/nix-update-force-check"
 
+# Fingerprint of the last check's findings, used to expire a preview when
+# upstream moves. Written by the checker, read by the preview script.
+RESULT_HASH_FILE="$CACHE_DIR/nix-update-result-hash"
+
 # Result of the last update-cost preview, written by the preview script.
 PREVIEW_FILE="$CACHE_DIR/nix-update-preview"
 
@@ -297,6 +301,15 @@ format_tooltip_header() {
 # whether there is real state behind it. A bare "middle-click to calculate"
 # affordance must not by itself give a fully updated system a tooltip, so only
 # actual state counts towards showing one.
+# Fingerprint of what the last check found. The update-cost preview prices a
+# prospective `nix flake update`, so it goes stale when upstream moves - which
+# changes nothing about flake.lock or the current system, and so is invisible to
+# the preview's other two staleness keys. A change in what the check reports is
+# the observable signal that upstream moved.
+write_result_hash() {
+    sha256sum "$LAST_RUN_TOOLTIP" 2>/dev/null | cut -d' ' -f1 > "$RESULT_HASH_FILE"
+}
+
 # True while the process that recorded a "calculating" preview is still alive.
 # An empty owner means the launcher has written the record but the evaluating
 # process has not claimed it yet - a sub-second window, treated as live.
@@ -335,7 +348,7 @@ build_preview_section() {
         return 0
     fi
 
-    local status="" timestamp="" lock_hash="" system_path="" owner="" reason="" cost=""
+    local status="" timestamp="" lock_hash="" system_path="" result_hash="" owner="" reason="" cost=""
     local key value
     while IFS='=' read -r key value; do
         case "$key" in
@@ -343,6 +356,8 @@ build_preview_section() {
             timestamp)   timestamp="$value" ;;
             lock_hash)   lock_hash="$value" ;;
             system_path) system_path="$value" ;;
+
+            result_hash) result_hash="$value" ;;
             owner)       owner="$value" ;;
             reason)      reason="$value" ;;
             cost)        cost="$value" ;;
@@ -379,6 +394,11 @@ build_preview_section() {
             # what a prospective update would cost.
             if [ "$lock_hash" != "$live_lock" ]; then
                 body="inputs changed — middle-click to recalculate"
+
+            elif [ "$result_hash" != "$(cat "$RESULT_HASH_FILE" 2>/dev/null)" ]; then
+                # Upstream moved: the check now finds something different, so a cost
+                # priced against the old upstream no longer holds.
+                body="updates changed — middle-click to recalculate"
             elif [ "$system_path" != "$live_system" ]; then
                 body="outdated since rebuild — middle-click to recalculate"
             else
@@ -1528,7 +1548,8 @@ check_for_updates_lightweight() {
             send_notification "updates-pending" "Update Check Complete" "Found $total_count updates" -e
         fi
     fi
-    
+
+    write_result_hash
     return 0
 }
 
