@@ -305,6 +305,26 @@
     # PREVIEW_HAS_STATE, whether there is real state behind it. A bare
     # "middle-click to calculate" affordance must not by itself give a fully
     # updated system a tooltip, so only actual state counts towards showing one.
+    # True while the process that recorded a "calculating" preview is still
+    # alive. An empty owner means the launcher has written the record but the
+    # evaluating process has not claimed it yet - a sub-second window, treated
+    # as live.
+    function preview_owner_alive() {
+        local pid starttime
+        read -r pid starttime <<<"$1"
+
+        [ -z "$pid" ] && return 0
+        [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+        [ -d "/proc/$pid" ] || return 1
+
+        if [[ "$starttime" =~ ^[0-9]+$ ]]; then
+            local live
+            live=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)
+            [ "$live" = "$starttime" ] || return 1
+        fi
+        return 0
+    }
+
     PREVIEW_SECTION=""
     PREVIEW_HAS_STATE=false
     function build_preview_section() {
@@ -323,7 +343,7 @@
             return 0
         fi
 
-        local status="" timestamp="" lock_hash="" system_path="" reason="" cost=""
+        local status="" timestamp="" lock_hash="" system_path="" owner="" reason="" cost=""
         local key value
         while IFS='=' read -r key value; do
             case "$key" in
@@ -331,6 +351,7 @@
                 timestamp)   timestamp="$value" ;;
                 lock_hash)   lock_hash="$value" ;;
                 system_path) system_path="$value" ;;
+                owner)       owner="$value" ;;
                 reason)      reason="$value" ;;
                 cost)        cost="$value" ;;
             esac
@@ -340,7 +361,14 @@
         local body
         case "$status" in
             calculating)
-                body="calculating... (~3 min)"
+                # An evaluation that died without recording anything would
+                # otherwise leave this reading "calculating..." indefinitely,
+                # since nothing else rewrites the record.
+                if preview_owner_alive "$owner"; then
+                    body="calculating... (~3 min)"
+                else
+                    body="interrupted — middle-click to retry"
+                fi
                 ;;
             declined)
                 body="check in progress — try again shortly"

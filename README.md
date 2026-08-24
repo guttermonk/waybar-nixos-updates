@@ -489,7 +489,7 @@ The script uses several cache files in your ~/.cache directory:
 - `nix-update-error`: Present when the last check failed, holding the reason; makes the module show its error state instead of a healthy count. Removed by the next successful check.
 - `nix-update-diagnostic` / `.prev`: What the last two checks actually resolved — channels, package-to-channel mapping size, and for each reported package which channel it was compared against versus which one the mapping put it in. The previous run is kept because a wrong result is usually followed immediately by a correct one, which would otherwise overwrite the evidence. If the module reports something you don't expect, `cat ~/.cache/nix-update-diagnostic.prev` is the place to start.
 - `nix-update-force-check`: Set by `refresh` to request a check before the interval is up; cleared once that check starts
-- `nix-update-preview`: Last update-cost preview, with the `flake.lock` hash and system path it was computed against; removed when `dryRunPreview.enable` is `false`
+- `nix-update-preview`: Last update-cost preview, with the `flake.lock` hash and system path it was computed against, plus the evaluating process while one is running so an interrupted preview is reported rather than left reading "calculating"; removed when `dryRunPreview.enable` is `false`
 
 ### 🔒 Privacy and Security Considerations
 The script checks network connectivity locally using the `ip` command to verify network interfaces and routing tables. This approach:

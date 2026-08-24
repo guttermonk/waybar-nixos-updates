@@ -46,13 +46,17 @@ current_system_path() {
 # The state file is read by both checkers at output time. Values are written
 # one per line as key=value; cost is last because it is the only free-form one.
 write_state() {
-    local status="$1" cost="${2:-}" reason="${3:-}"
+    local status="$1" cost="${2:-}" reason="${3:-}" owner="${4:-}"
     mkdir -p "$CACHE_DIR"
     {
         printf 'status=%s\n' "$status"
         printf 'timestamp=%s\n' "$(date +%s)"
         printf 'lock_hash=%s\n' "$(current_lock_hash)"
         printf 'system_path=%s\n' "$(current_system_path)"
+        # "<pid> <starttime>" of the evaluating process while status is
+        # calculating, so a reader can tell a live evaluation from one that died
+        # without recording anything. Empty in every other state.
+        printf 'owner=%s\n' "$owner"
         printf 'reason=%s\n' "$reason"
         printf 'cost=%s\n' "$cost"
     } > "$PREVIEW_FILE"
@@ -154,14 +158,28 @@ start() {
     fi
 
     write_state calculating
-    refresh_waybar
+    # Spawn before signalling waybar. The signal makes waybar re-poll, and that
+    # poll can start an update check, which would take the lock this worker is
+    # about to want.
     setsid -f "$0" worker </dev/null >/dev/null 2>&1 || true
+    refresh_waybar
 }
 
 worker() {
     (
-        flock -n 9 || exit 0
+        # The launcher's lock test and this acquisition are separate moments, so
+        # a check can start in between. Say so and clear the calculating state -
+        # exiting quietly here left the tooltip reading "calculating..." forever,
+        # because nothing else ever rewrites that record.
+        if ! flock -n 9; then
+            write_state declined
+            refresh_waybar
+            exit 0
+        fi
         printf '%s %s\n' "$(($(ps -o pgid= -p $$)))" "$(date +%s)" >&9
+        # Re-stamp with this process's identity so a reader can tell a running
+        # evaluation from one that was killed part way through.
+        write_state calculating "" "" "$$ $(awk '{print $22}' /proc/$$/stat 2>/dev/null)"
         run_preview || true
     ) 9>"$CHECK_LOCK_FILE"
 }
