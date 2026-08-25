@@ -77,6 +77,82 @@ write_state() {
 # derivation and nothing about what would be built or fetched - so this scrapes
 # stderr. A format change must therefore read as "unavailable" and never as a
 # plausible-looking zero.
+# Nix records no build durations, but it does record when each path became
+# valid. The gap between consecutive locally-built paths approximates how long
+# that derivation took, and the same for substituted paths gives an effective
+# download rate. Both are read from this machine's own store, so the estimate
+# calibrates itself to this CPU, disk and link rather than to shipped constants.
+NIX_DB="${NIX_DB:-/nix/var/nix/db/db.sqlite}"
+
+# Gaps longer than this are treated as a boundary between sessions rather than
+# one very slow derivation, and excluded from both history and rates.
+ESTIMATE_GAP_CAP="${ESTIMATE_GAP_CAP:-300}"
+
+# Effective substitution rate in MiB of nar per second, measured over the whole
+# span of a past download session. Deliberately not raw link speed: the span
+# includes the building that happens between fetches, which is what makes it
+# predict wall clock rather than transfer time.
+substitution_rate() {
+    command -v sqlite3 >/dev/null 2>&1 || return 1
+    sqlite3 "$NIX_DB" "
+        WITH s AS (
+          SELECT registrationTime AS t, narSize,
+                 registrationTime - LAG(registrationTime) OVER (ORDER BY registrationTime) AS gap
+          FROM ValidPaths WHERE ultimate IS NULL OR ultimate = 0)
+        SELECT ROUND(SUM(narSize)/1048576.0 / NULLIF(SUM(gap),0), 3)
+        FROM s WHERE gap IS NOT NULL AND gap <= $ESTIMATE_GAP_CAP;" 2>/dev/null
+}
+
+# Sum of median historical build times for the given derivation names, plus how
+# many of them had any history at all. A derivation never built here contributes
+# nothing and is counted as unseen, rather than being guessed at.
+build_estimate() {
+    local names_file="$1"
+    command -v sqlite3 >/dev/null 2>&1 || return 1
+    [ -s "$names_file" ] || return 1
+
+    # pname key: drop the trailing version so a new release matches past builds
+    # of the same package. Inlined as VALUES rather than imported: sqlite3
+    # flattens dot-commands when SQL arrives as an argument, so .import cannot
+    # be used here.
+    local values
+    values=$(sed -E "s/-[0-9][0-9a-zA-Z.+_-]*$//; s/'/''/g; s/^(.*)$/('\1'),/" "$names_file" \
+             | sort -u | tr -d '\n' | sed 's/,$//')
+    [ -n "$values" ] || return 1
+
+    sqlite3 "$NIX_DB" "
+        CREATE TEMP TABLE want(pname TEXT);
+        INSERT INTO want(pname) VALUES $values;
+        CREATE TEMP TABLE hist AS
+        WITH b AS (
+          SELECT substr(path,45) AS name,
+                 registrationTime - LAG(registrationTime) OVER (ORDER BY registrationTime) AS gap
+          FROM ValidPaths WHERE ultimate = 1)
+        SELECT name, gap FROM b WHERE gap IS NOT NULL AND gap <= $ESTIMATE_GAP_CAP;
+        CREATE TEMP TABLE m AS
+        WITH j AS (
+          SELECT DISTINCT w.pname AS pname, h.gap AS gap
+          FROM (SELECT DISTINCT pname FROM want) w
+          JOIN hist h ON h.name LIKE w.pname || '-%' OR h.name = w.pname),
+        r AS (
+          SELECT pname, gap,
+                 ROW_NUMBER() OVER (PARTITION BY pname ORDER BY gap) rn,
+                 COUNT(*)     OVER (PARTITION BY pname)            c
+          FROM j)
+        SELECT pname, MIN(gap) AS med FROM r WHERE rn = (c+1)/2 GROUP BY pname;
+        SELECT COALESCE(SUM(m.med),0) || '|' || COUNT(m.pname) || '|' || (SELECT COUNT(*) FROM want)
+        FROM want w LEFT JOIN m ON m.pname = w.pname;
+    " 2>/dev/null
+}
+
+# "1h 5m", "12m", "45s" - a duration nobody has to convert in their head.
+human_duration() {
+    local s="$1"
+    [ "$s" -lt 60 ] 2>/dev/null && { printf '%ds' "$s"; return; }
+    if [ "$s" -lt 3600 ]; then printf '%dm' "$((s/60))"; return; fi
+    printf '%dh %dm' "$((s/3600))" "$(((s%3600)/60))"
+}
+
 summarise_plan() {
     local plan="$1"
     local builds fetches sizes
@@ -95,8 +171,70 @@ summarise_plan() {
         return 0
     fi
 
-    local out="${builds:-0} to build · ${fetches:-0} to download"
+    # Download leads, because it dominates: a measured rebuild spent 30 of its
+    # 43 minutes fetching and only 13 building.
+    # A literal backslash-n, not a real newline: this ends up in a key=value
+    # state file that is read a line at a time, and the tooltip renders the
+    # escape as a break anyway.
+    local out=""
+    local est
+    if est=$(estimate_line "$plan"); then
+        [ -n "$est" ] && out="$est"'\n'
+    fi
+
+    out+="${builds:-0} to build · ${fetches:-0} to download"
     [ -n "$sizes" ] && out+=" ($sizes)"
+    printf '%s' "$out"
+}
+
+# Turns the plan into "~32m download · ~13m build (62 of 105 seen)". Any part
+# that cannot be estimated is omitted rather than guessed, and the whole line is
+# dropped if nothing can be worked out at all.
+estimate_line() {
+    local plan="$1"
+    local parts=()
+
+    # Download: unpacked bytes over the measured rate. Both are nar-domain, so
+    # the compression ratio cancels and never has to be assumed.
+    local unpacked rate
+    unpacked=$(sed -nE 's/.*will be fetched \(.*, ([0-9.]+) ([KMG])iB unpacked\):$/\1 \2/p' <<<"$plan" | tail -1)
+    rate=$(substitution_rate)
+    if [ -n "$unpacked" ] && [ -n "$rate" ]; then
+        local n unit mib
+        read -r n unit <<<"$unpacked"
+        case "$unit" in
+            K) mib=$(awk -v n="$n" 'BEGIN{printf "%.3f", n/1024}') ;;
+            M) mib="$n" ;;
+            G) mib=$(awk -v n="$n" 'BEGIN{printf "%.3f", n*1024}') ;;
+        esac
+        local secs
+        secs=$(awk -v m="$mib" -v r="$rate" 'BEGIN{ if (r>0) printf "%d", m/r }')
+        [ -n "$secs" ] && [ "$secs" -gt 0 ] 2>/dev/null && \
+            parts+=("~$(human_duration "$secs") download")
+    fi
+
+    # Build: sum of median historical times, with coverage stated. A low
+    # coverage figure is the reader's cue that the number is a floor.
+    local names
+    names=$(mktemp)
+    grep -oE '/nix/store/[a-z0-9]{32}-[^ ]*\.drv' <<<"$plan" \
+        | sed 's|.*/[a-z0-9]\{32\}-||; s|\.drv$||' | sort -u > "$names"
+    if [ -s "$names" ]; then
+        local res
+        if res=$(build_estimate "$names") && [ -n "$res" ]; then
+            local bsecs seen total
+            IFS='|' read -r bsecs seen total <<<"$res"
+            if [ "${bsecs:-0}" -gt 0 ] 2>/dev/null; then
+                parts+=("~$(human_duration "$bsecs") build ($seen of $total seen)")
+            fi
+        fi
+    fi
+    rm -f "$names"
+
+    [ "${#parts[@]}" -eq 0 ] && return 1
+    # Joined by hand: ${arr[*]} only ever uses the first character of IFS.
+    local out="${parts[0]}" i
+    for ((i = 1; i < ${#parts[@]}; i++)); do out+=" · ${parts[i]}"; done
     printf '%s' "$out"
 }
 

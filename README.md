@@ -212,6 +212,16 @@ When using the Home Manager module, you can configure these options:
 - `explicitPackagesOnly`: Only report updates for packages explicitly defined in your config files (default: `true` in dual-channel mode, `false` otherwise)
 - `dryRunPreview.enable`: Adds an on-demand update-cost preview on **middle-click** (default: `false`). Resolves a temporary lock file and runs a Nix dry-run to report how many derivations would be built and how much would be downloaded if you updated your flake inputs and rebuilt. Your `flake.lock` and configuration are never modified, and the update count is unchanged.
   - Never runs on a timer. A preview is a full system evaluation — roughly 2–3 minutes and well over a gigabyte of memory — so it only runs when you ask for it.
+  - Where possible it also estimates **time**, download first because it dominates: one measured rebuild here spent 30 of its 43 minutes fetching and 13 building.
+    ```
+    Update cost (14:23):
+    ~23m download · ~14m build (62 of 105 seen)
+    105 to build · 193 to download (709.0 MiB download, 1.5 GiB unpacked)
+    ```
+    Nix records no build durations, so both figures come from the gaps between path registrations in your own store: download rate from substituted paths, build time from the median of each package's past local builds. That makes the estimate **self-calibrating to your machine** — your CPU, disk and link — rather than depending on shipped constants. Nothing is shared between machines, and none is needed.
+    - `(62 of 105 seen)` is the coverage: derivations you have never built contribute nothing, so a low figure means the build number is a floor rather than a prediction. Expect roughly ±30% even at full coverage; remote builders and heavy parallelism skew it further.
+    - The two figures overlap, since Nix fetches while it builds — treat the wall clock as nearer the larger of them than their sum.
+    - A fresh install has no history, and an unreadable store database simply omits the line rather than guessing.
   - The result is stamped with the time it was taken and is discarded automatically once it stops being true: either `flake.lock` changes or you rebuild.
   - Setting this back to `false` removes the binding *and* clears any result already computed.
   - Shares a lock with the background check, so the two never evaluate at once. Middle-clicking during a check reports `check in progress — try again shortly` rather than queueing.

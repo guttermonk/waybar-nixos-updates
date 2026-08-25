@@ -56,6 +56,7 @@
                 pkgs.systemd
                 pkgs.iproute2
                 pkgs.inetutils
+                pkgs.sqlite  # reads the nix store db for build-time estimates
                 pkgs.git  # source-checker
               ]}"
             
@@ -114,6 +115,7 @@
                 pkgs.nixVersions.stable
                 pkgs.libnotify
                 pkgs.util-linux  # flock, setsid - background check serialisation
+                pkgs.sqlite  # reads the nix store db for build-time estimates
                 pkgs.git  # source-checker
               ]}"
 
