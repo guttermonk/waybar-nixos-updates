@@ -216,7 +216,7 @@ When using the Home Manager module, you can configure these options:
     ```
     Update cost (14:23):
     ~23m download · ~14m build (62 of 105 seen)
-    105 to build · 193 to download (709.0 MiB download, 1.5 GiB unpacked)
+    193 to download (709.0 MiB download, 1.5 GiB unpacked) · 105 to build
     ```
     Nix records no build durations, so both figures come from the gaps between path registrations in your own store: download rate from substituted paths, build time from the median of each package's past local builds. That makes the estimate **self-calibrating to your machine** — your CPU, disk and link — rather than depending on shipped constants. Nothing is shared between machines, and none is needed.
     - `(62 of 105 seen)` is the coverage: derivations you have never built contribute nothing, so a low figure means the build number is a floor rather than a prediction. Expect roughly ±30% even at full coverage; remote builders and heavy parallelism skew it further.

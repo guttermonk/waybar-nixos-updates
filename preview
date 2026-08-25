@@ -182,8 +182,12 @@ summarise_plan() {
         [ -n "$est" ] && out="$est"'\n'
     fi
 
-    out+="${builds:-0} to build · ${fetches:-0} to download"
+    # Download before build, matching the order the work actually happens in:
+    # measured here, fetching started 769s before the first build. The sizes
+    # stay attached to the download half, which is what they describe.
+    out+="${fetches:-0} to download"
     [ -n "$sizes" ] && out+=" ($sizes)"
+    out+=" · ${builds:-0} to build"
     printf '%s' "$out"
 }
 
