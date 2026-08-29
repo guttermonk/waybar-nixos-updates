@@ -314,11 +314,20 @@ write_result_hash() {
 # An empty owner means the launcher has written the record but the evaluating
 # process has not claimed it yet - a sub-second window, treated as live.
 preview_owner_alive() {
-    local pid starttime
-    read -r pid starttime <<<"$1"
+    local pid starttime bootid
+    read -r pid starttime bootid <<<"$1"
 
     [ -z "$pid" ] && return 0
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+
+    # A record from an earlier boot cannot describe a running process, and its
+    # pid/starttime pair can still match a live one: starttime is counted from
+    # boot, so both halves of the identity repeat every time the machine starts.
+    if [ -n "$bootid" ] && \
+       [ "$bootid" != "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]; then
+        return 1
+    fi
+
     [ -d "/proc/$pid" ] || return 1
 
     # Same pid, different process - only possible after pid wraparound.
@@ -1734,26 +1743,28 @@ main() {
         exit 0
     fi
 
-    # Grace period?
+    # Post-boot/resume grace period: the system is still settling, so no check
+    # is started and no missing-network complaint is raised. Rendering falls
+    # through to the shared tail below rather than exiting here - the early exit
+    # emitted a bare body, dropping both the header and the update-cost section
+    # for the first minutes after every boot and every resume.
+    local in_grace=false
     if [ "$SKIP_AFTER_BOOT" = "true" ] && check_boot_resume; then
-        local updates
-        updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
-        if [ "$updates" -ne 0 ] 2>/dev/null; then
-            local tooltip
-            tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "$updates updates available")
-            output_json "$updates" "has-updates" "$tooltip"
-        else
-            output_json "0" "updated" "System updated"
-        fi
-        exit 0
+        in_grace=true
     fi
 
     # Network?
-    if ! check_network; then
+    if [ "$in_grace" = false ] && ! check_network; then
         local updates
         updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
         send_notification "updates-failed" "Update Check Failed" "Not connected to the internet"
-        output_json "${updates:-0}" "updated" "No network connection"
+        # A cost computed earlier is unaffected by the link being down, so it
+        # is still shown rather than displaced by the failure line.
+        build_preview_section
+        local body="No network connection"
+        [ -n "$PREVIEW_SECTION" ] && body="$body\\n\\n$PREVIEW_SECTION"
+        output_json "${updates:-0}" "updated" \
+            "$(format_tooltip_header)\\n─────────────────────────────────────────────────\\n$body"
         exit 0
     fi
 
@@ -1771,7 +1782,8 @@ main() {
     local checking=false
     if worker_running; then
         checking=true
-    elif [ -f "$FORCE_CHECK_FLAG" ] || [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
+    elif [ "$in_grace" = false ] && \
+         { [ -f "$FORCE_CHECK_FLAG" ] || [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; }; then
         # Cleared here rather than in the worker: the request has been honoured
         # once a check is under way, and leaving it set would re-trigger on
         # every poll if that check fails.

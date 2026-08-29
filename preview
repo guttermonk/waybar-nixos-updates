@@ -63,9 +63,11 @@ write_state() {
         printf 'lock_hash=%s\n' "$(current_lock_hash)"
         printf 'system_path=%s\n' "$(current_system_path)"
         printf 'result_hash=%s\n' "$(current_result_hash)"
-        # "<pid> <starttime>" of the evaluating process while status is
-        # calculating, so a reader can tell a live evaluation from one that died
-        # without recording anything. Empty in every other state.
+        # "<pid> <starttime> <boot id>" of the evaluating process while status
+        # is calculating, so a reader can tell a live evaluation from one that
+        # died without recording anything. The boot id is part of the identity
+        # because starttime is counted from boot and so repeats across one.
+        # Empty in every other state.
         printf 'owner=%s\n' "$owner"
         printf 'reason=%s\n' "$reason"
         printf 'cost=%s\n' "$cost"
@@ -331,7 +333,8 @@ worker() {
         printf '%s %s\n' "$(($(ps -o pgid= -p $$)))" "$(date +%s)" >&9
         # Re-stamp with this process's identity so a reader can tell a running
         # evaluation from one that was killed part way through.
-        write_state calculating "" "" "$$ $(awk '{print $22}' /proc/$$/stat 2>/dev/null)"
+        write_state calculating "" "" \
+            "$$ $(awk '{print $22}' /proc/$$/stat 2>/dev/null) $(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
         run_preview || true
     ) 9>"$CHECK_LOCK_FILE"
 }

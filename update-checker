@@ -313,11 +313,20 @@
     # evaluating process has not claimed it yet - a sub-second window, treated
     # as live.
     function preview_owner_alive() {
-        local pid starttime
-        read -r pid starttime <<<"$1"
+        local pid starttime bootid
+        read -r pid starttime bootid <<<"$1"
 
         [ -z "$pid" ] && return 0
         [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+
+        # A record from an earlier boot cannot describe a running process, and
+        # its pid/starttime pair can still match a live one: starttime is
+        # counted from boot, so both halves repeat every time the machine starts.
+        if [ -n "$bootid" ] && \
+           [ "$bootid" != "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]; then
+            return 1
+        fi
+
         [ -d "/proc/$pid" ] || return 1
 
         if [[ "$starttime" =~ ^[0-9]+$ ]]; then
@@ -899,23 +908,25 @@
         fi
 
         # Check if we're in post-boot/resume grace period
+        # Skip update check during grace period after boot or resume from hibernation
+        # This prevents unnecessary resource usage during system startup or wakeup
+        local in_grace=false
         if [ "$SKIP_AFTER_BOOT" = "true" ] && check_boot_resume; then
-            # Skip update check during grace period after boot or resume from hibernation
-            # This prevents unnecessary resource usage during system startup or wakeup
-            local updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
-            local alt=""
-            local tooltip=""
-            var_setter
-            echo "{ \"text\":\"$updates\", \"alt\":\"$alt\", \"tooltip\":\"$tooltip\" }"
-            exit 0
+            in_grace=true
         fi
 
-        # Check for network connectivity before proceeding
-        if check_network_connectivity; then
-          local updates=""
-          local alt=""
-          local tooltip=""
+        local updates=""
+        local alt=""
+        local tooltip=""
 
+        # Rendering falls through to the shared tail rather than exiting inside
+        # the grace branch: the early exit there skipped the update-cost section
+        # below for the first minutes after every boot and every resume.
+        if [ "$in_grace" = true ]; then
+            updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+            var_setter
+        # Check for network connectivity before proceeding
+        elif check_network_connectivity; then
           # Auto-detect rebuild via /run/current-system comparison
           if check_system_rebuilt; then
               updates=0
@@ -1006,7 +1017,7 @@
                 updates="0"
             fi
             alt="updated"
-            tooltip="No network connection"
+            tooltip="$(format_tooltip_header)\n─────────────────────────────────────────────────\nNo network connection"
             send_notification "updates-failed" "Update Check Failed" "Not connected to the internet"
         fi
 
