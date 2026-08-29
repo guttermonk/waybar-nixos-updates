@@ -167,6 +167,11 @@ When using the Home Manager module, you can configure these options:
   - In lightweight mode, versions are compared with Nix's own ordering (`builtins.compareVersions`), so `5.3p9 → 5.3p15` is correctly an upgrade and `1.16.1 → 1.3.6` is not
   - A pending change where the channel is *behind* what you have installed is reported and marked `(downgrade)` rather than hidden — moving a package from `pkgs-unstable` to `pkgs` is a deliberate change worth seeing before you rebuild
 - `updateInterval`: Time in seconds between update checks (default: 3600)
+- `afterRebuild`: What to do when a rebuild that changed package versions is detected - `"recheck"` (default) or `"assume-updated"`
+  - `"recheck"`: discard the previous result and run a real check, so the count reflects what is still outstanding. A rebuild that applied only *some* of the pending updates — you ran `nix flake update nixpkgs` but not the rest, or updated a single input — is reported correctly. Costs one check per rebuild, which in `"full"` mode means building the new closure.
+  - `"assume-updated"`: treat the rebuild as having applied everything and report zero without checking, deferring the next real check to the normal `updateInterval`. Cheap, and right if you always update every input before rebuilding. If you did not, updates from the inputs you left alone are still outstanding but read as zero until the next scheduled check.
+  - Only the **package** count is affected. A rebuild does not resolve stale flake inputs, pinned inputs or source drift, so those keep both their counts and their tooltip sections under either setting.
+  - A right-click forces a real check immediately under either setting.
 - `notifications`: Whether to show desktop notifications (default: true)
 - `skipAfterBoot`: Whether to skip update checks right after boot/resume (default: true)
 - `gracePeriod`: Time in seconds to wait after boot/resume before checking (default: 60)

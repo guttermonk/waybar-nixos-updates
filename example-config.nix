@@ -72,6 +72,22 @@
   # Tooltip once complete:      Update cost (14:23):
   #                             53 to download (46.9 MiB download, 159.8 MiB unpacked) · 21 to build
 
+  # Example 1h: What a detected rebuild does to the package count.
+  # "recheck" (default) discards the old result and checks, so a rebuild that
+  # applied only some of the pending updates - you updated one flake input, not
+  # all of them - is reported correctly. Costs one check per rebuild, which in
+  # "full" mode means building the new closure.
+  # "assume-updated" is the cheaper trade: report zero without checking and wait
+  # for the next scheduled check. Right if you always update every input before
+  # rebuilding; if you did not, the updates you left behind read as zero until
+  # then. A right-click forces a real check either way.
+  # Only the package count is affected - stale inputs, pinned inputs and source
+  # drift are not resolved by a rebuild, so they keep their counts and sections.
+  # programs.waybar-nixos-updates = {
+  #   enable = true;
+  #   afterRebuild = "assume-updated";
+  # };
+
   # Example 1f: Explicit upstream policies for sources the ordinary checks
   # cannot interpret - a fork tracking a branch, and a pinned release line.
   # Each check declares intent, so an intentional pin is not reported as drift.

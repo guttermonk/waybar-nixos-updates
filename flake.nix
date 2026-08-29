@@ -271,6 +271,31 @@
                 '';
               };
               
+              afterRebuild = mkOption {
+                type = types.enum [ "recheck" "assume-updated" ];
+                default = "recheck";
+                description = ''
+                  What to do when a rebuild that changed package versions is detected.
+
+                  "recheck" discards the previous result and runs a real check, so the
+                  count reflects what is actually still outstanding. A rebuild that
+                  applied only some of the pending updates - updating a single flake
+                  input rather than all of them - is reported correctly. Costs one
+                  check per rebuild, which in "full" mode means building the new
+                  closure.
+
+                  "assume-updated" treats the rebuild as having applied everything and
+                  reports zero without checking, deferring the next real check to the
+                  normal updateInterval. Cheap, and right when you always update every
+                  input before rebuilding; wrong until the next scheduled check if you
+                  did not, since updates from inputs you left alone stay outstanding
+                  but are reported as zero.
+
+                  Both settings keep the flake-input, pinned-input and source-check
+                  sections of the tooltip.
+                '';
+              };
+
               notifications = mkOption {
                 type = types.bool;
                 default = true;
@@ -493,6 +518,7 @@
                   export GRACE_PERIOD="${toString cfg.gracePeriod}"
                   export NOTIFICATIONS_ENABLED="${if cfg.notifications then "true" else "false"}"
                   export CLOCK_FORMAT="${cfg.clockFormat}"
+                  export AFTER_REBUILD="${cfg.afterRebuild}"
                   export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
                   export LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON=${escapeShellArg (builtins.toJSON cfg.lightweightExcludePatterns)}
@@ -522,6 +548,7 @@
                   export UPDATE_LOCK_FILE="${if cfg.updateLockFile then "true" else "false"}"
                   export NOTIFICATIONS_ENABLED="${if cfg.notifications then "true" else "false"}"
                   export CLOCK_FORMAT="${cfg.clockFormat}"
+                  export AFTER_REBUILD="${cfg.afterRebuild}"
                   export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
                   export SOURCE_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.sourceChecks)}

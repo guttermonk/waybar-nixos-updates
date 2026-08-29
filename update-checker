@@ -23,6 +23,14 @@
     # default: a preview is a full system evaluation costing minutes, so it
     # never runs on a timer.
     DRY_RUN_PREVIEW="${DRY_RUN_PREVIEW:-false}"
+    # What a detected rebuild does to the package count. "recheck" discards the
+    # old result and checks, so a rebuild that applied only some of the pending
+    # updates is reported correctly - at the cost of a full check, which in this
+    # mode builds the new closure. "assume-updated" reports zero packages without
+    # checking and waits for the next scheduled check. Neither affects the input,
+    # pinned or source sections: a rebuild does not resolve those.
+    AFTER_REBUILD="${AFTER_REBUILD:-recheck}"
+    [ "$AFTER_REBUILD" = "assume-updated" ] || AFTER_REBUILD="recheck"
     STATE_FILE="$CACHE_DIR/nix-update-state"
     LAST_RUN_FILE="$CACHE_DIR/nix-update-last-run"
     LAST_RUN_TOOLTIP="$CACHE_DIR/nix-update-tooltip"
@@ -32,6 +40,13 @@
     INPUT_TOOLTIP_FILE="$CACHE_DIR/nix-update-input-tooltip"  # Input checker tooltip
     PINNED_STATE_FILE="$CACHE_DIR/nix-update-pinned-state"  # Pinned input checker state
     PINNED_TOOLTIP_FILE="$CACHE_DIR/nix-update-pinned-tooltip"  # Pinned input checker tooltip
+    # Source check results. Cached for the same reason the input and pinned
+    # results are: a rebuild handled as "assume-updated" has to rebuild the
+    # tooltip without re-running the checks, and source-checker reaches the
+    # network.
+    SOURCE_COUNT_FILE="$CACHE_DIR/nix-update-source-count"
+    SOURCE_SHOWN_FILE="$CACHE_DIR/nix-update-source-shown"
+    SOURCE_TOOLTIP_FILE="$CACHE_DIR/nix-update-source-tooltip"
 
     # The grace period prevents the update checker from running immediately after:
     # 1. First boot - when the system has just started up
@@ -208,6 +223,53 @@
         else
             return 1  # No network
         fi
+    }
+
+    # Assembles the tooltip body from whichever sections have something to show,
+    # and prints it. Section labels appear only when more than one section is
+    # present, so a tooltip with a single section stays as bare lines.
+    #
+    # Separate from the check because a rebuild handled as "assume-updated" has
+    # to produce the same body from cached section state without re-running
+    # anything. Inlining it there is what let the old early-exit path overwrite
+    # the tooltip with a bare "System updated", discarding the input, pinned and
+    # source sections a rebuild does not resolve.
+    #
+    # Args: pkg_count pkg_tooltip input_count input_tooltip
+    #       pinned_count pinned_tooltip source_shown source_tooltip
+    function compose_tooltip_body() {
+        local pkg_count="$1" pkg_tooltip="$2"
+        local input_count="$3" input_tooltip="$4"
+        local pinned_count="$5" pinned_tooltip="$6"
+        local source_shown="$7" source_tooltip="$8"
+
+        local labels=() texts=()
+        if [ "$pkg_count" -gt 0 ]; then
+            labels+=("Packages"); texts+=("$pkg_tooltip")
+        fi
+        if [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ "$input_count" -gt 0 ]; then
+            labels+=("Inputs"); texts+=("$input_tooltip")
+        fi
+        if [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ "$pinned_count" -gt 0 ]; then
+            labels+=("Pinned"); texts+=("$pinned_tooltip")
+        fi
+        if [ "$source_shown" -gt 0 ]; then
+            labels+=("Sources"); texts+=("$source_tooltip")
+        fi
+
+        local n=${#labels[@]}
+        if [ "$n" -eq 0 ]; then
+            printf 'System updated'
+            return 0
+        fi
+
+        local out="" i
+        for ((i = 0; i < n; i++)); do
+            [ -n "$out" ] && out="$out\\n\\n"
+            [ "$n" -gt 1 ] && out="$out${labels[i]}:\\n"
+            out="$out${texts[i]}"
+        done
+        printf '%s' "$out"
     }
 
     function check_system_rebuilt() {
@@ -691,6 +753,10 @@
             [[ "$source_shown" =~ ^[0-9]+$ ]] || source_shown=0
             source_tooltip=${source_tooltip//$'\n'/\\n}
         fi
+        # Recorded so a rebuild can rebuild the tooltip without reaching the network.
+        echo "$source_count" > "$SOURCE_COUNT_FILE"
+        echo "$source_shown" > "$SOURCE_SHOWN_FILE"
+        echo "$source_tooltip" > "$SOURCE_TOOLTIP_FILE"
 
         # Calculate total count (only items with mode="count")
         local total_count=$((pkg_count + input_count_for_total + pinned_count_for_total + source_count))
@@ -710,66 +776,11 @@
             echo "System updated" > "$LAST_RUN_TOOLTIP"
             send_notification "updates-complete" "Update Check Complete" "No updates available" -e
         else
-            local final_tooltip=""
-            
-            # Check if we have multiple sections to show
-            local section_count=0
-            [ "$pkg_count" -gt 0 ] && section_count=$((section_count + 1))
-            [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ "$input_count" -gt 0 ] && section_count=$((section_count + 1))
-            [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ "$pinned_count" -gt 0 ] && section_count=$((section_count + 1))
-            [ "$source_shown" -gt 0 ] && section_count=$((section_count + 1))
-            local has_multiple_sections=false
-            [ "$section_count" -gt 1 ] && has_multiple_sections=true
-            
-            # Build packages section
-            if [ "$pkg_count" -gt 0 ]; then
-                if [ "$has_multiple_sections" = true ]; then
-                    final_tooltip="Packages:\\n$tooltip"
-                else
-                    final_tooltip="$tooltip"
-                fi
-            fi
-            
-            # Build inputs section
-            if [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ "$input_count" -gt 0 ]; then
-                if [ -n "$final_tooltip" ]; then
-                    final_tooltip="$final_tooltip\\n\\nInputs:\\n$input_tooltip"
-                else
-                    if [ "$has_multiple_sections" = true ]; then
-                        final_tooltip="Inputs:\\n$input_tooltip"
-                    else
-                        final_tooltip="$input_tooltip"
-                    fi
-                fi
-            fi
-            
-            # Build pinned section
-            if [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ "$pinned_count" -gt 0 ]; then
-                if [ -n "$final_tooltip" ]; then
-                    final_tooltip="$final_tooltip\\n\\nPinned:\\n$pinned_tooltip"
-                else
-                    if [ "$has_multiple_sections" = true ]; then
-                        final_tooltip="Pinned:\\n$pinned_tooltip"
-                    else
-                        final_tooltip="$pinned_tooltip"
-                    fi
-                fi
-            fi
-
-            # Build sources section
-            if [ "$source_shown" -gt 0 ]; then
-                if [ -n "$final_tooltip" ]; then
-                    final_tooltip="$final_tooltip\\n\\nSources:\\n$source_tooltip"
-                else
-                    if [ "$has_multiple_sections" = true ]; then
-                        final_tooltip="Sources:\\n$source_tooltip"
-                    else
-                        final_tooltip="$source_tooltip"
-                    fi
-                fi
-            fi
-
-            echo "$final_tooltip" > "$LAST_RUN_TOOLTIP"
+            compose_tooltip_body \
+                "$pkg_count" "$tooltip" \
+                "$input_count" "$input_tooltip" \
+                "$pinned_count" "$pinned_tooltip" \
+                "$source_shown" "$source_tooltip" > "$LAST_RUN_TOOLTIP"
 
             if [ "$total_count" -eq 0 ]; then
                 send_notification "updates-complete" "Update Check Complete" "No countable updates" -e
@@ -928,30 +939,86 @@
         # Check for network connectivity before proceeding
         elif check_network_connectivity; then
           # Auto-detect rebuild via /run/current-system comparison
+          local rebuild_handled=false
           if check_system_rebuilt; then
-              updates=0
-              alt="updated"
-              tooltip="System updated"
-              echo "$updates" > "$STATE_FILE"
-              echo "$tooltip" > "$LAST_RUN_TOOLTIP"
               # Update flake.lock hash now to avoid a spurious input re-check next run
               # (flake.lock may have changed as part of this rebuild e.g. via checkup).
               md5sum "$NIXOS_CONFIG_PATH/flake.lock" 2>/dev/null | cut -d' ' -f1 > "$FLAKE_LOCK_INPUT_HASH_FILE"
-              # Input state is preserved: stale inputs that weren't updated remain visible.
-              # Stamp LAST_RUN_FILE with "now" so the interval throttle treats the rebuild
-              # as a completed check and skips an immediate (expensive) full re-check. The
-              # next check happens on the normal updateInterval schedule.
-              echo "$(date +%s)" > "$LAST_RUN_FILE"
-              # Output JSON, refresh waybar, and exit immediately
-              echo "{ \"text\":\"$updates\", \"alt\":\"$alt\", \"tooltip\":\"$tooltip\" }"
-              refresh_waybar
-              exit 0
+
+              if [ "$AFTER_REBUILD" = "assume-updated" ]; then
+                  # Take the rebuild as having applied every pending package
+                  # update and report zero without checking. Correct when every
+                  # input was updated before rebuilding; when only some were, the
+                  # packages from the inputs left alone are still outstanding and
+                  # are reported as zero until the next scheduled check.
+                  #
+                  # Only the package section is assumed away. A rebuild does not
+                  # resolve stale inputs, pinned inputs or source drift, so those
+                  # keep both their counts and their tooltip sections - rebuilt
+                  # here from cached state rather than dropped.
+                  local r_input_count=0 r_input_tooltip=""
+                  local r_pinned_count=0 r_pinned_tooltip=""
+                  local r_source_count=0 r_source_shown=0 r_source_tooltip=""
+                  local r_total=0
+
+                  if [ "$INPUT_CHECKER_MODE" != "disabled" ]; then
+                      r_input_count=$(cat "$INPUT_STATE_FILE" 2>/dev/null || echo "0")
+                      r_input_tooltip=$(cat "$INPUT_TOOLTIP_FILE" 2>/dev/null || echo "")
+                      [[ "$r_input_count" =~ ^[0-9]+$ ]] || r_input_count=0
+                      [ "$INPUT_CHECKER_MODE" = "count" ] && r_total=$((r_total + r_input_count))
+                  fi
+                  if [ "$INPUT_CHECKER_PINNED" != "disabled" ]; then
+                      r_pinned_count=$(cat "$PINNED_STATE_FILE" 2>/dev/null || echo "0")
+                      r_pinned_tooltip=$(cat "$PINNED_TOOLTIP_FILE" 2>/dev/null || echo "")
+                      [[ "$r_pinned_count" =~ ^[0-9]+$ ]] || r_pinned_count=0
+                      [ "$INPUT_CHECKER_PINNED" = "count" ] && r_total=$((r_total + r_pinned_count))
+                  fi
+                  r_source_count=$(cat "$SOURCE_COUNT_FILE" 2>/dev/null || echo "0")
+                  r_source_shown=$(cat "$SOURCE_SHOWN_FILE" 2>/dev/null || echo "0")
+                  r_source_tooltip=$(cat "$SOURCE_TOOLTIP_FILE" 2>/dev/null || echo "")
+                  [[ "$r_source_count" =~ ^[0-9]+$ ]] || r_source_count=0
+                  [[ "$r_source_shown" =~ ^[0-9]+$ ]] || r_source_shown=0
+                  r_total=$((r_total + r_source_count))
+
+                  local r_body
+                  r_body=$(compose_tooltip_body \
+                      0 "" \
+                      "$r_input_count" "$r_input_tooltip" \
+                      "$r_pinned_count" "$r_pinned_tooltip" \
+                      "$r_source_shown" "$r_source_tooltip")
+
+                  echo "$r_total" > "$STATE_FILE"
+                  echo "$r_body" > "$LAST_RUN_TOOLTIP"
+                  # Stamp LAST_RUN_FILE with "now" so the interval throttle treats the
+                  # rebuild as a completed check and skips an immediate (expensive) full
+                  # re-check; the next check runs on the normal updateInterval schedule.
+                  # This is what makes the setting cheap, and also what makes a wrong
+                  # zero persist for an interval - the trade "recheck" exists to avoid.
+                  echo "$(date +%s)" > "$LAST_RUN_FILE"
+
+                  updates="$r_total"
+                  alt="updated"
+                  [ "$r_total" -gt 0 ] && alt="has-updates"
+                  # Rendering falls through to the shared tail rather than exiting
+                  # here, so the header and the update-cost section are included.
+                  tooltip="$(format_tooltip_header)\n─────────────────────────────────────────────────\n$r_body"
+                  rebuild_handled=true
+              else
+                  # "recheck": the rebuild may have applied only some of the
+                  # pending updates, so the previous result is discarded rather
+                  # than replaced with an assumed zero, and the throttle is
+                  # cleared so the check runs on this poll.
+                  rm -f "$LAST_RUN_FILE"
+              fi
           else
               # Auto-detect flake.lock changes for immediate input re-check.
               # Package state is intentionally preserved - system hasn't been rebuilt yet.
               if check_inputs_updated; then
                   rm -f "$LAST_RUN_FILE"
               fi
+          fi
+
+          if [ "$rebuild_handled" = false ]; then
 
               # Read state from files
               updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
