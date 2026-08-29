@@ -70,7 +70,7 @@
   # Tooltip while calculating:  Update cost:
   #                             calculating... (~3 min)
   # Tooltip once complete:      Update cost (14:23):
-  #                             21 to build · 53 to download (46.9 MiB download, 159.8 MiB unpacked)
+  #                             53 to download (46.9 MiB download, 159.8 MiB unpacked) · 21 to build
 
   # Example 1f: Explicit upstream policies for sources the ordinary checks
   # cannot interpret - a fork tracking a branch, and a pinned release line.
