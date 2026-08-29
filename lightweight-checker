@@ -55,14 +55,24 @@ INPUT_CHECKER_PINNED="${INPUT_CHECKER_PINNED:-disabled}"
 # source-checker to be reported rather than passing as a clean result.
 SOURCE_CHECKS_JSON="${SOURCE_CHECKS_JSON-[]}"
 
-# What a detected rebuild does to the package count. "recheck" discards the old
-# result and checks, so a rebuild that applied only some of the pending updates
-# is reported correctly. "assume-updated" reports zero packages without checking
-# and waits for the next scheduled check, which is cheap but wrong until then if
-# the rebuild did not consume everything. Neither affects the input, pinned or
-# source sections: a rebuild does not resolve those, so they carry over intact.
+# What a detected rebuild does to the package count.
+#
+# "recheck" discards the old result and checks, so a rebuild that applied only
+# some of the pending updates is reported correctly. "reconcile" subtracts the
+# packages the rebuild demonstrably changed - read from the nvd diff already
+# being run to detect the rebuild - and keeps the rest, which costs no extra
+# work but cannot see the channel moving on, so it can undercount until the next
+# scheduled check. "assume-updated" reports zero packages without checking,
+# which is cheapest and wrong until then if the rebuild did not consume
+# everything.
+#
+# None of them affect the input, pinned or source sections: a rebuild does not
+# resolve those, so they carry over intact.
 AFTER_REBUILD="${AFTER_REBUILD:-recheck}"
-[ "$AFTER_REBUILD" = "assume-updated" ] || AFTER_REBUILD="recheck"
+case "$AFTER_REBUILD" in
+    assume-updated|reconcile) ;;
+    *) AFTER_REBUILD="recheck" ;;
+esac
 
 # On-demand update-cost preview, bound to middle-click when enabled. Off by
 # default: a preview is a full system evaluation costing minutes, so it never
@@ -151,6 +161,11 @@ PINNED_TOOLTIP_FILE="$CACHE_DIR/nix-update-pinned-tooltip"
 SOURCE_COUNT_FILE="$CACHE_DIR/nix-update-source-count"
 SOURCE_SHOWN_FILE="$CACHE_DIR/nix-update-source-shown"
 SOURCE_TOOLTIP_FILE="$CACHE_DIR/nix-update-source-tooltip"
+
+# The reported packages as structured data, not just the rendered line. Written
+# by every check so "reconcile" can drop entries by package name after a rebuild
+# instead of parsing them back out of display text.
+PACKAGES_JSON_FILE="$CACHE_DIR/nix-update-packages.json"
 
 # Auto-detection cache files - no flag files or alias modifications needed.
 # Stores the last seen /run/current-system path to auto-detect rebuilds.
@@ -1068,6 +1083,40 @@ report_eval_failure() {
     send_notification "updates-failed" "Update Check Failed" "$detail"
 }
 
+# Package names nvd reports as changed, lowercased, one per line.
+#
+# nvd's format is "[U.]  #02  brave  1.93.129 -> 1.93.138": a bracketed marker,
+# an index, the name, then versions. Every marker counts, not just [U] - a
+# downgrade, a mixed-version change and a removal all mean the same thing here,
+# that the entry being held no longer describes what is installed.
+nvd_changed_names() {
+    sed -nE 's/^\[[A-Z][^]]*\][[:space:]]+#[0-9]+[[:space:]]+([^[:space:]]+)[[:space:]].*/\1/p' \
+        <<<"$1" | tr '[:upper:]' '[:lower:]' | sort -u
+}
+
+# Drops the pending entries a rebuild resolved and prints what is left, as the
+# same JSON shape that went in.
+#
+# The rule is "the rebuild changed this package at all", not "it reached the
+# version we were waiting for". A package whose installed version moved is one
+# the rebuild acted on, and the stored entry - which quotes the old installed
+# version as current - has stopped describing reality either way. Entries nvd
+# never mentions were untouched by definition, so they stay.
+#
+# What this cannot see is the channel moving forward since the last check, so
+# the surviving count can be an undercount. It never invents a resolved entry,
+# and the next scheduled check replaces the estimate with a measurement.
+reconcile_packages() {
+    local pending="$1" nvd_out="$2"
+    local changed_json
+    changed_json=$(nvd_changed_names "$nvd_out" \
+        | jq -R -s 'split("\n") | map(select(length > 0))' 2>/dev/null)
+    [ -n "$changed_json" ] || { printf '%s' "$pending"; return 0; }
+    jq -c --argjson changed "$changed_json" \
+        '[ .[] | select((.name | ascii_downcase) as $n | ($changed | index($n)) == null) ]' \
+        <<<"$pending" 2>/dev/null
+}
+
 # Assembles the tooltip body from whichever sections have something to show, and
 # prints it. Section labels appear only when more than one section is present, so
 # a tooltip with a single section stays as bare lines.
@@ -1466,6 +1515,20 @@ check_for_updates_lightweight() {
 
     # After filtering, so the record matches what the tooltip actually showed.
     write_diagnostic "$changed_json"
+    # Kept alongside the rendered tooltip so a later rebuild can reconcile
+    # against package names rather than re-parsing the display text. Each entry
+    # carries its rendered line, so dropping the resolved ones is a filter and a
+    # join - reconciling never has to redo channel detection to re-render what
+    # survived.
+    if [ "$single_channel_mode" = true ]; then
+        jq -c '[ .[] | . + {line: ("\(.display): \(.current) → \(.new)" +
+                 (if .direction == "downgrade" then " (downgrade)" else "" end))} ]' \
+            <<<"$changed_json" > "$PACKAGES_JSON_FILE" 2>/dev/null
+    else
+        jq -c '[ .[] | . + {line: ("\(.display): \(.current) → \(.new) (\(.channel)" +
+                 (if .direction == "downgrade" then ", downgrade)" else ")" end))} ]' \
+            <<<"$changed_json" > "$PACKAGES_JSON_FILE" 2>/dev/null
+    fi
 
     local pkg_count
     pkg_count=$(echo "$changed_json" | jq 'length')
@@ -1676,15 +1739,17 @@ main() {
         echo "$current_system" > "$SYSTEM_PATH_FILE"
     elif [ -n "$current_system" ] && [ "$current_system" != "$cached_system" ]; then
         # Rebuild detected - use nvd diff to distinguish package updates from
-        # config-only rebuilds. nvd diff on existing store paths is fast (ms),
-        # since both paths already exist in the nix store - no building needed.
+        # config-only rebuilds. No building is needed, since both closures
+        # already exist in the store, but it is not free either: measured at
+        # ~4.3s here, which is why the result is captured once and reused rather
+        # than the diff being run again per caller.
         echo "$current_system" > "$SYSTEM_PATH_FILE"
         local packages_changed=false
+        local nvd_out=""
         if [ -d "$cached_system" ]; then
             # Both paths exist - diff them to check if package versions changed
-            if nvd diff "$cached_system" "$current_system" 2>/dev/null | grep -q '\[U'; then
-                packages_changed=true
-            fi
+            nvd_out=$(nvd diff "$cached_system" "$current_system" 2>/dev/null)
+            grep -q '\[U' <<<"$nvd_out" && packages_changed=true
         else
             # Previous path was GC'd - can't diff, assume packages may have changed
             packages_changed=true
@@ -1703,17 +1768,27 @@ main() {
             # (flake.lock may have changed as part of this rebuild e.g. via checkup).
             md5sum "$FLAKE_DIR/flake.lock" 2>/dev/null | cut -d' ' -f1 > "$FLAKE_LOCK_INPUT_HASH_FILE"
 
-            if [ "$AFTER_REBUILD" = "assume-updated" ]; then
-                # Take the rebuild as having applied every pending package update
-                # and report zero without checking. Correct when every input was
-                # updated before rebuilding; when only some were, the packages
-                # from the inputs left alone are still outstanding and are
-                # reported as zero until the next scheduled check.
+            # "reconcile" needs something to reconcile against: a GC'd previous
+            # closure means no diff, and no stored package list means nothing to
+            # subtract from. Either way it degrades to a real check rather than
+            # reporting a number it cannot support.
+            local rebuild_mode="$AFTER_REBUILD"
+            if [ "$rebuild_mode" = "reconcile" ]; then
+                if [ -z "$nvd_out" ] || [ ! -s "$PACKAGES_JSON_FILE" ]; then
+                    rebuild_mode="recheck"
+                fi
+            fi
+
+            if [ "$rebuild_mode" != "recheck" ]; then
+                # Neither fast path runs a check. "assume-updated" takes the
+                # rebuild as having applied every pending package update and
+                # reports zero; "reconcile" subtracts only the packages nvd says
+                # actually changed and keeps the rest.
                 #
-                # Only the package section is assumed away. A rebuild does not
-                # resolve stale inputs, pinned inputs or source drift, so those
-                # keep both their counts and their tooltip sections - rebuilt
-                # here from cached state rather than dropped.
+                # Either way only the package section is decided here. A rebuild
+                # does not resolve stale inputs, pinned inputs or source drift,
+                # so those keep both their counts and their tooltip sections -
+                # rebuilt from cached state rather than dropped.
                 local r_input_count=0 r_input_tooltip=""
                 local r_pinned_count=0 r_pinned_tooltip=""
                 local r_source_count=0 r_source_shown=0 r_source_tooltip=""
@@ -1738,9 +1813,31 @@ main() {
                 [[ "$r_source_shown" =~ ^[0-9]+$ ]] || r_source_shown=0
                 r_total=$((r_total + r_source_count))
 
+                # The surviving packages, if any. "assume-updated" keeps none by
+                # construction; "reconcile" keeps whatever the rebuild left
+                # untouched, re-rendered from the line stored with each entry.
+                local r_pkg_count=0 r_pkg_tooltip=""
+                if [ "$rebuild_mode" = "reconcile" ]; then
+                    local r_remaining
+                    r_remaining=$(reconcile_packages \
+                        "$(cat "$PACKAGES_JSON_FILE" 2>/dev/null)" "$nvd_out")
+                    if [ -n "$r_remaining" ]; then
+                        printf '%s' "$r_remaining" > "$PACKAGES_JSON_FILE"
+                        r_pkg_count=$(jq 'length' <<<"$r_remaining" 2>/dev/null || echo 0)
+                        [[ "$r_pkg_count" =~ ^[0-9]+$ ]] || r_pkg_count=0
+                        r_pkg_tooltip=$(jq -r '.[] | .line' <<<"$r_remaining" 2>/dev/null \
+                            | awk '{printf "%s%s", (NR>1 ? "\\n" : ""), $0}')
+                    fi
+                    r_total=$((r_total + r_pkg_count))
+                else
+                    # Nothing is pending under this setting, so the stored list
+                    # must not outlive it and be reconciled against next time.
+                    printf '[]' > "$PACKAGES_JSON_FILE"
+                fi
+
                 local r_body
                 r_body=$(compose_tooltip_body \
-                    0 "" \
+                    "$r_pkg_count" "$r_pkg_tooltip" \
                     "$r_input_count" "$r_input_tooltip" \
                     "$r_pinned_count" "$r_pinned_tooltip" \
                     "$r_source_shown" "$r_source_tooltip")
@@ -1750,8 +1847,9 @@ main() {
                 # Stamp LAST_RUN_FILE with "now" so the interval throttle treats the
                 # rebuild as a completed check and skips an immediate re-check; the
                 # next check runs on the normal updateInterval schedule. This is what
-                # makes the setting cheap, and also what makes a wrong zero persist
-                # for an interval - the trade "recheck" exists to avoid.
+                # makes both fast paths cheap, and also what bounds how long an
+                # estimate can stand: at most one interval before a real check
+                # replaces it.
                 echo "$(date +%s)" > "$LAST_RUN_FILE"
 
                 local r_alt="updated"

@@ -167,11 +167,17 @@ When using the Home Manager module, you can configure these options:
   - In lightweight mode, versions are compared with Nix's own ordering (`builtins.compareVersions`), so `5.3p9 → 5.3p15` is correctly an upgrade and `1.16.1 → 1.3.6` is not
   - A pending change where the channel is *behind* what you have installed is reported and marked `(downgrade)` rather than hidden — moving a package from `pkgs-unstable` to `pkgs` is a deliberate change worth seeing before you rebuild
 - `updateInterval`: Time in seconds between update checks (default: 3600)
-- `afterRebuild`: What to do when a rebuild that changed package versions is detected - `"recheck"` (default) or `"assume-updated"`
+- `afterRebuild`: What to do when a rebuild that changed package versions is detected - `"recheck"` (default), `"reconcile"` or `"assume-updated"`
   - `"recheck"`: discard the previous result and run a real check, so the count reflects what is still outstanding. A rebuild that applied only *some* of the pending updates — you ran `nix flake update nixpkgs` but not the rest, or updated a single input — is reported correctly. Costs one check per rebuild, which in `"full"` mode means building the new closure.
-  - `"assume-updated"`: treat the rebuild as having applied everything and report zero without checking, deferring the next real check to the normal `updateInterval`. Cheap, and right if you always update every input before rebuilding. If you did not, updates from the inputs you left alone are still outstanding but read as zero until the next scheduled check.
-  - Only the **package** count is affected. A rebuild does not resolve stale flake inputs, pinned inputs or source drift, so those keep both their counts and their tooltip sections under either setting.
-  - A right-click forces a real check immediately under either setting.
+  - `"reconcile"`: subtract the packages the rebuild demonstrably changed and keep the rest. Detecting the rebuild already means diffing the old and new closures with `nvd`, so the list of what changed is there for free:
+    ```
+    [U*]  #13  thunderbird  153.0.2 -> 153.0.3     ← pending entry dropped
+    (ripgrep not mentioned)                        ← pending entry kept
+    ```
+    Usually right, and costs no work beyond the diff already being run. What it cannot see is the **channel moving forward** since the last check, so it can undercount — it never reports an update as resolved that wasn't, and the next scheduled check replaces the estimate with a measurement. Falls back to `"recheck"` when there is nothing to reconcile against, such as a previous closure that has been garbage collected.
+  - `"assume-updated"`: treat the rebuild as having applied everything and report zero without checking, deferring the next real check to the normal `updateInterval`. Cheapest, and right if you always update every input before rebuilding. If you did not, updates from the inputs you left alone are still outstanding but read as zero until the next scheduled check.
+  - Only the **package** count is affected. A rebuild does not resolve stale flake inputs, pinned inputs or source drift, so those keep both their counts and their tooltip sections under all three settings.
+  - A right-click forces a real check immediately under any setting.
 - `notifications`: Whether to show desktop notifications (default: true)
 - `skipAfterBoot`: Whether to skip update checks right after boot/resume (default: true)
 - `gracePeriod`: Time in seconds to wait after boot/resume before checking (default: 60)

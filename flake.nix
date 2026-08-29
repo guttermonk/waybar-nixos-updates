@@ -272,7 +272,7 @@
               };
               
               afterRebuild = mkOption {
-                type = types.enum [ "recheck" "assume-updated" ];
+                type = types.enum [ "recheck" "reconcile" "assume-updated" ];
                 default = "recheck";
                 description = ''
                   What to do when a rebuild that changed package versions is detected.
@@ -284,14 +284,25 @@
                   check per rebuild, which in "full" mode means building the new
                   closure.
 
+                  "reconcile" subtracts the packages the rebuild demonstrably changed
+                  and keeps the rest. The rebuild is already detected by diffing the
+                  old and new closures with nvd, so the list of what changed is
+                  available at no extra cost, and the pending entries matching it are
+                  dropped. Usually right and effectively free. What it cannot see is
+                  the channel moving forward since the last check, so it can undercount
+                  - it never reports an update as resolved that was not, and the next
+                  scheduled check replaces the estimate with a measurement. Falls back
+                  to "recheck" when there is nothing to reconcile against, such as a
+                  previous closure that has been garbage collected.
+
                   "assume-updated" treats the rebuild as having applied everything and
                   reports zero without checking, deferring the next real check to the
-                  normal updateInterval. Cheap, and right when you always update every
-                  input before rebuilding; wrong until the next scheduled check if you
-                  did not, since updates from inputs you left alone stay outstanding
-                  but are reported as zero.
+                  normal updateInterval. Cheapest, and right when you always update
+                  every input before rebuilding; wrong until the next scheduled check
+                  if you did not, since updates from inputs you left alone stay
+                  outstanding but are reported as zero.
 
-                  Both settings keep the flake-input, pinned-input and source-check
+                  All three keep the flake-input, pinned-input and source-check
                   sections of the tooltip.
                 '';
               };

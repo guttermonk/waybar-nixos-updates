@@ -77,16 +77,25 @@
   # applied only some of the pending updates - you updated one flake input, not
   # all of them - is reported correctly. Costs one check per rebuild, which in
   # "full" mode means building the new closure.
-  # "assume-updated" is the cheaper trade: report zero without checking and wait
-  # for the next scheduled check. Right if you always update every input before
-  # rebuilding; if you did not, the updates you left behind read as zero until
-  # then. A right-click forces a real check either way.
+  # "reconcile" is the middle option: detecting the rebuild already diffs the old
+  # and new closures with nvd, so it drops the pending entries that diff shows
+  # changed and keeps the rest. No extra work, usually right. It cannot see the
+  # channel moving on since the last check, so it can undercount until the next
+  # scheduled one, and falls back to "recheck" if the old closure was GC'd.
+  # "assume-updated" is cheapest: report zero without checking and wait for the
+  # next scheduled check. Right if you always update every input before
+  # rebuilding; if you did not, the updates you left behind read as zero.
+  # A right-click forces a real check under any of them.
   # Only the package count is affected - stale inputs, pinned inputs and source
   # drift are not resolved by a rebuild, so they keep their counts and sections.
   # programs.waybar-nixos-updates = {
   #   enable = true;
-  #   afterRebuild = "assume-updated";
+  #   afterRebuild = "reconcile";
   # };
+  #
+  # After updating one input and rebuilding, with "reconcile":
+  #   thunderbird: 153.0.2 → 153.0.3 (stable)   <- kept, nixpkgs never moved
+  #   (the updated input's own packages drop off the list)
 
   # Example 1f: Explicit upstream policies for sources the ordinary checks
   # cannot interpret - a fork tracking a branch, and a pinned release line.
