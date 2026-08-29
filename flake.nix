@@ -14,7 +14,7 @@
         # The update-checker script package
         waybar-nixos-updates = pkgs.stdenv.mkDerivation {
           pname = "waybar-nixos-updates";
-          version = "3.6";
+          version = "3.7";
           
           src = ./.;
           
@@ -75,7 +75,7 @@
         # Lightweight mode: uses lazy nix eval instead of a full build + nvd diff
         waybar-nixos-updates-lightweight = pkgs.stdenv.mkDerivation {
           pname = "waybar-nixos-updates-lightweight";
-          version = "3.6";
+          version = "3.7";
           
           src = ./.;
           
@@ -134,7 +134,7 @@
         # Flake input checker: compares locked revs against upstream via git ls-remote
         waybar-nixos-updates-inputs = pkgs.stdenv.mkDerivation {
           pname = "waybar-nixos-updates-inputs";
-          version = "3.6";
+          version = "3.7";
           src = ./.;
           nativeBuildInputs = [ pkgs.makeWrapper ];
           installPhase = ''
