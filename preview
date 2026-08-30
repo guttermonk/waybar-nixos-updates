@@ -128,7 +128,7 @@ substitution_rate() {
 
 # Sum of median historical build times for the given derivation names, plus how
 # many of them had any history at all. A derivation never built here contributes
-# nothing and is counted as unseen, rather than being guessed at.
+# nothing and is counted as untimed, rather than being guessed at.
 build_estimate() {
     local names_file="$1"
     command -v sqlite3 >/dev/null 2>&1 || return 1
@@ -138,9 +138,15 @@ build_estimate() {
     # of the same package. Inlined as VALUES rather than imported: sqlite3
     # flattens dot-commands when SQL arrives as an argument, so .import cannot
     # be used here.
+    #
+    # Not deduplicated. One row per derivation is what makes the sum below count
+    # each build, and what makes the coverage figure agree with the build count
+    # beside it - "56 of 56" against "62 to build" was two different populations
+    # printed as though they were one. The median is still computed per distinct
+    # name; only the multiplying back out happens here.
     local values
     values=$(sed -E "s/-[0-9][0-9a-zA-Z.+_-]*$//; s/'/''/g; s/^(.*)$/('\1'),/" "$names_file" \
-             | sort -u | tr -d '\n' | sed 's/,$//')
+             | tr -d '\n' | sed 's/,$//')
     [ -n "$values" ] || return 1
 
     sqlite3 "$NIX_DB" "
@@ -153,10 +159,18 @@ build_estimate() {
           FROM ValidPaths WHERE ultimate = 1)
         SELECT name, gap FROM b WHERE gap IS NOT NULL AND gap <= $ESTIMATE_GAP_CAP;
         CREATE TEMP TABLE m AS
+        -- The character after the dash has to be a digit, so a name only
+        -- matches its own versions. LIKE 'pname-%' also matched every longer
+        -- name sharing the prefix: 145 such pairs on one store, including
+        -- 'waybar' against 'waybar-nixos-updates-lightweight-4.1', which priced
+        -- a browser bar from this project's build times. substr rather than LIKE
+        -- because _ and % are wildcards, and package names contain _.
         WITH j AS (
           SELECT DISTINCT w.pname AS pname, h.gap AS gap
           FROM (SELECT DISTINCT pname FROM want) w
-          JOIN hist h ON h.name LIKE w.pname || '-%' OR h.name = w.pname),
+          JOIN hist h ON h.name = w.pname
+                      OR (substr(h.name, 1, length(w.pname) + 1) = w.pname || '-'
+                          AND substr(h.name, length(w.pname) + 2, 1) BETWEEN '0' AND '9')),
         r AS (
           SELECT pname, gap,
                  ROW_NUMBER() OVER (PARTITION BY pname ORDER BY gap) rn,
@@ -224,8 +238,9 @@ summarise_plan() {
     printf '%s' "$out"
 }
 
-# Turns the plan into "~32m download · ~13m build (62 of 105 seen)". Any part
-# that cannot be estimated is omitted rather than guessed, and the whole line is
+# Turns the plan into "~32m to fetch & unpack" and "~13m+ build (62 timed of
+# 105)", one per line. Any part
+# that cannot be estimated is omitted rather than guessed, and the whole thing is
 # dropped if nothing can be worked out at all.
 estimate_line() {
     local plan="$1" sizes="$2"
@@ -260,15 +275,27 @@ estimate_line() {
     # coverage figure is the reader's cue that the number is a floor.
     local names
     names=$(mktemp)
-    grep -oE '/nix/store/[a-z0-9]{32}-[^ ]*\.drv' <<<"$plan" \
-        | sed 's|.*/[a-z0-9]\{32\}-||; s|\.drv$||' | sort -u > "$names"
+    # Deduplicated on the store path, which is a derivation's identity, and only
+    # then reduced to names. Deduplicating on the name instead discarded real
+    # work: two derivations differing in their inputs share a name and build
+    # twice, and sampling 62 drv names from one store collapsed them to 56-59.
+    # Every one of those lost a build from the total below.
+    grep -oE '/nix/store/[a-z0-9]{32}-[^ ]*\.drv' <<<"$plan" | sort -u \
+        | sed 's|.*/[a-z0-9]\{32\}-||; s|\.drv$||' > "$names"
     if [ -s "$names" ]; then
         local res
         if res=$(build_estimate "$names") && [ -n "$res" ]; then
-            local bsecs seen total
-            IFS='|' read -r bsecs seen total <<<"$res"
+            local bsecs timed total
+            IFS='|' read -r bsecs timed total <<<"$res"
             if [ "${bsecs:-0}" -gt 0 ] 2>/dev/null; then
-                parts+=("~$(human_duration "$bsecs") build ($seen of $total seen)")
+                # A derivation never built here contributes nothing, so anything
+                # short of full coverage makes this a floor rather than an
+                # estimate. The coverage figure says so, but only to a reader
+                # who works out what it means; the plus says it in the number
+                # itself, where the eye already is.
+                local floor=""
+                [ "${timed:-0}" -lt "${total:-0}" ] 2>/dev/null && floor="+"
+                parts+=("~$(human_duration "$bsecs")$floor build ($timed timed of $total)")
             fi
         fi
     fi

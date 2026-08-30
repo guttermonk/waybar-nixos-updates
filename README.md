@@ -236,12 +236,13 @@ When using the Home Manager module, you can configure these options:
     Update cost (14:23):
     621 to download · 62 to build
     ~26m to fetch & unpack (1.8 GiB, 5.3 GiB)
-    ~16m build (56 of 56 seen)
+    ~16m+ build (48 timed of 62)
     ```
     Nix records no build durations, so both figures come from the gaps between path registrations in your own store: a substitution rate from fetched paths, build time from the median of each package's past local builds. That makes the estimate **self-calibrating to your machine** — your CPU, disk and link — rather than depending on shipped constants. Nothing is shared between machines, and none is needed.
     - **`fetch & unpack` is the whole operation, not the transfer.** A path is registered only once it has been downloaded, decompressed *and* written, so all three are inside that figure. On one measured machine decompression ran at ~420 MiB/s — under 1% of a fetch-bound job — but on a fast link and a slow CPU it would dominate, and the same measurement absorbs either case.
     - **The two sizes are the wire and the disk**, in the order the label names them: `1.8 GiB` is what crosses the network, `5.3 GiB` is what it becomes on disk. The estimate is computed from the second against a rate measured in the same uncompressed units — the store database records `narSize` and has no column for the compressed size — which holds exactly when a job compresses like your past ones did. One sample gave 3.64× historically against 2.94× for the job being priced, so treat it as an assumption that mostly cancels rather than one that always does.
-    - `(56 of 56 seen)` is the coverage: **distinct package names**, after the trailing version is stripped, so it will not match the build count above it when two derivations share a name. Names never built here contribute nothing, so a low figure means the build number is a floor rather than a prediction. Expect roughly ±30% even at full coverage; remote builders and heavy parallelism skew it further.
+    - `(48 timed of 62)` is the coverage, counted in derivations, so it agrees with the build count above it. A derivation never built on this machine has no timing sample and contributes nothing to the sum — so anything short of full coverage makes the figure a **floor**, which is what the trailing `+` on `~16m+` marks. At full coverage the `+` disappears. Expect roughly ±30% even then; remote builders and heavy parallelism skew it further.
+    - History is matched per package **version**, so `waybar` draws on past builds of `waybar-0.13.0` but not on `waybar-nixos-updates-4.1`, whose name merely starts the same way.
     - The two estimates overlap, since Nix fetches while it builds — treat the wall clock as nearer the larger of them than their sum.
     - A fresh install has no history, and an unreadable store database simply omits the line rather than guessing.
   - The result is stamped with the time it was taken, and stops being shown once it no longer describes anything. Three things retire it: your `flake.lock` changes, a check finds something different from what the cost was priced against, or you rebuild.
