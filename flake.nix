@@ -56,6 +56,7 @@
                 pkgs.systemd
                 pkgs.iproute2
                 pkgs.inetutils
+                pkgs.util-linux  # flock - serialises the check
                 pkgs.sqlite  # reads the nix store db for build-time estimates
                 pkgs.git  # source-checker
               ]}"

@@ -65,6 +65,12 @@
     # replace id, so an unthrottled notification does not update in place - it
     # stacks a new one every few seconds for as long as the link stays down.
     NETWORK_DOWN_FLAG="$CACHE_DIR/nix-update-network-down"
+    # Held for the duration of a check. This mode's check realises the closure
+    # rather than evaluating it, so its duration is however long the pending
+    # update takes to fetch and build - which can exceed updateInterval, putting
+    # a second poll inside the first check. Two of those would fetch and build
+    # the same paths concurrently and race to write the same result files.
+    CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
 
     # The grace period prevents the update checker from running immediately after:
     # 1. First boot - when the system has just started up
@@ -1145,6 +1151,38 @@
                       # been honoured. Cleared here rather than after the check
                       # so a failing check does not re-trigger on every poll.
                       rm -f "$FORCE_CHECK_FLAG"
+                      # Serialise. UPDATING_FLAG alone does not do this: a poll
+                      # landing inside a running check finds the flag present,
+                      # takes it as its cue to check, and overwrites the pid with
+                      # its own. The lock is what actually keeps one check at a
+                      # time, as it does in lightweight mode.
+                      #
+                      # Held on a file descriptor in this shell rather than a
+                      # subshell, because the check runs inline and sets the
+                      # variables rendered below; it is released when the script
+                      # exits. flock is treated as optional so a manual install
+                      # without util-linux still runs, just unserialised - a
+                      # missing binary must not mean no check ever runs.
+                      local check_locked=true
+                      if command -v flock >/dev/null 2>&1; then
+                          exec 9>"$CHECK_LOCK_FILE"
+                          flock -n 9 || check_locked=false
+                      fi
+
+                      if [ "$check_locked" = false ]; then
+                          # Another check owns the lock. Report it as in progress
+                          # rather than starting a second one, and leave its
+                          # UPDATING_FLAG alone - it belongs to that process.
+                          updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+                          alt="updating"
+                          local busy_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
+                          local busy_header=$(format_tooltip_header checking)
+                          if [ -n "$busy_tooltip" ] && [ "$busy_tooltip" != "System updated" ]; then
+                              tooltip="$busy_header\n─────────────────────────────────────────────────\n$busy_tooltip"
+                          else
+                              tooltip="$busy_header"
+                          fi
+                      else
                       # Claim the flag for this process. The check runs inline,
                       # so this pid is alive for exactly as long as the check
                       # is, which lets refresh test liveness precisely rather
@@ -1176,8 +1214,9 @@
                           tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "Check failed")
                           send_notification "updates-failed" "Update Check Failed" "Check tooltip for detailed error message"
                       fi
-                      
+
                       rm -f "$UPDATING_FLAG"
+                      fi
                   else
                       updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
                       alt="updating"
