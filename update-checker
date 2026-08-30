@@ -442,11 +442,11 @@
             next_check=$(date -d "@$((last_run + UPDATE_INTERVAL))" "$time_fmt")
         fi
 
-        if [ "$state" = "checking" ]; then
-            echo "Last checked: $last_checked · Checking for updates..."
-        else
-            echo "Last checked: $last_checked · Next check: $next_check"
-        fi
+        case "$state" in
+            checking) echo "Last checked: $last_checked · Checking for updates..." ;;
+            offline)  echo "Last checked: $last_checked · Offline" ;;
+            *)        echo "Last checked: $last_checked · Next check: $next_check" ;;
+        esac
     }
 
     # Renders the "Update cost" tooltip section and reports, via
@@ -1248,7 +1248,18 @@
                 updates="0"
             fi
             alt="updated"
-            tooltip="$(format_tooltip_header)\n─────────────────────────────────────────────────\nNo network connection"
+            # The header carries the state now, so the body does not repeat it
+            # and keeps showing what is actually pending. The last result is not
+            # invalidated by the link being down - the same reasoning the
+            # "checking" state uses for holding its previous list. Any update
+            # cost is appended by the shared tail below.
+            local off_header=$(format_tooltip_header offline)
+            local off_existing=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
+            if [ -n "$off_existing" ] && [ "$off_existing" != "System updated" ]; then
+                tooltip="$off_header\n─────────────────────────────────────────────────\n$off_existing"
+            else
+                tooltip="$off_header"
+            fi
             # Once per outage, not once per poll. This branch is reached on every
             # poll for as long as the link is down, and the notification carries
             # no replace id, so notifying unconditionally stacks a new one every

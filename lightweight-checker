@@ -305,8 +305,14 @@ calc_next_update() {
 }
 
 # With no argument: "Last checked: X · Next check: Y".
-# With "checking":  "Last checked: X · Checking for updates..." - the layout
-# stays put while a check runs, so only the right-hand half changes.
+# With "checking":  "Last checked: X · Checking for updates..."
+# With "offline":   "Last checked: X · Offline"
+#
+# Only the right-hand half ever changes, so the layout stays put whatever the
+# state. "offline" exists because the idle half is a promise the module cannot
+# keep with the link down: no check runs, so nothing advances the timestamp the
+# next-check time is derived from, and it drifts into the past the longer the
+# outage lasts.
 format_tooltip_header() {
     local state="${1:-idle}"
     local last_run
@@ -327,11 +333,11 @@ format_tooltip_header() {
         next_check=$(date -d "@$((last_run + UPDATE_INTERVAL))" "$time_fmt")
     fi
 
-    if [ "$state" = "checking" ]; then
-        echo "Last checked: $last_checked · Checking for updates..."
-    else
-        echo "Last checked: $last_checked · Next check: $next_check"
-    fi
+    case "$state" in
+        checking) echo "Last checked: $last_checked · Checking for updates..." ;;
+        offline)  echo "Last checked: $last_checked · Offline" ;;
+        *)        echo "Last checked: $last_checked · Next check: $next_check" ;;
+    esac
 }
 
 # Renders the "Update cost" tooltip section and reports, via PREVIEW_HAS_STATE,
@@ -1940,13 +1946,31 @@ main() {
             : > "$NETWORK_DOWN_FLAG"
             send_notification "updates-failed" "Update Check Failed" "Not connected to the internet"
         fi
-        # A cost computed earlier is unaffected by the link being down, so it
-        # is still shown rather than displaced by the failure line.
+        # The header carries the state now, so the body does not repeat it and
+        # keeps showing what is actually pending. Neither the last result nor a
+        # cost computed earlier is invalidated by the link being down - the same
+        # reasoning the "checking" state uses for holding its previous list.
         build_preview_section
-        local body="No network connection"
-        [ -n "$PREVIEW_SECTION" ] && body="$body\\n\\n$PREVIEW_SECTION"
-        output_json "${updates:-0}" "updated" \
-            "$(format_tooltip_header)\\n─────────────────────────────────────────────────\\n$body"
+        local header existing body
+        header=$(format_tooltip_header offline)
+        existing=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
+        body=""
+        if [ -n "$existing" ] && [ "$existing" != "System updated" ]; then
+            body="$existing"
+        fi
+        if [ -n "$PREVIEW_SECTION" ]; then
+            if [ -n "$body" ]; then
+                body="$body\\n\\n$PREVIEW_SECTION"
+            else
+                body="$PREVIEW_SECTION"
+            fi
+        fi
+        if [ -n "$body" ]; then
+            output_json "${updates:-0}" "updated" \
+                "$header\\n─────────────────────────────────────────────────\\n$body"
+        else
+            output_json "${updates:-0}" "updated" "$header"
+        fi
         exit 0
     fi
     # Either the link is up or the grace period skipped the test. Clearing the
