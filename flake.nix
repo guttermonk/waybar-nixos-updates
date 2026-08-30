@@ -430,6 +430,26 @@
                   evaluation costing a few minutes and well over a gigabyte of memory.
                   Setting this back to false also clears any result already computed.
                 '';
+                recalculateOnChange = mkOption {
+                  type = types.bool;
+                  default = false;
+                  description = ''
+                    Recompute the cost by itself once it no longer describes anything,
+                    instead of showing "middle-click to recalculate" and waiting.
+
+                    Triggers when your flake.lock changes, or when a check finds
+                    something different from what the cost was priced against. Not on a
+                    rebuild: what happens after one is already afterRebuild's business,
+                    and each option leads to a check whose result triggers this anyway.
+
+                    Only ever refreshes a cost you already have. The first one is always
+                    a middle-click, so enabling this cannot commit a machine to an
+                    evaluation it has never asked for - but do read what dryRunPreview
+                    costs before turning it on, because that is the price per recompute.
+
+                    Has no effect unless dryRunPreview.enable is true.
+                  '';
+                };
                 target = mkOption {
                   type = types.str;
                   default = ".#nixosConfigurations.\${hostname}.config.system.build.toplevel";
@@ -577,6 +597,7 @@
                   export SOURCE_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.sourceChecks)}
                   export DRY_RUN_PREVIEW="${if cfg.dryRunPreview.enable then "true" else "false"}"
                   export PREVIEW_TARGET="${builtins.replaceStrings ["\${hostname}"] ["$(hostname)"] cfg.dryRunPreview.target}"
+                  export PREVIEW_AUTO="${if cfg.dryRunPreview.recalculateOnChange then "true" else "false"}"
                   ${if builtins.isString cfg.nixpkgsChannel then ''
                   export NIXPKGS_CHANNEL="${cfg.nixpkgsChannel}"
                   ${if cfg.explicitPackagesOnly != null then ''
@@ -606,6 +627,7 @@
                   export SOURCE_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.sourceChecks)}
                   export DRY_RUN_PREVIEW="${if cfg.dryRunPreview.enable then "true" else "false"}"
                   export PREVIEW_TARGET="${builtins.replaceStrings ["\${hostname}"] ["$(hostname)"] cfg.dryRunPreview.target}"
+                  export PREVIEW_AUTO="${if cfg.dryRunPreview.recalculateOnChange then "true" else "false"}"
                   exec ${checkerBin} "$@"
                 '';
               };

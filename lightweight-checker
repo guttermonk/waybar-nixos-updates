@@ -79,6 +79,10 @@ esac
 # runs on a timer.
 DRY_RUN_PREVIEW="${DRY_RUN_PREVIEW:-false}"
 
+# Recompute that preview by itself once it goes stale. Also off by default, and
+# it only ever refreshes a preview that already exists - see maybe_auto_preview.
+PREVIEW_AUTO="${PREVIEW_AUTO:-false}"
+
 # Shell patterns for generated store outputs that are skipped before version
 # parsing. Without this, an output like "atuin-18.7.1-fish-completions" parses
 # its suffix as part of the version and reports a phantom update.
@@ -553,6 +557,59 @@ build_preview_section() {
     esac
 
     PREVIEW_SECTION="Update cost:\\n$body"
+}
+
+# Recompute a stale cost preview without being asked, when PREVIEW_AUTO is set.
+#
+# Kept out of build_preview_section on purpose. That function renders, and is
+# reached from five paths including the grace and no-network branches; starting
+# a multi-minute evaluation from a render is the wrong shape, and it would fire
+# from branches where a preview cannot succeed anyway.
+#
+# This only ever refreshes a preview that already exists. Enabling the option
+# never starts the first one - that stays a middle-click - so turning it on
+# cannot commit a machine to an evaluation it has not asked for once.
+maybe_auto_preview() {
+    [ "$PREVIEW_AUTO" = "true" ] || return 0
+    [ "$DRY_RUN_PREVIEW" = "true" ] || return 0
+    [ -f "$PREVIEW_FILE" ] || return 0
+
+    local status="" lock_hash="" result_hash=""
+    local key value
+    while IFS='=' read -r key value; do
+        case "$key" in
+            status)      status="$value" ;;
+            lock_hash)   lock_hash="$value" ;;
+            result_hash) result_hash="$value" ;;
+        esac
+    done < "$PREVIEW_FILE"
+    # Anything but a completed preview is either already running or a message
+    # about why one did not, and neither is a baseline to refresh. It also stops
+    # this from re-firing on the poll its own "calculating" record provokes.
+    [ "$status" = "done" ] || return 0
+
+    # Two of the three staleness keys, deliberately not the third: a rebuild
+    # moves system_path, and what to do after a rebuild is already the user's
+    # choice. Every afterRebuild option settles into a check whose findings move
+    # result_hash anyway, so the cost still refreshes when it genuinely changed,
+    # without pricing each rebuild as an event in its own right.
+    local live_lock
+    live_lock=$(sha256sum "$FLAKE_DIR/flake.lock" 2>/dev/null | cut -d' ' -f1)
+    if [ "$lock_hash" = "$live_lock" ] && \
+       [ "$result_hash" = "$(cat "$RESULT_HASH_FILE" 2>/dev/null)" ]; then
+        return 0
+    fi
+
+    # The lock is tested here rather than left to "preview start", which answers
+    # a busy lock by recording the "declined" state - and that record is cleared
+    # on read, taking the stored preview with it. For a click that is right: the
+    # click has been answered. Here it would delete the very baseline this
+    # function requires, disabling the option until the next manual click.
+    # Skipping instead costs one poll, and the caller below refreshes waybar as
+    # soon as the check releases the lock.
+    flock -n "$CHECK_LOCK_FILE" true 2>/dev/null || return 0
+
+    preview start >/dev/null 2>&1 || true
 }
 
 # ===== Flake Input Checking =====
@@ -1815,6 +1872,13 @@ run_check_worker() {
         fi
         check_for_updates_lightweight || true
     ) 9>"$CHECK_LOCK_FILE"
+    # A second refresh, after the lock is released rather than before. The trap
+    # above runs inside the subshell that holds fd 9, so the poll it provokes is
+    # both the first to see the new result hash and one that cannot take the
+    # lock - which is exactly the poll maybe_auto_preview needs to succeed on.
+    # The trap stays: it is what covers the paths where this line is not reached,
+    # the worker being killed with its process group among them.
+    refresh_waybar
 }
 
 # ===== Main =====
@@ -2112,6 +2176,14 @@ main() {
     tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "System updated")
     local header
     header=$(format_tooltip_header)
+
+    # Reached only when no check is running and none was started above, so an
+    # automatic preview cannot take the lock out from under one. The grace test
+    # doubles as the network test: the branch above exits when the link is down,
+    # and the only way past it without a live link is the grace period.
+    if [ "$in_grace" = false ]; then
+        maybe_auto_preview
+    fi
 
     # Built here rather than during the check, so a preview requested between
     # checks shows up on the very next poll instead of waiting for one.

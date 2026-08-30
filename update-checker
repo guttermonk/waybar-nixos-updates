@@ -23,6 +23,10 @@
     # default: a preview is a full system evaluation costing minutes, so it
     # never runs on a timer.
     DRY_RUN_PREVIEW="${DRY_RUN_PREVIEW:-false}"
+    # Recompute that preview by itself once it goes stale. Also off by default,
+    # and it only ever refreshes a preview that already exists - see
+    # maybe_auto_preview.
+    PREVIEW_AUTO="${PREVIEW_AUTO:-false}"
     # What a detected rebuild does to the package count.
     #
     # "recheck" discards the old result and checks, so a rebuild that applied
@@ -76,11 +80,21 @@
     # 1. First boot - when the system has just started up
     # 2. Resume from hibernation/suspension - when the system has just woken up
     # This avoids unnecessary resource usage and notifications during these transition periods.
-    SKIP_AFTER_BOOT=true  # Set to false if you want to run the checker even after boot/resume
-    GRACE_PERIOD=60  # Grace period in seconds (60 seconds) after boot/resume
+    # Read from the environment like every other setting: these were plain
+    # assignments, which overwrote what the module exports, so skipAfterBoot and
+    # gracePeriod had no effect in this mode whatever they were set to.
+    SKIP_AFTER_BOOT="${SKIP_AFTER_BOOT:-true}"  # false runs the checker even after boot/resume
+    GRACE_PERIOD="${GRACE_PERIOD:-60}"  # Grace period in seconds after boot/resume
 
     # If true, update the lock file in the config folder.
-    # If false, copy config to temp folder first, and then update the temp dir's lock file.
+    # If false, resolve a speculative lock beside it and leave yours untouched.
+    #
+    # Deliberately still a plain assignment, so the module's updateLockFile is
+    # inert and every check takes the false branch. The true branch runs `nix
+    # flake update` in the real configuration directory and builds there,
+    # rewriting your flake.lock and leaving a ./result behind. It has been dead
+    # code for long enough that honouring the option would newly enable that on
+    # configurations already setting it, which is not a change to make quietly.
     UPDATE_LOCK_FILE="false"
 
     # If you have a separate script to update your lock file (i.e. "nix flake update" script)
@@ -636,6 +650,66 @@
         PREVIEW_SECTION="Update cost:\n$body"
     }
 
+    # Recompute a stale cost preview without being asked, when PREVIEW_AUTO is
+    # set.
+    #
+    # Kept out of build_preview_section on purpose. That function renders, and
+    # the tail below reaches it from the grace and no-network branches as well;
+    # starting a multi-minute evaluation from a render is the wrong shape, and
+    # it would fire from branches where a preview cannot succeed anyway.
+    #
+    # This only ever refreshes a preview that already exists. Enabling the
+    # option never starts the first one - that stays a middle-click - so turning
+    # it on cannot commit a machine to an evaluation it has not asked for once.
+    function maybe_auto_preview() {
+        [ "$PREVIEW_AUTO" = "true" ] || return 0
+        [ "$DRY_RUN_PREVIEW" = "true" ] || return 0
+        [ -f "$PREVIEW_FILE" ] || return 0
+
+        local status="" lock_hash="" result_hash=""
+        local key value
+        while IFS='=' read -r key value; do
+            case "$key" in
+                status)      status="$value" ;;
+                lock_hash)   lock_hash="$value" ;;
+                result_hash) result_hash="$value" ;;
+            esac
+        done < "$PREVIEW_FILE"
+        # Anything but a completed preview is either already running or a
+        # message about why one did not, and neither is a baseline to refresh.
+        # It also stops this re-firing on the poll its own "calculating" record
+        # provokes.
+        [ "$status" = "done" ] || return 0
+
+        # Two of the three staleness keys, deliberately not the third: a rebuild
+        # moves system_path, and what to do after a rebuild is already the
+        # user's choice. Every afterRebuild option settles into a check whose
+        # findings move result_hash anyway, so the cost still refreshes when it
+        # genuinely changed, without pricing each rebuild as an event in its own
+        # right - which in this mode would mean building the closure again.
+        local live_lock
+        live_lock=$(sha256sum "$NIXOS_CONFIG_PATH/flake.lock" 2>/dev/null | cut -d' ' -f1)
+        if [ "$lock_hash" = "$live_lock" ] && \
+           [ "$result_hash" = "$(cat "$RESULT_HASH_FILE" 2>/dev/null)" ]; then
+            return 0
+        fi
+
+        # The lock is tested here rather than left to "preview start", which
+        # answers a busy lock by recording the "declined" state - and that
+        # record is cleared on read, taking the stored preview with it. For a
+        # click that is right: the click has been answered. Here it would delete
+        # the very baseline this function requires, disabling the option until
+        # the next manual click.
+        #
+        # A check in this mode runs inline and holds the lock on fd 9 until the
+        # script exits, so a poll that checked skips here and the recompute
+        # lands on a later one. That is the intended order: the check comes
+        # first, and its findings are what the new cost is priced against.
+        flock -n "$CHECK_LOCK_FILE" true 2>/dev/null || return 0
+
+        preview start >/dev/null 2>&1 || true
+    }
+
     function var_setter() {
         # Ensure updates is a number
         if [ -z "$updates" ]; then
@@ -1089,6 +1163,10 @@
         local updates=""
         local alt=""
         local tooltip=""
+        # Set only on the live-link branch. The tail below is shared with the
+        # grace and no-network branches, and neither is a place to start an
+        # evaluation that needs the network and has just been skipped for cost.
+        local network_up=false
 
         # Rendering falls through to the shared tail rather than exiting inside
         # the grace branch: the early exit there skipped the update-cost section
@@ -1102,6 +1180,7 @@
           # what makes the next outage notify again, rather than the first one
           # silencing every outage that follows it.
           rm -f "$NETWORK_DOWN_FLAG"
+          network_up=true
           # Auto-detect rebuild via /run/current-system comparison
           local rebuild_handled=false
           if check_system_rebuilt; then
@@ -1347,6 +1426,10 @@
                 : > "$NETWORK_DOWN_FLAG"
                 send_notification "updates-failed" "Update Check Failed" "Not connected to the internet"
             fi
+        fi
+
+        if [ "$network_up" = true ]; then
+            maybe_auto_preview
         fi
 
         # Built here rather than during the check, so a preview requested

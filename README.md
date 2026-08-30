@@ -241,10 +241,16 @@ When using the Home Manager module, you can configure these options:
     - `(62 of 105 seen)` is the coverage: derivations you have never built contribute nothing, so a low figure means the build number is a floor rather than a prediction. Expect roughly ±30% even at full coverage; remote builders and heavy parallelism skew it further.
     - The two figures overlap, since Nix fetches while it builds — treat the wall clock as nearer the larger of them than their sum.
     - A fresh install has no history, and an unreadable store database simply omits the line rather than guessing.
-  - The result is stamped with the time it was taken and is discarded automatically once it stops being true: either `flake.lock` changes or you rebuild.
+  - The result is stamped with the time it was taken, and stops being shown once it no longer describes anything. Three things retire it: your `flake.lock` changes, a check finds something different from what the cost was priced against, or you rebuild.
   - Setting this back to `false` removes the binding *and* clears any result already computed.
   - Shares a lock with the background check, so the two never evaluate at once. Middle-clicking during a check reports `check in progress — try again shortly` rather than queueing.
   - `dryRunPreview.target`: flake target to price; literal `${hostname}` is replaced at run time. A leading `.#` resolves against `nixosConfigPath`, not your shell's working directory.
+  - `dryRunPreview.recalculateOnChange`: Recompute the cost by itself when it goes stale, instead of showing `middle-click to recalculate` and waiting (default: `false`). Requires `dryRunPreview.enable`.
+    - Fires on two of the three staleness reasons above: `flake.lock` changing, and a check finding something different. **Not on a rebuild** — what happens after one is already `afterRebuild`'s business, and each of its options leads to a check whose result fires this anyway.
+    - **Only ever refreshes a cost you already have.** With no stored result it does nothing, so the first preview on any machine is always a middle-click and enabling this cannot commit a machine to an evaluation it has never asked for. Middle-click once to establish a baseline; after that it maintains itself.
+    - Each recompute costs what a preview costs — the 2–3 minutes and gigabyte above. There is no minimum interval between automatic recomputes, so on a fast-moving channel with a short `updateInterval` this can run several times a day.
+    - Skipped, not queued, when the check holds the lock. It runs on a later poll instead, which is the right order anyway: the check settles what the new cost should be priced against.
+    - A failed recompute is not retried. The cost reads `unavailable` until you middle-click, rather than re-attempting a several-minute evaluation on a schedule.
 - `lightweightExcludePatterns`: Shell patterns for generated store outputs to skip before version parsing (default: `[ "*-fish-completions" ]`). Outputs like `atuin-18.7.1-fish-completions` otherwise have their suffix read as part of the version, showing a phantom update. Keep patterns anchored — `*-completions` would also drop real packages such as `nix-bash-completions`.
 
 **Lightweight mode features:**

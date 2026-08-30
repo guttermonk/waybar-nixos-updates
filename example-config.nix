@@ -71,6 +71,13 @@
   #   checkMode = "lightweight";
   #   dryRunPreview.enable = true;
   #   # dryRunPreview.target = ".#nixosConfigurations.\${hostname}.config.system.build.toplevel";
+  #   # A stored cost stops being true when flake.lock changes or a check finds
+  #   # something different. By default it says so and waits for another
+  #   # middle-click; this recomputes it instead. Not on a rebuild - that is
+  #   # afterRebuild's business, below. Only ever refreshes a cost you already
+  #   # have, so the first one is still a middle-click, and every refresh after
+  #   # that costs the same few minutes as the first.
+  #   # dryRunPreview.recalculateOnChange = true;
   # };
   #
   # Tooltip while calculating:  Update cost:
