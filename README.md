@@ -166,7 +166,9 @@ When using the Home Manager module, you can configure these options:
 - `checkMode`: Update check strategy - `"full"` (default) or `"lightweight"`
   - In lightweight mode, versions are compared with Nix's own ordering (`builtins.compareVersions`), so `5.3p9 → 5.3p15` is correctly an upgrade and `1.16.1 → 1.3.6` is not
   - A pending change where the channel is *behind* what you have installed is reported and marked `(downgrade)` rather than hidden — moving a package from `pkgs-unstable` to `pkgs` is a deliberate change worth seeing before you rebuild
-- `updateInterval`: Time in seconds between update checks (default: 3600)
+- `updateInterval`: Minimum time in seconds between update checks (default: 3600)
+  - This is the *check* interval, not waybar's poll interval. The module polls more often than it checks — at `updateInterval / 10`, capped at 500s — and the script throttles itself against `updateInterval`. A check therefore runs at the first poll after it comes due: never early, and late by at most the poll interval (under 9 minutes on a 6-hour setting).
+  - The two must not be equal. A check started by the poll at `T` only records its timestamp at `T + duration`, so a poll at `T + updateInterval` sees slightly less than the interval elapsed and skips — losing every second poll and doubling the effective period.
 - `afterRebuild`: What to do when a rebuild that changed package versions is detected - `"recheck"` (default), `"reconcile"` or `"assume-updated"`
   - `"recheck"`: discard the previous result and run a real check, so the count reflects what is still outstanding. A rebuild that applied only *some* of the pending updates — you ran `nix flake update nixpkgs` but not the rest, or updated a single input — is reported correctly. Costs one check per rebuild, which in `"full"` mode means building the new closure.
   - `"reconcile"`: subtract the packages the rebuild demonstrably changed and keep the rest. Detecting the rebuild already means diffing the old and new closures with `nvd`, so the list of what changed is there for free:
@@ -463,8 +465,8 @@ The flake provides the following outputs:
 No integration is required. The checker automatically detects both rebuilds and flake input updates on its own - you do **not** need to modify your rebuild script or `nix flake update` aliases, and there are no flag files to `touch`.
 
 #### Automatic Rebuild Detection
-The checker caches the `/run/current-system` path (in `nix-update-system-path`) and compares it on each run. When it changes, the system has been rebuilt. It then runs `nvd diff` on the two existing store paths (fast - no building) to distinguish a real package update from a config-only rebuild:
-- **Package versions changed:** the count is reset to `0` ("System updated"), and the next check runs on the normal `updateInterval` schedule.
+The checker caches the `/run/current-system` path (in `nix-update-system-path`) and compares it on each run. When it changes, the system has been rebuilt. It then runs `nvd diff` on the two existing store paths — no building, since both closures already exist, though it is not instant either (~4s here) — to distinguish a real package update from a config-only rebuild:
+- **Package versions changed:** handled according to [`afterRebuild`](#configuration-options) — re-checked, reconciled against what the diff shows changed, or assumed applied.
 - **Config-only rebuild:** the existing package state is preserved, so a config change doesn't clear a pending update count.
 
 #### Automatic Input-Update Detection

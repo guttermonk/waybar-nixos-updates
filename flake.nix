@@ -480,7 +480,26 @@
                   signal = 12;
                   on-click = "~/.config/waybar/scripts/update-checker toggle";
                   on-click-right = "~/.config/waybar/scripts/update-checker refresh";
-                  interval = cfg.updateInterval;
+                  # How often waybar asks the script what to display, which is
+                  # deliberately not how often a check runs - updateInterval is,
+                  # and the script throttles itself against it.
+                  #
+                  # These were the same value, and that is a phase trap rather
+                  # than a tidy default: a check started by the poll at T only
+                  # stamps its timestamp at T+duration, so the poll at T+interval
+                  # sees interval-duration elapsed, decides it is early, and skips.
+                  # Every second poll was lost and the effective period was twice
+                  # what was configured. Measured here at 123s for a lightweight
+                  # check, and a full check realises the closure, so its duration
+                  # is the whole update - there is no duration small enough for
+                  # the two periods to coexist safely.
+                  #
+                  # Polling well inside the interval removes the coincidence:
+                  # some poll always lands after the check becomes due, so a
+                  # check is late by at most this value and never early. Capped
+                  # so a long interval does not mean a rare poll, and scaled for
+                  # short ones so lateness stays under a tenth of the period.
+                  interval = lib.max 60 (lib.min 500 (cfg.updateInterval / 10));
                 } // optionalAttrs cfg.dryRunPreview.enable {
                   # Only bound when the preview is enabled, so it cannot be
                   # triggered by accident on a default configuration.
