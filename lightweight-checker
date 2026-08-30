@@ -291,8 +291,89 @@ check_network() {
     ip route 2>/dev/null | grep -q "^default" && ip -4 addr show 2>/dev/null | grep -qE "inet .* scope global"
 }
 
+# Waybar renders a custom module's tooltip with set_tooltip_markup, so the text
+# is parsed as Pango markup. An unescaped & or < - from a nix error, a package
+# name, an input name - is a parse failure that discards the *whole* tooltip
+# rather than the offending line, and it happens precisely when something has
+# already gone wrong and the tooltip is what you need. Escaped centrally here so
+# that no caller can forget it.
+#
+# The only markup this module emits is the horizontal rule, so callers place a
+# token and it is substituted after escaping. It is drawn as an underline over
+# spaces rather than a run of box-drawing glyphs, which leave a hairline gap at
+# every character boundary, and sized to the widest line - a fixed width is a
+# floor under the tooltip, padding it out whenever the content is narrower.
+TOOLTIP_HR=$'\002'
+
+escape_markup() {
+    local s="$1"
+    # The ampersands are backslash-escaped because bash 5.2 made a bare & in a
+    # substitution replacement expand to the matched text (patsub_replacement, on
+    # by default), which turned every escape into <lt; rather than &lt;. Escaping
+    # & first is also load-bearing: the & this introduces must not be re-escaped.
+    s=${s//&/\&amp;}
+    s=${s//</\&lt;}
+    s=${s//>/\&gt;}
+    printf '%s' "$s"
+}
+
 output_json() {
     local text="$1" alt="$2" tooltip="$3"
+    tooltip=$(escape_markup "$tooltip")
+    # The tooltip is interpolated into a JSON string, so a double quote in a nix
+    # error or a package name ends that string early and waybar gets malformed
+    # JSON. Only the quote is escaped: the body carries literal backslash-n
+    # sequences that are meant to reach waybar as JSON line breaks, and escaping
+    # backslashes too would turn them into the characters \ and n.
+    tooltip=${tooltip//\"/\\\"}
+
+    if [[ "$tooltip" == *"$TOOLTIP_HR"* ]]; then
+        local -a lines=()
+        local line
+        while IFS= read -r line; do lines+=("$line"); done \
+            < <(printf '%s\n' "${tooltip//\\n/$'\n'}")
+
+        # Width of the widest line, the rule's own line excluded. Counted in
+        # characters, which needs a UTF-8 locale to be exact; under a C locale
+        # the multi-byte arrows inflate the count and the rule comes out a
+        # little long, which is what a fixed width did anyway.
+        local width=0 i
+        for i in "${!lines[@]}"; do
+            [[ "${lines[i]}" == *"$TOOLTIP_HR"* ]] && continue
+            [ "${#lines[i]}" -gt "$width" ] && width=${#lines[i]}
+        done
+        [ "$width" -gt 0 ] || width=20
+
+        # An underlined run puts its stroke on the line's baseline, so the line's
+        # whole height sits above the rule and nothing below it. The two
+        # attributes do different halves of the fix, and only one does what its
+        # name suggests:
+        #
+        #   line_height shortens the rule's own line box, and is the only thing
+        #   that reduces the space *above* the rule. Measured at this font: 19
+        #   rows at the default, 15 at 0.6, 11 at 0.15, and no lower - the
+        #   remainder is the header line's own descent, which is not the rule's
+        #   to reclaim.
+        #
+        #   rise lifts the stroke, and adds space *below* it only. It does not
+        #   touch the space above: that measured 19 rows at rise 0, 6000, 12000
+        #   and 20000 alike, because the line box grows to follow the stroke.
+        #
+        # Full size, not x-small: Pango scales underline thickness with the font
+        # size, and a run of spaces set smaller is physically narrower than the
+        # same count of body-sized characters, so a smaller rule comes out both
+        # thinner and short of the width it was measured for.
+        #
+        # line_height needs Pango 1.50 or newer. Pango rejects markup carrying an
+        # attribute it does not know rather than ignoring it, so on anything
+        # older this whole tooltip fails to parse.
+        local spaces
+        printf -v spaces '%*s' "$width" ''
+        # Single-quoted attributes, which Pango accepts: a double quote would be
+        # interpolated into the JSON string below and end it early.
+        tooltip=${tooltip//$TOOLTIP_HR/<span line_height=\'0.15\' rise=\'8000\' underline=\'single\'>$spaces</span>}
+    fi
+
     echo "{ \"text\":\"$text\", \"alt\":\"$alt\", \"tooltip\":\"$tooltip\" }"
 }
 
@@ -1869,7 +1950,7 @@ main() {
                 build_preview_section
                 [ -n "$PREVIEW_SECTION" ] && r_body="$r_body\\n\\n$PREVIEW_SECTION"
                 output_json "$r_total" "$r_alt" \
-                    "$(format_tooltip_header)\\n─────────────────────────────────────────────────\\n$r_body"
+                    "$(format_tooltip_header)\\n${TOOLTIP_HR}\\n$r_body"
                 refresh_waybar
                 exit 0
             fi
@@ -1918,7 +1999,7 @@ main() {
         if [ "$updates" = "0" ] || [ -z "$updates" ]; then
             output_json "$updates" "disabled" "Updates disabled (Last checked: $last_fmt)"
         elif [ -n "$existing" ] && [ "$existing" != "System updated" ]; then
-            output_json "$updates" "disabled" "Updates disabled (Last checked: $last_fmt)\\n─────────────────────────────────────────────────\\n$existing"
+            output_json "$updates" "disabled" "Updates disabled (Last checked: $last_fmt)\\n${TOOLTIP_HR}\\n$existing"
         else
             output_json "$updates" "disabled" "Updates disabled ($updates pending)\\nLast checked: $last_fmt"
         fi
@@ -1967,7 +2048,7 @@ main() {
         fi
         if [ -n "$body" ]; then
             output_json "${updates:-0}" "updated" \
-                "$header\\n─────────────────────────────────────────────────\\n$body"
+                "$header\\n${TOOLTIP_HR}\\n$body"
         else
             output_json "${updates:-0}" "updated" "$header"
         fi
@@ -2012,7 +2093,7 @@ main() {
         header=$(format_tooltip_header checking)
         local tooltip
         if [ -n "$existing_tooltip" ] && [ "$existing_tooltip" != "System updated" ]; then
-            tooltip="$header\\n─────────────────────────────────────────────────\\n$existing_tooltip"
+            tooltip="$header\\n${TOOLTIP_HR}\\n$existing_tooltip"
         else
             tooltip="$header"
         fi
@@ -2042,7 +2123,7 @@ main() {
     if [ -f "$ERROR_FILE" ]; then
         local err_body="$tooltip"
         [ -n "$PREVIEW_SECTION" ] && err_body="$err_body\\n\\n$PREVIEW_SECTION"
-        output_json "$updates" "error" "$header\\n─────────────────────────────────────────────────\\n$err_body"
+        output_json "$updates" "error" "$header\\n${TOOLTIP_HR}\\n$err_body"
         exit 0
     fi
 
@@ -2073,7 +2154,7 @@ main() {
     fi
 
     if [ -n "$body" ]; then
-        output_json "$text" "$alt" "$header\\n─────────────────────────────────────────────────\\n$body"
+        output_json "$text" "$alt" "$header\\n${TOOLTIP_HR}\\n$body"
     else
         output_json "$text" "$alt" "$header"
     fi

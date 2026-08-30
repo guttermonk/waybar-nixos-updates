@@ -422,6 +422,68 @@
     # With no argument: "Last checked: X · Next check: Y".
     # With "checking":  "Last checked: X · Checking for updates..." - the layout
     # stays put while a check runs, so only the right-hand half changes.
+    # Waybar renders a custom module's tooltip with set_tooltip_markup, so the
+    # text is parsed as Pango markup. An unescaped & or < - from a nix error, a
+    # package name, an input name - is a parse failure that discards the *whole*
+    # tooltip rather than the offending line, and it happens precisely when
+    # something has already gone wrong and the tooltip is what you need. Escaped
+    # centrally here so that no caller can forget it.
+    #
+    # The only markup this module emits is the horizontal rule, so callers place
+    # a token and it is substituted after escaping.
+    TOOLTIP_HR=$'\002'
+
+    function escape_markup() {
+        local s="$1"
+        # The ampersands are backslash-escaped because bash 5.2 made a bare & in a
+        # substitution replacement expand to the matched text (patsub_replacement, on
+        # by default), which turned every escape into <lt; rather than &lt;. Escaping
+        # & first is also load-bearing: the & this introduces must not be re-escaped.
+        s=${s//&/\&amp;}
+        s=${s//</\&lt;}
+        s=${s//>/\&gt;}
+        printf '%s' "$s"
+    }
+
+    function output_json() {
+        local text="$1" alt="$2" tooltip="$3"
+        tooltip=$(escape_markup "$tooltip")
+        # The tooltip is interpolated into a JSON string, so a double quote in a
+        # nix error or a package name ends that string early and waybar gets
+        # malformed JSON. Only the quote is escaped: the body carries literal
+        # backslash-n sequences meant to reach waybar as JSON line breaks, and
+        # escaping backslashes too would turn them into the characters \ and n.
+        tooltip=${tooltip//\"/\\\"}
+
+        if [[ "$tooltip" == *"$TOOLTIP_HR"* ]]; then
+            # Width of the widest line, the rule's own line excluded. Counted in
+            # characters, which needs a UTF-8 locale to be exact; under a C
+            # locale the multi-byte arrows inflate the count and the rule comes
+            # out a little long, which is what a fixed width did anyway.
+            local width=0 line
+            while IFS= read -r line; do
+                [[ "$line" == *"$TOOLTIP_HR"* ]] && continue
+                [ "${#line}" -gt "$width" ] && width=${#line}
+            done < <(printf '%s\n' "${tooltip//\\n/$'\n'}")
+            [ "$width" -gt 0 ] || width=20
+
+            # line_height shortens the rule's own line box and is the only thing
+            # that reduces the space above it; rise lifts the stroke and adds
+            # space below it only. Full size, not x-small: Pango scales
+            # underline thickness with font size, and smaller spaces are
+            # narrower than the body characters the width was measured from.
+            # line_height needs Pango 1.50+, which rejects unknown attributes
+            # rather than ignoring them.
+            local spaces
+            printf -v spaces '%*s' "$width" ''
+            # Single-quoted attributes, which Pango accepts: a double quote would
+            # be interpolated into the JSON string below and end it early.
+            tooltip=${tooltip//$TOOLTIP_HR/<span line_height=\'0.15\' rise=\'8000\' underline=\'single\'>$spaces</span>}
+        fi
+
+        echo "{ \"text\":\"$text\", \"alt\":\"$alt\", \"tooltip\":\"$tooltip\" }"
+    }
+
     function format_tooltip_header() {
         local state="${1:-idle}"
         local last_run
@@ -587,7 +649,7 @@
             alt="has-updates"
             local existing_tooltip
             existing_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "$updates updates available")
-            tooltip="$header\\n─────────────────────────────────────────────────\\n$existing_tooltip"
+            tooltip="$header\\n${TOOLTIP_HR}\\n$existing_tooltip"
         else
             alt="updated"
             tooltip="$header"
@@ -988,14 +1050,14 @@
                 # Show the original tooltip content with disabled indicator and timestamp
                 if [ -n "$existing_tooltip" ] && [ "$existing_tooltip" != "System updated" ]; then
                     # Preserve the original update list with timestamp
-                    tooltip="Updates disabled (Last checked: $last_run_formatted)\n─────────────────────────────────────────────────\n$existing_tooltip"
+                    tooltip="Updates disabled (Last checked: $last_run_formatted)\n${TOOLTIP_HR}\n$existing_tooltip"
                 else
                     # Fallback if no proper tooltip exists
                     tooltip="Updates disabled ($updates pending)\nLast checked: $last_run_formatted"
                 fi
             fi
             # Output JSON without modifying the tooltip file
-            echo "{ \"text\":\"$updates\", \"alt\":\"$alt\", \"tooltip\":\"$tooltip\" }"
+            output_json "$updates" "$alt" "$tooltip"
             exit 0
         fi
 
@@ -1118,7 +1180,7 @@
                   [ "$r_total" -gt 0 ] && alt="has-updates"
                   # Rendering falls through to the shared tail rather than exiting
                   # here, so the header and the update-cost section are included.
-                  tooltip="$(format_tooltip_header)\n─────────────────────────────────────────────────\n$r_body"
+                  tooltip="$(format_tooltip_header)\n${TOOLTIP_HR}\n$r_body"
                   rebuild_handled=true
               else
                   # "recheck": the rebuild may have applied only some of the
@@ -1178,7 +1240,7 @@
                           local busy_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
                           local busy_header=$(format_tooltip_header checking)
                           if [ -n "$busy_tooltip" ] && [ "$busy_tooltip" != "System updated" ]; then
-                              tooltip="$busy_header\n─────────────────────────────────────────────────\n$busy_tooltip"
+                              tooltip="$busy_header\n${TOOLTIP_HR}\n$busy_tooltip"
                           else
                               tooltip="$busy_header"
                           fi
@@ -1225,7 +1287,7 @@
                       local existing_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
                       local header=$(format_tooltip_header checking)
                       if [ -n "$existing_tooltip" ] && [ "$existing_tooltip" != "System updated" ]; then
-                          tooltip="$header\n─────────────────────────────────────────────────\n$existing_tooltip"
+                          tooltip="$header\n${TOOLTIP_HR}\n$existing_tooltip"
                       else
                           tooltip="$header"
                       fi
@@ -1256,7 +1318,7 @@
             local off_header=$(format_tooltip_header offline)
             local off_existing=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
             if [ -n "$off_existing" ] && [ "$off_existing" != "System updated" ]; then
-                tooltip="$off_header\n─────────────────────────────────────────────────\n$off_existing"
+                tooltip="$off_header\n${TOOLTIP_HR}\n$off_existing"
             else
                 tooltip="$off_header"
             fi
@@ -1284,7 +1346,7 @@
         fi
 
         # Output JSON for Waybar
-        echo "{ \"text\":\"$updates\", \"alt\":\"$alt\", \"tooltip\":\"$tooltip\" }"
+        output_json "$updates" "$alt" "$tooltip"
     }
 
     # Error handler to ensure we always output valid JSON

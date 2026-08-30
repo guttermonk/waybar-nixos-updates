@@ -173,23 +173,30 @@ summarise_plan() {
         return 0
     fi
 
-    # Download leads, because it dominates: a measured rebuild spent 30 of its
-    # 43 minutes fetching and only 13 building.
+    # nix writes "1.2 GiB download, 3.8 GiB unpacked"; on a line that already
+    # says "download" the word is said twice, and it is the longest line here.
+    sizes=${sizes/ download,/,}
+    sizes=${sizes% download}
+
+    # Counts first, as the summary: what the update is, before how long it
+    # takes. Then one estimate per line, download before build - the order the
+    # work happens in, measured here as fetching starting 769s before the first
+    # build - and each carrying only what qualifies it.
+    #
     # A literal backslash-n, not a real newline: this ends up in a key=value
     # state file that is read a line at a time, and the tooltip renders the
     # escape as a break anyway.
-    local out=""
+    local out="${fetches:-0} to download · ${builds:-0} to build"
+
     local est
-    if est=$(estimate_line "$plan"); then
-        [ -n "$est" ] && out="$est"'\n'
+    if est=$(estimate_line "$plan" "$sizes"); then
+        [ -n "$est" ] && out+='\n'"$est"
+    elif [ -n "$sizes" ]; then
+        # No estimate to hang them on, so the sizes stay with the counts rather
+        # than being dropped.
+        out="${fetches:-0} to download ($sizes) · ${builds:-0} to build"
     fi
 
-    # Download before build, matching the order the work actually happens in:
-    # measured here, fetching started 769s before the first build. The sizes
-    # stay attached to the download half, which is what they describe.
-    out+="${fetches:-0} to download"
-    [ -n "$sizes" ] && out+=" ($sizes)"
-    out+=" · ${builds:-0} to build"
     printf '%s' "$out"
 }
 
@@ -197,7 +204,7 @@ summarise_plan() {
 # that cannot be estimated is omitted rather than guessed, and the whole line is
 # dropped if nothing can be worked out at all.
 estimate_line() {
-    local plan="$1"
+    local plan="$1" sizes="$2"
     local parts=()
 
     # Download: unpacked bytes over the measured rate. Both are nar-domain, so
@@ -215,8 +222,10 @@ estimate_line() {
         esac
         local secs
         secs=$(awk -v m="$mib" -v r="$rate" 'BEGIN{ if (r>0) printf "%d", m/r }')
+        # The sizes ride with the download estimate, being what that estimate is
+        # computed from, rather than with the counts line.
         [ -n "$secs" ] && [ "$secs" -gt 0 ] 2>/dev/null && \
-            parts+=("~$(human_duration "$secs") download")
+            parts+=("~$(human_duration "$secs") download${sizes:+ ($sizes)}")
     fi
 
     # Build: sum of median historical times, with coverage stated. A low
@@ -238,9 +247,12 @@ estimate_line() {
     rm -f "$names"
 
     [ "${#parts[@]}" -eq 0 ] && return 1
+    # One estimate per line. Side by side they made the widest line in the whole
+    # tooltip, and the coverage figure trailing both of them read as qualifying
+    # both when it only ever describes the build.
     # Joined by hand: ${arr[*]} only ever uses the first character of IFS.
     local out="${parts[0]}" i
-    for ((i = 1; i < ${#parts[@]}; i++)); do out+=" · ${parts[i]}"; done
+    for ((i = 1; i < ${#parts[@]}; i++)); do out+='\n'"${parts[i]}"; done
     printf '%s' "$out"
 }
 
