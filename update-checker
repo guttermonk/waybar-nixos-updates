@@ -60,6 +60,11 @@
     # Written by every check so "reconcile" can drop entries by package name
     # after a rebuild instead of parsing them back out of display text.
     PACKAGES_JSON_FILE="$CACHE_DIR/nix-update-packages.json"
+    # Set while the link is down, so the "not connected" notification is raised
+    # once per outage rather than once per poll. notify-send is called without a
+    # replace id, so an unthrottled notification does not update in place - it
+    # stacks a new one every few seconds for as long as the link stays down.
+    NETWORK_DOWN_FLAG="$CACHE_DIR/nix-update-network-down"
 
     # The grace period prevents the update checker from running immediately after:
     # 1. First boot - when the system has just started up
@@ -1008,6 +1013,10 @@
             var_setter
         # Check for network connectivity before proceeding
         elif check_network_connectivity; then
+          # The link is up, so clear the once-per-outage latch. Doing it here is
+          # what makes the next outage notify again, rather than the first one
+          # silencing every outage that follows it.
+          rm -f "$NETWORK_DOWN_FLAG"
           # Auto-detect rebuild via /run/current-system comparison
           local rebuild_handled=false
           if check_system_rebuilt; then
@@ -1147,8 +1156,22 @@
                           updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
                           var_setter
                       else
-                          # Update check failed - read the full error from tooltip file
-                          updates="0"
+                          # Update check failed - read the full error from tooltip file.
+                          #
+                          # Stamped here rather than in check_for_updates, which
+                          # writes the timestamp only on its success path and has
+                          # four ways to fail. Without it the throttle still sees
+                          # the interval as elapsed, and the next poll starts
+                          # another doomed build - a retry loop for as long as the
+                          # cause persists, which for an unreachable substituter
+                          # can be the length of an outage.
+                          echo "$(date +%s)" > "$LAST_RUN_FILE"
+                          # The count is left alone. A check that failed has
+                          # learned nothing about it, and zeroing here would now
+                          # persist a wrong "0" for a whole interval rather than
+                          # until the next retry.
+                          updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+                          [ -n "$updates" ] || updates="0"
                           alt="error"
                           tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "Check failed")
                           send_notification "updates-failed" "Update Check Failed" "Check tooltip for detailed error message"
@@ -1187,7 +1210,14 @@
             fi
             alt="updated"
             tooltip="$(format_tooltip_header)\n─────────────────────────────────────────────────\nNo network connection"
-            send_notification "updates-failed" "Update Check Failed" "Not connected to the internet"
+            # Once per outage, not once per poll. This branch is reached on every
+            # poll for as long as the link is down, and the notification carries
+            # no replace id, so notifying unconditionally stacks a new one every
+            # few seconds rather than updating one in place.
+            if [ ! -f "$NETWORK_DOWN_FLAG" ]; then
+                : > "$NETWORK_DOWN_FLAG"
+                send_notification "updates-failed" "Update Check Failed" "Not connected to the internet"
+            fi
         fi
 
         # Built here rather than during the check, so a preview requested

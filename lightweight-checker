@@ -126,6 +126,12 @@ PREVIEW_FILE="$CACHE_DIR/nix-update-preview"
 # rendering the failure as a healthy result. Cleared by the next good check.
 ERROR_FILE="$CACHE_DIR/nix-update-error"
 
+# Set while the link is down, so the "not connected" notification is raised once
+# per outage rather than once per poll. notify-send is called without a replace
+# id, so an unthrottled notification does not update in place - it stacks a new
+# one every few seconds for as long as the link stays down.
+NETWORK_DOWN_FLAG="$CACHE_DIR/nix-update-network-down"
+
 # Set when a rebuild is detected, asking the next check to re-derive the
 # package-to-channel mapping. A request rather than a deletion, so it cannot
 # disturb a check already in progress.
@@ -1927,7 +1933,13 @@ main() {
     if [ "$in_grace" = false ] && ! check_network; then
         local updates
         updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
-        send_notification "updates-failed" "Update Check Failed" "Not connected to the internet"
+        # Once per outage, not once per poll. This branch is reached on every
+        # poll for as long as the link is down, and the notification carries no
+        # replace id, so notifying unconditionally stacks one every few seconds.
+        if [ ! -f "$NETWORK_DOWN_FLAG" ]; then
+            : > "$NETWORK_DOWN_FLAG"
+            send_notification "updates-failed" "Update Check Failed" "Not connected to the internet"
+        fi
         # A cost computed earlier is unaffected by the link being down, so it
         # is still shown rather than displaced by the failure line.
         build_preview_section
@@ -1937,6 +1949,10 @@ main() {
             "$(format_tooltip_header)\\n─────────────────────────────────────────────────\\n$body"
         exit 0
     fi
+    # Either the link is up or the grace period skipped the test. Clearing the
+    # latch here is what makes the next outage notify again, rather than the
+    # first one silencing every outage that follows it.
+    rm -f "$NETWORK_DOWN_FLAG"
 
     # Check interval
     local updates
