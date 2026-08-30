@@ -87,13 +87,34 @@ write_state() {
 NIX_DB="${NIX_DB:-/nix/var/nix/db/db.sqlite}"
 
 # Gaps longer than this are treated as a boundary between sessions rather than
-# one very slow derivation, and excluded from both history and rates.
+# one very slow derivation. A build legitimately takes minutes, so this has to
+# stay generous to keep real builds in the history.
 ESTIMATE_GAP_CAP="${ESTIMATE_GAP_CAP:-300}"
 
-# Effective substitution rate in MiB of nar per second, measured over the whole
-# span of a past download session. Deliberately not raw link speed: the span
-# includes the building that happens between fetches, which is what makes it
-# predict wall clock rather than transfer time.
+# The same cap for the substitution rate, where a gap is not work but the space
+# between two fetches. Measured on one store: 485 gaps in the 61-300s band -
+# 0.35% of all substituted paths - contributed 61% of the entire denominator,
+# and a third of that time had no local build running at all. It was idle
+# machine counted as transfer time, and it made the rate five times too slow.
+#
+# 5s is not a guess. Against a directly measured 1.35 MiB/s link (8 parallel
+# streams to cache.nixos.org, the fetch nix actually performs) the caps predict:
+# 2s over by 39%, 5s under by 12%, 10s under by 33%, 300s under by 5x.
+ESTIMATE_RATE_GAP_CAP="${ESTIMATE_RATE_GAP_CAP:-5}"
+
+# Effective substitution rate in MiB of nar per second.
+#
+# Nar bytes, not wire bytes, because the store database records narSize and has
+# no column for the compressed size - so this is the only rate history can
+# yield, and a job has to be expressed in the same unit to divide by it. That
+# holds exactly when a job compresses like past ones did; sampling 58 cached
+# paths from one store gave 3.64x against 2.94x for the job being priced, so
+# treat it as an assumption that mostly cancels rather than one that always does.
+#
+# A path registers only once it has been fetched, decompressed and written, so
+# all three are inside this figure. On the machine above decompression measured
+# ~420 MiB/s, under 1% of a fetch-bound job - but on a fast link and a slow CPU
+# it would dominate, and this rate absorbs either case without being told which.
 substitution_rate() {
     command -v sqlite3 >/dev/null 2>&1 || return 1
     sqlite3 "$NIX_DB" "
@@ -102,7 +123,7 @@ substitution_rate() {
                  registrationTime - LAG(registrationTime) OVER (ORDER BY registrationTime) AS gap
           FROM ValidPaths WHERE ultimate IS NULL OR ultimate = 0)
         SELECT ROUND(SUM(narSize)/1048576.0 / NULLIF(SUM(gap),0), 3)
-        FROM s WHERE gap IS NOT NULL AND gap <= $ESTIMATE_GAP_CAP;" 2>/dev/null
+        FROM s WHERE gap IS NOT NULL AND gap <= $ESTIMATE_RATE_GAP_CAP;" 2>/dev/null
 }
 
 # Sum of median historical build times for the given derivation names, plus how
@@ -173,10 +194,13 @@ summarise_plan() {
         return 0
     fi
 
-    # nix writes "1.2 GiB download, 3.8 GiB unpacked"; on a line that already
-    # says "download" the word is said twice, and it is the longest line here.
+    # nix writes "1.2 GiB download, 3.8 GiB unpacked". Both words go: the pair
+    # sits behind "to fetch & unpack" and reads off against it in order, and
+    # this was the longest line in the tooltip before the words came out.
     sizes=${sizes/ download,/,}
     sizes=${sizes% download}
+    sizes=${sizes% unpacked}
+    sizes=${sizes%% }
 
     # Counts first, as the summary: what the update is, before how long it
     # takes. Then one estimate per line, download before build - the order the
@@ -222,10 +246,14 @@ estimate_line() {
         esac
         local secs
         secs=$(awk -v m="$mib" -v r="$rate" 'BEGIN{ if (r>0) printf "%d", m/r }')
-        # The sizes ride with the download estimate, being what that estimate is
-        # computed from, rather than with the counts line.
+        # "download" named the one thing this figure is not computed from. The
+        # time comes from the unpacked size against a nar-domain rate, so a
+        # reader dividing the stated minutes into the download size got a rate
+        # five times too slow and reasonably concluded the number was broken.
+        # "fetch & unpack" says what the rate measures - transfer, decompression
+        # and the write - and puts the pair of sizes in the order it names them.
         [ -n "$secs" ] && [ "$secs" -gt 0 ] 2>/dev/null && \
-            parts+=("~$(human_duration "$secs") download${sizes:+ ($sizes)}")
+            parts+=("~$(human_duration "$secs") to fetch & unpack${sizes:+ ($sizes)}")
     fi
 
     # Build: sum of median historical times, with coverage stated. A low

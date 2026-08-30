@@ -323,6 +323,12 @@ escape_markup() {
 
 output_json() {
     local text="$1" alt="$2" tooltip="$3"
+    # Kept for the width measurement below, which has to run on what Pango will
+    # draw rather than on what is handed to it: escaping turns one & into the
+    # five characters of &amp;, and the rule was sized from the escaped text, so
+    # it overhung its content by four characters for every ampersand in the
+    # tooltip. Measured at 57 spaces under a 53-character line.
+    local raw="$tooltip"
     tooltip=$(escape_markup "$tooltip")
     # The tooltip is interpolated into a JSON string, so a double quote in a nix
     # error or a package name ends that string early and waybar gets malformed
@@ -335,7 +341,7 @@ output_json() {
         local -a lines=()
         local line
         while IFS= read -r line; do lines+=("$line"); done \
-            < <(printf '%s\n' "${tooltip//\\n/$'\n'}")
+            < <(printf '%s\n' "${raw//\\n/$'\n'}")
 
         # Width of the widest line, the rule's own line excluded. Counted in
         # characters, which needs a UTF-8 locale to be exact; under a C locale
