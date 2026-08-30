@@ -4,17 +4,23 @@
 { config, ... }:
 
 {
-  # Example 1: Basic Home Manager configuration (full mode - default)
+  # Example 1: Basic Home Manager configuration (lightweight mode - default)
   # Add this to your home-manager configuration
   programs.waybar-nixos-updates = {
     enable = true;
-    
+
     # Optional: Override default settings
-    updateInterval = 3600;              # Check every hour (in seconds)
+    updateInterval = 3600;              # Minimum time between checks (in seconds)
     nixosConfigPath = "~/.config/nixos"; # Path to your NixOS flake (used by both modes)
     skipAfterBoot = true;                # Don't check immediately after boot
     gracePeriod = 60;                    # Wait 60 seconds after boot before checking
-    updateLockFile = false;              # Use temporary directory for safety (full mode only)
+
+    # checkMode defaults to "lightweight": a nix eval that builds and downloads
+    # nothing. "full" is exact - it diffs the real closures with nvd - but gets
+    # that exactness by realising the new closure, so every check downloads and
+    # builds the whole pending update. Set it deliberately.
+    # checkMode = "full";
+    # updateLockFile = false;            # Use temporary directory for safety (full mode only)
   };
 
   # Example 1b: Lightweight mode - single channel (fast, simple)

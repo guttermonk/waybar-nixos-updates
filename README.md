@@ -38,33 +38,39 @@ When using the flake, all dependencies are automatically handled. The script req
 
 waybar-nixos-updates supports two update checking strategies:
 
-### Full Mode (Default)
-The original approach that performs a complete system closure build and diff:
-- Runs `nix flake update` + `nix build` + `nvd diff`
-- Detects all package changes including transitive dependencies
-- Shows added/removed packages
-- Takes several minutes to complete
-
-### Lightweight Mode
-A faster alternative using lazy Nix evaluation:
-- Compares `.version` attributes using a single `nix eval`
-- Completes in seconds rather than minutes
+### Lightweight Mode (Default)
+Resolves each package's `.version` attribute by lazy Nix evaluation and compares it against what is installed. **Nothing is built or downloaded.**
+- A single `nix eval`, no closure realisation
+- Around two minutes on a ~340-package configuration
 - Checks both NixOS system packages AND home-manager packages (auto-detected)
 - Supports single-channel or dual-channel (stable + unstable) configurations
 - ~80-85% attribute name coverage (some store paths don't map to nixpkgs attrs)
-- No transitive dependency tracking
+- No transitive dependency tracking: a package whose own version is unchanged but whose dependencies moved is not counted
 
-| Feature | Full | Lightweight |
+### Full Mode
+Exactly as accurate as a rebuild, because it *performs* one. It resolves a speculative lock, runs `nix build` on the new system closure, and diffs the result against the current system with `nvd`.
+- Runs `nix flake update` + `nix build` + `nvd diff`
+- Detects all package changes including transitive dependencies
+- Shows added/removed packages
+
+> [!WARNING]
+> **Full mode downloads and builds the entire pending update, on every scheduled check.** Its cost is the cost of the update itself, not of inspecting it — `nvd` can only diff store paths that exist, so the closure has to be realised first. On a large or long-deferred update that is gigabytes of traffic and many minutes of CPU, and it repeats every `updateInterval` until you actually rebuild. Don't enable it on a metered or slow connection.
+>
+> To find out what an update would cost *without* paying for it, use `dryRunPreview` (see Configuration Options) instead — it asks Nix for a build plan rather than executing one, on demand rather than on a timer.
+
+| | Lightweight (default) | Full |
 | --- | --- | --- |
-| Speed | Minutes (full build) | Seconds (lazy eval) |
-| Accuracy | Complete closure diff | Top-level packages only |
-| Transitive deps | ✓ | ✗ |
-| Added/removed pkgs | ✓ | ✗ |
-| Attr name coverage | 100% | ~80-85% |
+| Builds / downloads | **No** | **Yes — the whole update** |
+| Duration | ~2 min (evaluation) | As long as the update takes |
+| Bandwidth per check | none | up to the full update size |
+| Accuracy | Top-level packages only | Complete closure diff |
+| Transitive deps | ✗ | ✓ |
+| Added/removed pkgs | ✗ | ✓ |
+| Attr name coverage | ~80-85% | 100% |
 
 **Explicit Packages Filter**: When `CONFIG_DIR` is set, lightweight mode automatically enables `EXPLICIT_PACKAGES_ONLY` mode, which only reports updates for packages explicitly defined in your nix configuration files. This significantly reduces false positives from system dependencies and provides results closer to what full mode would report.
 
-Choose **lightweight** mode if you want quick, frequent checks and don't need to track transitive dependencies. Choose **full** mode if you need complete accuracy.
+**Lightweight** is the default and the right choice for almost everyone: it answers "is there anything to update?" without doing the update. Choose **full** only when you need a complete closure diff — transitive dependencies, added and removed packages — and are willing to pay the update's own cost on every check to get it.
 
 ## 🚀 How to Use
 
@@ -99,7 +105,7 @@ This provides the most flexibility for configuration:
   
   programs.waybar-nixos-updates = {
     enable = true;
-    checkMode = "lightweight";      # "full" (default) or "lightweight"
+    checkMode = "lightweight";      # "lightweight" (default) or "full" - see Check Modes
     updateInterval = 3600;          # Check every hour
     notifications = true;           # Set to false to disable desktop notifications
     
@@ -163,7 +169,7 @@ Two optional features are separate helper scripts that `update-checker` invokes 
 
 When using the Home Manager module, you can configure these options:
 
-- `checkMode`: Update check strategy - `"full"` (default) or `"lightweight"`
+- `checkMode`: Update check strategy - `"lightweight"` (default) or `"full"`. See **Check Modes** above — **`"full"` downloads and builds the whole pending update on every check.**
   - In lightweight mode, versions are compared with Nix's own ordering (`builtins.compareVersions`), so `5.3p9 → 5.3p15` is correctly an upgrade and `1.16.1 → 1.3.6` is not
   - A pending change where the channel is *behind* what you have installed is reported and marked `(downgrade)` rather than hidden — moving a package from `pkgs-unstable` to `pkgs` is a deliberate change worth seeing before you rebuild
 - `updateInterval`: Minimum time in seconds between update checks (default: 3600)
@@ -363,7 +369,7 @@ Here's a complete example of using waybar-nixos-updates with Home Manager:
             # Enable the waybar-nixos-updates module
             programs.waybar-nixos-updates = {
               enable = true;
-              checkMode = "lightweight";  # or "full" for complete accuracy
+              checkMode = "lightweight";  # default; "full" is exact but rebuilds every check
               updateInterval = 3600;
               notifications = true;       # set to false to disable notifications
               
@@ -466,7 +472,7 @@ No integration is required. The checker automatically detects both rebuilds and 
 
 #### Automatic Rebuild Detection
 The checker caches the `/run/current-system` path (in `nix-update-system-path`) and compares it on each run. When it changes, the system has been rebuilt. It then runs `nvd diff` on the two existing store paths — no building, since both closures already exist, though it is not instant either (~4s here) — to distinguish a real package update from a config-only rebuild:
-- **Package versions changed:** handled according to [`afterRebuild`](#configuration-options) — re-checked, reconciled against what the diff shows changed, or assumed applied.
+- **Package versions changed:** handled according to `afterRebuild` — re-checked, reconciled against what the diff shows changed, or assumed applied.
 - **Config-only rebuild:** the existing package state is preserved, so a config change doesn't clear a pending update count.
 
 #### Automatic Input-Update Detection

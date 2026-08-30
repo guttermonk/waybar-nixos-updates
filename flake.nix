@@ -263,12 +263,33 @@
               };
               
               checkMode = mkOption {
-                type = types.enum [ "full" "lightweight" ];
-                default = "full";
+                type = types.enum [ "lightweight" "full" ];
+                default = "lightweight";
                 description = ''
                   Update check strategy.
-                  "full" builds the new system closure and diffs with nvd (accurate, slow).
-                  "lightweight" uses lazy nix eval of .version attributes (fast, approximate).
+
+                  "lightweight" (default) resolves each package's .version attribute
+                  by lazy nix eval and compares it against what is installed. Nothing
+                  is built or downloaded. Fast - measured around two minutes - and
+                  approximate: it reports version differences, so a package whose
+                  version is unchanged but whose dependencies moved is not counted.
+
+                  "full" resolves a speculative lock and then *realises the closure* -
+                  it runs `nix build` on the new system and diffs it against the
+                  current one with nvd. That is exactly as accurate as a rebuild,
+                  because it performs the fetching and building a rebuild would, then
+                  reports what changed.
+
+                  The cost of "full" is therefore the cost of the update itself, not
+                  of inspecting it: every scheduled check downloads and builds the
+                  entire pending update in the background. On a large or long-deferred
+                  update that is gigabytes of traffic and many minutes of CPU, and it
+                  repeats on every updateInterval until you rebuild. Enable it
+                  deliberately, and not on a metered or slow connection.
+
+                  If you want to know what an update would cost without paying for it,
+                  see dryRunPreview - it asks nix for a build plan instead of executing
+                  one, on demand rather than on a timer.
                 '';
               };
               
