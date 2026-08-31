@@ -429,6 +429,12 @@
                   Off by default, and never runs on a timer: a preview is a full system
                   evaluation costing a few minutes and well over a gigabyte of memory.
                   Setting this back to false also clears any result already computed.
+
+                  A result is retired when your flake.lock changes, a check finds
+                  something different, or the packages your configuration declares
+                  change. A rebuild on its own only marks it - the stamp reads
+                  "pre-rebuild" and the numbers stay - because a rebuild that changed
+                  only settings moves the plan by far less than a recompute costs.
                 '';
                 recalculateOnChange = mkOption {
                   type = types.bool;
@@ -437,9 +443,10 @@
                     Recompute the cost by itself once it no longer describes anything,
                     instead of showing "middle-click to recalculate" and waiting.
 
-                    Triggers when your flake.lock changes, or when a check finds
-                    something different from what the cost was priced against. Not on a
-                    rebuild: what happens after one is already afterRebuild's business,
+                    Triggers when your flake.lock changes, when a check finds something
+                    different from what the cost was priced against, or when the
+                    packages your configuration declares change. Not on a rebuild
+                    alone: what happens after one is already afterRebuild's business,
                     and each option leads to a check whose result triggers this anyway.
 
                     Only ever refreshes a cost you already have. The first one is always

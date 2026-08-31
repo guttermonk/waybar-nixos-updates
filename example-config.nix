@@ -71,19 +71,26 @@
   #   checkMode = "lightweight";
   #   dryRunPreview.enable = true;
   #   # dryRunPreview.target = ".#nixosConfigurations.\${hostname}.config.system.build.toplevel";
-  #   # A stored cost stops being true when flake.lock changes or a check finds
-  #   # something different. By default it says so and waits for another
-  #   # middle-click; this recomputes it instead. Not on a rebuild - that is
-  #   # afterRebuild's business, below. Only ever refreshes a cost you already
-  #   # have, so the first one is still a middle-click, and every refresh after
-  #   # that costs the same few minutes as the first.
+  #   # A stored cost stops being true when flake.lock changes, a check finds
+  #   # something different, or you add or remove a package. By default it says
+  #   # so and waits for another middle-click; this recomputes it instead. Not
+  #   # on a rebuild alone - that is afterRebuild's business, below. Only ever
+  #   # refreshes a cost you already have, so the first one is still a
+  #   # middle-click, and every refresh costs the same few minutes as the first.
   #   # dryRunPreview.recalculateOnChange = true;
   # };
   #
   # Tooltip while calculating:  Update cost:
   #                             calculating... (~3 min)
   # Tooltip once complete:      Update cost (14:23):
-  #                             53 to download (46.9 MiB download, 159.8 MiB unpacked) · 21 to build
+  #                             621 to download · 62 to build
+  #                             ~26m to fetch & unpack (1.8 GiB, 5.3 GiB)
+  #                             ~16m+ build (48 timed of 62)
+  # Tooltip after a settings-   Update cost (14:23, pre-rebuild):
+  # only rebuild:               ...same numbers. A rebuild alone marks a cost rather
+  #                             than discarding it; middle-click to make it exact.
+  # Tooltip after adding or     Update cost:
+  # removing a package:         packages changed — middle-click to recalculate
 
   # Example 1h: What a detected rebuild does to the package count.
   # "recheck" (default) discards the old result and checks, so a rebuild that

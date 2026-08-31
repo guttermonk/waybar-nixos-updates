@@ -26,6 +26,11 @@ CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
 # untouched, and so is invisible to the other two staleness keys.
 RESULT_HASH_FILE="$CACHE_DIR/nix-update-result-hash"
 
+# Fingerprint of the packages the configuration declares. Adding or removing one
+# changes what a prospective update would cost; changing a setting on one does
+# not. Written by the checkers, which already parse the configuration for it.
+APP_LIST_HASH_FILE="$CACHE_DIR/nix-update-app-list-hash"
+
 # Cleanup is registered at top level rather than inside the function that
 # creates the directory: an EXIT trap runs after the function's locals are gone.
 tempdir=""
@@ -52,6 +57,10 @@ current_result_hash() {
     cat "$RESULT_HASH_FILE" 2>/dev/null
 }
 
+current_app_list_hash() {
+    cat "$APP_LIST_HASH_FILE" 2>/dev/null
+}
+
 # The state file is read by both checkers at output time. Values are written
 # one per line as key=value; cost is last because it is the only free-form one.
 write_state() {
@@ -63,6 +72,7 @@ write_state() {
         printf 'lock_hash=%s\n' "$(current_lock_hash)"
         printf 'system_path=%s\n' "$(current_system_path)"
         printf 'result_hash=%s\n' "$(current_result_hash)"
+        printf 'app_list_hash=%s\n' "$(current_app_list_hash)"
         # "<pid> <starttime> <boot id>" of the evaluating process while status
         # is calculating, so a reader can tell a live evaluation from one that
         # died without recording anything. The boot id is part of the identity

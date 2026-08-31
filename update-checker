@@ -117,6 +117,10 @@
     # Fingerprint of the last check's findings, used to expire a preview when
     # upstream moves. Written by the checker, read by the preview script.
     RESULT_HASH_FILE="$CACHE_DIR/nix-update-result-hash"
+    # Fingerprint of the packages the configuration declares, used to expire a
+    # preview when that set changes. Written by the checker, read by the preview
+    # script.
+    APP_LIST_HASH_FILE="$CACHE_DIR/nix-update-app-list-hash"
     # Result of the last update-cost preview, written by the preview script.
     PREVIEW_FILE="$CACHE_DIR/nix-update-preview"
 
@@ -583,6 +587,7 @@
         fi
 
         local status="" timestamp="" lock_hash="" system_path="" result_hash="" owner="" reason="" cost=""
+        local app_list_hash=""
         local key value
         while IFS='=' read -r key value; do
             case "$key" in
@@ -590,7 +595,7 @@
                 timestamp)   timestamp="$value" ;;
                 lock_hash)   lock_hash="$value" ;;
                 system_path) system_path="$value" ;;
-
+                app_list_hash) app_list_hash="$value" ;;
                 result_hash) result_hash="$value" ;;
                 owner)       owner="$value" ;;
                 reason)      reason="$value" ;;
@@ -633,8 +638,15 @@
                     # Upstream moved: the check now finds something different, so a cost
                     # priced against the old upstream no longer holds.
                     body="updates changed — middle-click to recalculate"
-                elif [ "$system_path" != "$live_system" ]; then
-                    body="outdated since rebuild — middle-click to recalculate"
+                elif [ -n "$app_list_hash" ] && \
+                     [ -n "$(cat "$APP_LIST_HASH_FILE" 2>/dev/null)" ] && \
+                     [ "$app_list_hash" != "$(cat "$APP_LIST_HASH_FILE" 2>/dev/null)" ]; then
+                    # A package was added to or removed from the configuration,
+                    # which adds or drops a whole closure from the plan. Both
+                    # sides are required to be non-empty: a missing hash means
+                    # the extraction has not run or found nothing, which is not
+                    # evidence of a change.
+                    body="packages changed — middle-click to recalculate"
                 else
                     local when=""
                     if [ -n "$timestamp" ] && [ "$timestamp" != "0" ]; then
@@ -643,6 +655,24 @@
                         else
                             when=$(date -d "@$timestamp" "+%H:%M" 2>/dev/null)
                         fi
+                    fi
+                    # A rebuild marks the cost rather than discarding it. The
+                    # number is stale by however much the rebuild changed the
+                    # closure, which for a config-only rebuild is a few
+                    # config-file derivations against a plan of hundreds of paths
+                    # - well inside the accuracy already claimed for it. The one
+                    # case that bites is a config change adding a package: the
+                    # rebuild makes it resident, so the plan shrinks and the
+                    # stored figure overestimates. That is the safe direction for
+                    # a number already reported as a floor, and cheaper than
+                    # throwing away a three-minute evaluation.
+                    #
+                    # Not a staleness reason, deliberately. recalculateOnChange
+                    # ignores system_path, so treating it as one here would leave
+                    # a config-only rebuild in a state nothing recovers from
+                    # except a click - see maybe_auto_preview.
+                    if [ "$system_path" != "$live_system" ]; then
+                        when="${when:+$when, }pre-rebuild"
                     fi
                     PREVIEW_SECTION="Update cost${when:+ ($when)}:\n$cost"
                     return 0
@@ -672,13 +702,14 @@
         [ "$DRY_RUN_PREVIEW" = "true" ] || return 0
         [ -f "$PREVIEW_FILE" ] || return 0
 
-        local status="" lock_hash="" result_hash=""
+        local status="" lock_hash="" result_hash="" app_list_hash=""
         local key value
         while IFS='=' read -r key value; do
             case "$key" in
-                status)      status="$value" ;;
-                lock_hash)   lock_hash="$value" ;;
-                result_hash) result_hash="$value" ;;
+                status)        status="$value" ;;
+                lock_hash)     lock_hash="$value" ;;
+                result_hash)   result_hash="$value" ;;
+                app_list_hash) app_list_hash="$value" ;;
             esac
         done < "$PREVIEW_FILE"
         # Anything but a completed preview is either already running or a
@@ -687,16 +718,19 @@
         # provokes.
         [ "$status" = "done" ] || return 0
 
-        # Two of the three staleness keys, deliberately not the third: a rebuild
-        # moves system_path, and what to do after a rebuild is already the
-        # user's choice. Every afterRebuild option settles into a check whose
-        # findings move result_hash anyway, so the cost still refreshes when it
-        # genuinely changed, without pricing each rebuild as an event in its own
-        # right - which in this mode would mean building the closure again.
-        local live_lock
+        # Every staleness key except system_path, deliberately: a rebuild moves
+        # that one, and what to do after a rebuild is already the user's choice.
+        # Every afterRebuild option settles into a check whose findings move
+        # result_hash anyway, so the cost still refreshes when it genuinely
+        # changed, without pricing each rebuild as an event in its own right -
+        # which in this mode would mean building the closure again.
+        local live_lock live_app_list
         live_lock=$(sha256sum "$NIXOS_CONFIG_PATH/flake.lock" 2>/dev/null | cut -d' ' -f1)
+        live_app_list=$(cat "$APP_LIST_HASH_FILE" 2>/dev/null)
         if [ "$lock_hash" = "$live_lock" ] && \
-           [ "$result_hash" = "$(cat "$RESULT_HASH_FILE" 2>/dev/null)" ]; then
+           [ "$result_hash" = "$(cat "$RESULT_HASH_FILE" 2>/dev/null)" ] && \
+           { [ -z "$app_list_hash" ] || [ -z "$live_app_list" ] || \
+             [ "$app_list_hash" = "$live_app_list" ]; }; then
             return 0
         fi
 
@@ -1032,6 +1066,7 @@
         fi
     
         write_result_hash
+        write_app_list_hash
         return 0
     }
 
@@ -1042,6 +1077,57 @@
     # check reports is the observable signal that upstream moved.
     function write_result_hash() {
         sha256sum "$LAST_RUN_TOOLTIP" 2>/dev/null | cut -d' ' -f1 > "$RESULT_HASH_FILE"
+    }
+
+    # The packages the configuration declares, as a sorted list. Kept in step
+    # with the lightweight checker's copy of the same function - full mode does
+    # no config parsing of its own, so this exists here only to fingerprint the
+    # declared set for the preview.
+    function extract_explicit_packages() {
+        local config_dir="$1"
+        local filter_pattern='^(done|else|fi|echo|then|in|let|true|false|null|if|with|import|inherit|rec|self|super|builtins|lib|pkgs|config|options|args|inputs|outputs|system|name|value|enable|default|description|type|example|services|programs|environment|systemd|networking|users|boot|hardware|security|nixpkgs|home|fonts|xdg|prev|final|old|new|src|version|meta|license|homepage|maintainers|platforms|broken|sha256|hash|url|owner|repo|rev|fetchurl|fetchgit|fetchFromGitHub|mkDerivation|stdenv|buildInputs|nativeBuildInputs|propagatedBuildInputs|checkInputs|installPhase|buildPhase|configurePhase|postInstall|preInstall|postBuild|preBuild|makeWrapper|wrapProgram|substituteInPlace|patchShebangs|autoPatchelfHook|pkg|drv|result|override|overrideAttrs|callPackage|writeText|writeScript|writeShellScript|runCommand|symlinkJoin|makeDesktopItem|copyDesktopItems|wrapGAppsHook)$'
+
+        {
+            # Bare identifiers on their own lines, e.g. "  brave  # comment"
+            find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+            xargs -0 grep -hE '^\s*[a-z][a-zA-Z0-9_-]*\s*(#.*)?$' 2>/dev/null | \
+            sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//'
+
+            # Overlay definitions, e.g. "brave = prev.brave.override"
+            find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+            xargs -0 grep -hE '^\s*[a-z][a-zA-Z0-9_-]+\s*=\s*(prev|final|old)\.[a-z]' 2>/dev/null | \
+            sed 's/^\s*//; s/\s*=.*//'
+
+            # Package references, e.g. "pkgs.brave" or "pkgs-unstable.yt-dlp"
+            find "$config_dir" -name "*.nix" -type f -print0 2>/dev/null | \
+            xargs -0 grep -hoE '(pkgs|pkgs-unstable|pkgs-stable)\.[a-z][a-zA-Z0-9_-]+' 2>/dev/null | \
+            sed 's/^[^.]*\.//'
+        } | \
+        grep -v '^\s*$' | \
+        grep -vE "$filter_pattern" | \
+        sort -u
+    }
+
+    # Fingerprint of the packages the configuration declares. This is the key
+    # that tells a package being added or removed apart from a setting being
+    # changed on one already there - a distinction /run/current-system cannot
+    # make, since every rebuild moves it, and nvd cannot make either: it reports
+    # added packages for config-generated systemd units and for transitive
+    # dependencies pulled in by ordinary upgrades.
+    #
+    # The extraction is a heuristic and its absolute contents are noisy, which
+    # does not matter here: only whether it changed does, and a stable false
+    # positive cancels. Roughly half a second over a hundred files, so it runs
+    # once per check rather than per render.
+    function write_app_list_hash() {
+        local list
+        list=$(extract_explicit_packages "$NIXOS_CONFIG_PATH" 2>/dev/null)
+        # An empty result means the extraction found nothing to look at rather
+        # than that the configuration declares nothing. Writing it would read as
+        # a change and retire a preview for no reason, so leave the last good
+        # value in place.
+        [ -n "$list" ] || return 0
+        printf '%s\n' "$list" | sha256sum | cut -d' ' -f1 > "$APP_LIST_HASH_FILE"
     }
 
     # ===== Toggle Function =====
@@ -1119,6 +1205,11 @@
     # ===== Main Function =====
     function main() {
         init_files
+
+        # Establish the app-list fingerprint before anything can stamp a preview
+        # with an empty one. Checks maintain it from here on; this only covers
+        # the first poll on a new machine, and costs its half second once.
+        [ -s "$APP_LIST_HASH_FILE" ] || write_app_list_hash
 
         # Check if update checking is disabled via toggle
         if [ -f "$TOGGLE_FILE" ] && [ "$(cat "$TOGGLE_FILE")" = "disabled" ]; then
