@@ -178,7 +178,9 @@
   # tooltip rather than compared, because a commit never equals a tag name and
   # the check would otherwise show an update on every run. The same rule
   # applies to hand-written "revision", "tag" and "local" sources - it just
-  # bites more easily here, where you never see the pin.
+  # bites more easily here, where you never see the pin. A tag policy also
+  # checks the current value is a tag upstream really has, so a branch name,
+  # a short revision or a typo is reported rather than compared forever.
   #
   # tagPattern matters more here than it does for a hand-written pin, because
   # you are no longer writing the tag out and noticing its shape. A repository

@@ -214,6 +214,13 @@ When using the Home Manager module, you can configure these options:
     ```
     This applies to `revision`, `tag`, `local` and `package` alike. `flake-input` is exempt: it picks its current value from the policy, so it is consistent by construction.
     - **Behavior change.** A config with one of these pairings previously showed a permanent phantom update, and one set to `mode = "count"` was inflating the waybar badge by one. Both now become a tooltip line that doesn't count. If your count drops by one after upgrading, this is why — the check was never valid, and the tooltip now says so.
+  - **A `tag` policy also verifies the current value is actually a tag upstream.** The shape rule rules out a commit, but a tag policy can still be handed something that only looks like a tag: a branch name from a flake input's `ref`, an abbreviated revision, a typo, or a tag renamed or deleted upstream. Each compares unequal to every real tag forever — the same permanent phantom update, in a shape no syntactic test can catch:
+    ```
+    hyprland ("main" is not a tag upstream)
+    my-pin ("v0.70.99" is not a tag upstream)
+    ```
+    This closes the one gap the shape rule leaves, including `flake-input` with `policy = "tag"` where the input tracks a branch rather than a release. It costs nothing extra: the tag list is already fetched to find the latest, so a tag policy is still a single `ls-remote`.
+    - Membership is tested against **every** tag, not just the ones `tagPattern` admits — so deliberately sitting on an older release line (`tag = "0.24.0"` with `tagPattern = "v*"`) still compares normally rather than being reported as broken.
   - **`current = "package"` reads the pin instead of restating it.** Give it an `attribute` (`"codex"`, or a dotted path like `"python3Packages.foo"`) and it evaluates that package's `src`, taking both the current revision and the `repository` from it — so the pin lives only in the package expression, and only the upstream policy is configured here:
     ```nix
     sourceChecks = [{

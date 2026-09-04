@@ -47,13 +47,19 @@ remote_revision() {
     ls_remote "$repository" "$remote_ref" | awk 'NR == 1 { print $1 }'
 }
 
+# The upstream tag list, one bare tag per line. Fetched once per check and
+# passed to latest_tag: the membership test below reads the same list, so a tag
+# policy still costs a single ls-remote no matter how much is asked of it.
+remote_tags() {
+    ls_remote --tags --refs "$1" | awk '{ sub("refs/tags/", "", $2); print $2 }'
+}
+
 latest_tag() {
-    local repository="$1"
+    local tags="$1"
     local include_pattern="$2"
     local excluded_json="$3"
 
-    ls_remote --tags --refs "$repository" \
-        | awk '{ sub("refs/tags/", "", $2); print $2 }' \
+    printf '%s\n' "$tags" \
         | while IFS= read -r tag; do
             [[ "$tag" == $include_pattern ]] || continue
             excluded=false
@@ -325,8 +331,30 @@ main() {
                 upstream=$(remote_revision "$repository" "$ref")
                 ;;
             tag)
+                local tags
+                tags=$(remote_tags "$repository")
+                if [[ -z "$tags" ]]; then
+                    add_line "$name (upstream unreachable)"
+                    continue
+                fi
+
+                # The shape guard above rules out a commit, but a tag policy
+                # can still be handed something that merely looks like a tag
+                # and is not one: a branch name from a flake input's ref, an
+                # abbreviated revision, a tag that was renamed or deleted
+                # upstream, or a typo. Each compares unequal to every real tag
+                # forever, which is the same permanent phantom update in a
+                # shape no syntactic test can catch. The list is already here,
+                # so ask it. Matched against every tag rather than the ones
+                # tagPattern admits, so that deliberately moving between
+                # release lines is not mistaken for a broken check.
+                if ! grep -qxF -- "$current" <<<"$tags"; then
+                    add_line "$name (\"$current\" is not a tag upstream)"
+                    continue
+                fi
+
                 upstream=$(latest_tag \
-                    "$repository" \
+                    "$tags" \
                     "$(jq -r '.tagPattern // "*"' <<<"$check")" \
                     "$(jq -c '.excludeTagPatterns // []' <<<"$check")")
                 ;;

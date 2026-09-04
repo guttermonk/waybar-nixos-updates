@@ -507,6 +507,12 @@
                   than compared. flake-input is exempt, taking its current value from the
                   policy and so consistent by construction.
 
+                  A tag policy goes further and checks that the current value is a tag the
+                  upstream actually has, which catches what the shape rule cannot: a branch
+                  name from a flake input's ref, an abbreviated revision, a typo, or a tag
+                  renamed away. The tag list is already fetched to find the latest, so this
+                  costs no additional ls-remote.
+
                   current = "package" derives both the pin and the repository from a package
                   attribute's src instead of restating them here, leaving only the upstream
                   policy to configure. It costs one nix eval per package check - measured
