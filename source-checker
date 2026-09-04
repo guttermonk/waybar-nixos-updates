@@ -18,6 +18,12 @@ SOURCE_CHECKS_JSON="${SOURCE_CHECKS_JSON-[]}"
 # default leaves headroom without being open-ended.
 SOURCE_CHECK_TIMEOUT="${SOURCE_CHECK_TIMEOUT:-60}"
 
+# Ceiling for the nix eval behind current = "package". Reading one attribute
+# out of an already-evaluated configuration measures around 4s warm; the
+# ceiling is for the cold case, and stops a package whose expression loops or
+# blocks from holding the worker lock open indefinitely.
+PACKAGE_EVAL_TIMEOUT="${PACKAGE_EVAL_TIMEOUT:-120}"
+
 json_result() {
     jq -cn --argjson count "$1" --argjson shown "$2" --arg tooltip "$3" \
         '{count: $count, shown: $shown, tooltip: $tooltip}'
@@ -73,32 +79,155 @@ flake_input_node() {
     ' "$FLAKE_DIR/flake.lock" 2>/dev/null
 }
 
+# Set by current_value(): the resolved current revision or tag.
+CURRENT_VALUE=""
+# Set by current_value() for current = "package": the upstream repository read
+# out of the package's own src, used when the check does not name one itself.
+DERIVED_REPOSITORY=""
+# Set by current_value() when it fails, so a missing attribute, a src with no
+# revision in it and a typo'd input name do not all report the same thing.
+CURRENT_ERROR=""
+
+# Set by package_pin(): the rev, tag and repository read out of a package's src.
+PACKAGE_PIN=""
+
+# Attribute prefixes that hold a configuration's package set, tried in order.
+# Resolved once per run and reused: probing costs a nix eval per candidate, and
+# every package check after the first would otherwise pay for it again.
+PACKAGE_BASE=""
+
+package_bases() {
+    if [[ -n "$PACKAGE_BASE" ]]; then
+        printf '%s\n' "$PACKAGE_BASE"
+        return
+    fi
+
+    # Read rather than shelled out to, because "hostname" comes from inetutils
+    # and only one of the two checker wrappers puts it on PATH.
+    local host user
+    host=$(< /proc/sys/kernel/hostname)
+    user="${USER:-$(id -un)}"
+
+    printf '%s\n' \
+        "nixosConfigurations.$host.pkgs" \
+        "homeConfigurations.$user@$host.pkgs" \
+        "homeConfigurations.$user.pkgs" \
+        "legacyPackages.$(uname -m)-linux"
+}
+
+# Reads the pin out of a package's own src. fetchFromGitHub and its siblings
+# pass rev, tag and gitRepoUrl through to the fetched derivation, and those
+# survive overrideAttrs - so what comes back is the pin the configuration
+# actually builds, not whatever nixpkgs happens to ship.
+#
+# The whole probe is forced inside tryEval: a src that throws when evaluated is
+# a package that cannot be checked, not a checker that crashes. Nothing is
+# forced outside it, which is why the isAttrs test lives inside too.
+#
+# Sets PACKAGE_PIN rather than printing it, so that the resolved PACKAGE_BASE
+# survives: called through a command substitution the memoisation would be
+# written in a subshell and every later check would re-probe every candidate.
+package_pin() {
+    local attribute="$1"
+    local base output
+
+    PACKAGE_PIN=""
+
+    while IFS= read -r base; do
+        output=$(timeout "$PACKAGE_EVAL_TIMEOUT" nix eval --json \
+            "$FLAKE_DIR#$base.$attribute" --apply '
+                package:
+                let
+                  none = { rev = null; tag = null; repository = null; };
+                  probe =
+                    let src = package.src or null; in
+                    if builtins.isAttrs src then {
+                      rev = src.rev or null;
+                      tag = src.tag or null;
+                      repository = src.gitRepoUrl or null;
+                    } else none;
+                  result = builtins.tryEval (builtins.deepSeq probe probe);
+                in
+                if result.success then result.value else none
+            ' 2>/dev/null) || continue
+        [[ -n "$output" ]] || continue
+        PACKAGE_BASE="$base"
+        PACKAGE_PIN="$output"
+        return 0
+    done < <(package_bases)
+
+    return 1
+}
+
+is_revision() {
+    [[ "$1" =~ ^[0-9a-fA-F]{40}$ ]]
+}
+
+# Sets CURRENT_VALUE rather than printing it. The package case has to report a
+# derived repository and a specific failure alongside the value, and a command
+# substitution runs in a subshell where those assignments would be discarded.
 current_value() {
     local check="$1"
     local current_type
     current_type=$(jq -r '.current' <<<"$check")
 
+    CURRENT_VALUE=""
+
     case "$current_type" in
+        package)
+            local attribute rev tag
+            attribute=$(jq -r '.attribute // empty' <<<"$check")
+            if [[ -z "$attribute" ]]; then
+                CURRENT_ERROR="no package attribute configured"
+                return 1
+            fi
+
+            if ! package_pin "$attribute"; then
+                CURRENT_ERROR="package \"$attribute\" not found"
+                return 1
+            fi
+
+            DERIVED_REPOSITORY=$(jq -r '.repository // empty' <<<"$PACKAGE_PIN")
+            rev=$(jq -r '.rev // empty' <<<"$PACKAGE_PIN")
+            tag=$(jq -r '.tag // empty' <<<"$PACKAGE_PIN")
+
+            # A tarball or vendored src carries no pin at all. Reported rather
+            # than skipped: silently passing would be indistinguishable from a
+            # package that is genuinely up to date.
+            if [[ -z "$rev" && -z "$tag" ]]; then
+                CURRENT_ERROR="no revision in \"$attribute\" src"
+                return 1
+            fi
+
+            # fetchFromGitHub writes the tag into rev as "refs/tags/v1.2.3"
+            # when called with rev, and sets tag separately when called with
+            # tag. Either way the comparable value is the bare tag.
+            if [[ -n "$tag" ]]; then
+                CURRENT_VALUE="$tag"
+            else
+                CURRENT_VALUE="${rev#refs/tags/}"
+            fi
+            ;;
         flake-input)
             local node
             node=$(flake_input_node "$(jq -r '.input' <<<"$check")") || return 1
             if [[ "$(jq -r '.policy' <<<"$check")" == "tag" ]]; then
-                jq -r '.original.ref // empty' <<<"$node"
+                CURRENT_VALUE=$(jq -r '.original.ref // empty' <<<"$node")
             else
-                jq -r '.locked.rev // empty' <<<"$node"
+                CURRENT_VALUE=$(jq -r '.locked.rev // empty' <<<"$node")
             fi
             ;;
         local)
             local path
             path=$(jq -r '.path' <<<"$check")
             path=${path/#\~/$HOME}
-            git -C "$path" rev-parse HEAD 2>/dev/null
+            CURRENT_VALUE=$(git -C "$path" rev-parse HEAD 2>/dev/null)
             ;;
         revision)
-            jq -r '.revision // empty' <<<"$check"
+            CURRENT_VALUE=$(jq -r '.revision // empty' <<<"$check")
             ;;
         tag)
-            jq -r '.tag // empty' <<<"$check"
+            CURRENT_VALUE=$(jq -r '.tag // empty' <<<"$check")
             ;;
         *)
             return 1
@@ -141,14 +270,43 @@ main() {
         mode=$(jq -r '.mode' <<<"$check")
         [[ "$mode" == "disabled" ]] && continue
 
-        local name repository policy ref current upstream
+        local name repository policy ref current upstream current_type
         name=$(jq -r '.name' <<<"$check")
-        repository=$(jq -r '.repository' <<<"$check")
+        repository=$(jq -r '.repository // empty' <<<"$check")
         policy=$(jq -r '.policy' <<<"$check")
+        current_type=$(jq -r '.current' <<<"$check")
 
-        if ! current=$(current_value "$check") || [[ -z "$current" || "$current" == "null" ]]; then
-            add_line "$name (current revision not found)"
+        DERIVED_REPOSITORY=""
+        CURRENT_ERROR="current revision not found"
+        if ! current_value "$check" || [[ -z "$CURRENT_VALUE" || "$CURRENT_VALUE" == "null" ]]; then
+            add_line "$name ($CURRENT_ERROR)"
             continue
+        fi
+        current="$CURRENT_VALUE"
+
+        # A check may name its own repository - forks are the whole reason to
+        # track an upstream other than the one the package fetches from - and
+        # only falls back to the one read out of the package when it does not.
+        [[ -n "$repository" && "$repository" != "null" ]] || repository="$DERIVED_REPOSITORY"
+        if [[ -z "$repository" ]]; then
+            add_line "$name (no upstream repository configured)"
+            continue
+        fi
+
+        # Only for derived pins. Where the pin was written out by hand the
+        # policy that goes with it was too, and second-guessing a stated
+        # intent is not this checker's job; a derived pin has no such
+        # statement behind it, and comparing a commit against a tag name (or
+        # the reverse) would report an update on every single run.
+        if [[ "$current_type" == "package" ]]; then
+            if [[ "$policy" == "branch" ]] && ! is_revision "$current"; then
+                add_line "$name (pinned to \"$current\", branch policy needs a revision)"
+                continue
+            fi
+            if [[ "$policy" == "tag" ]] && is_revision "$current"; then
+                add_line "$name (pinned to a revision, tag policy needs a tag)"
+                continue
+            fi
         fi
 
         case "$policy" in

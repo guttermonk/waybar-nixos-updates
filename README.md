@@ -204,9 +204,26 @@ When using the Home Manager module, you can configure these options:
   - `"show"`: Check and show in separate "Pinned:" section, but don't count
   - `"count"`: Check, show, and include in waybar count
   - Pinned inputs are those with `original.rev` set in flake.lock
-- `sourceChecks`: Explicit upstream policies for sources the package and input checks can't interpret on their own — fixed revisions in package expressions, local checkouts, named release lines, and forks. Each entry states a current source (`flake-input`, `revision`, `tag`, or `local`), an upstream `repository`, and a `policy` of `branch` or `tag`, so intent is declared rather than guessed. Set `mode` per entry to `"disabled"`, `"show"`, or `"count"`.
+- `sourceChecks`: Explicit upstream policies for sources the package and input checks can't interpret on their own — fixed revisions in package expressions, local checkouts, named release lines, and forks. Each entry states a current source (`flake-input`, `package`, `revision`, `tag`, or `local`), an upstream `repository`, and a `policy` of `branch` or `tag`, so intent is declared rather than guessed. Set `mode` per entry to `"disabled"`, `"show"`, or `"count"`.
   - Checks run `git ls-remote`, bounded by `SOURCE_CHECK_TIMEOUT` (default 60s) per call, and are skipped entirely when there is no default route
   - Misconfiguration is reported in the tooltip rather than passing silently: `current revision not found`, `upstream unreachable`, `unknown policy`, `Invalid sourceChecks configuration`
+  - **`current = "package"` reads the pin instead of restating it.** Give it an `attribute` (`"codex"`, or a dotted path like `"python3Packages.foo"`) and it evaluates that package's `src`, taking both the current revision and the `repository` from it — so the pin lives only in the package expression, and only the upstream policy is configured here:
+    ```nix
+    sourceChecks = [{
+      name = "codex";
+      mode = "count";
+      current = "package";
+      attribute = "codex";
+      policy = "tag";
+      tagPattern = "rust-v*";
+    }];
+    ```
+    - Works for sources fetched with `fetchFromGitHub`, `fetchFromGitLab`, `fetchFromGitea` or `fetchgit`, all of which pass `rev`/`tag` and `gitRepoUrl` through to the fetched derivation. A release tarball or a vendored source carries no revision and is reported as `no revision in "<attr>" src` rather than passing silently.
+    - Costs one `nix eval` per package check — measured around 4s warm — bounded by `PACKAGE_EVAL_TIMEOUT` (default 120s).
+    - **`overrideAttrs` is recognised through an overlay, not inline.** The attribute is resolved by name against the configuration's own package set (`nixosConfigurations.<host>.pkgs`, then `homeConfigurations.<user>.pkgs`), so an overlay that pins a source is read correctly. An `overrideAttrs` applied at the point of use — inside `environment.systemPackages` or `home.packages` — is not reachable by name, and the check would read the unpinned nixpkgs version and compare the wrong thing. Pin through an overlay.
+    - The `policy` must match the shape of the pin: `"tag"` for a src pinned to a tag, `"branch"` for one pinned to a commit. A mismatch is reported (`pinned to "v1.2.3", branch policy needs a revision`) rather than compared, since a commit never equals a tag name and the check would otherwise show an update on every run.
+    - `tagPattern` matters more here than for a hand-written pin, because you never see the tag's shape. A repository that tags subcrates alongside releases — ripgrep tags `wincolor-0.1.6` — returns the wrong "latest" under the default `"*"`. Anchor the pattern to the release line the package follows.
+    - Setting `repository` explicitly still wins, which is how you track a fork's upstream rather than the URL the package fetches from.
   - Only an *unset* `SOURCE_CHECKS_JSON` means "no checks configured". An empty or malformed value is reported as invalid rather than read as an empty list, so a broken environment can't look like a clean result
 
 **Both modes:**

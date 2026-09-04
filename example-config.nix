@@ -146,6 +146,50 @@
   #   ];
   # };
 
+  # Example 1g: Reading the pin out of a package instead of restating it.
+  # current = "package" evaluates the attribute's src and takes both the
+  # revision and the repository from it, so a pin lives in one place - the
+  # package expression - and only the upstream policy is configured here.
+  # programs.waybar-nixos-updates = {
+  #   enable = true;
+  #   checkMode = "lightweight";
+  #   sourceChecks = [
+  #     {
+  #       name = "codex";
+  #       mode = "count";
+  #       current = "package";
+  #       attribute = "codex";    # resolved against the configuration's pkgs
+  #       policy = "tag";         # src is pinned to a tag, so ask for newer tags
+  #       tagPattern = "rust-v*";
+  #     }
+  #     {
+  #       name = "some-tool (tracking main)";
+  #       mode = "show";
+  #       current = "package";
+  #       attribute = "some-tool";
+  #       policy = "branch";      # src is pinned to a commit, so ask if main moved
+  #       ref = "main";
+  #     }
+  #   ];
+  # };
+  #
+  # The policy has to match the shape of the pin: "tag" for a src pinned to a
+  # tag, "branch" for one pinned to a commit. A mismatch is reported in the
+  # tooltip rather than compared, because a commit never equals a tag name and
+  # the check would otherwise show an update on every run.
+  #
+  # tagPattern matters more here than it does for a hand-written pin, because
+  # you are no longer writing the tag out and noticing its shape. A repository
+  # that tags subcrates alongside releases (ripgrep tags "wincolor-0.1.6") will
+  # hand back the wrong "latest" under the default "*". Anchor the pattern to
+  # the release line the package actually follows.
+  #
+  # The attribute is looked up by name, so an overlay that pins a source is
+  # read correctly. An overrideAttrs applied inline in home.packages or
+  # environment.systemPackages is not reachable by name - the check would read
+  # the unpinned nixpkgs version and quietly compare the wrong thing. Pin
+  # through an overlay if you want this to be accurate.
+
   # Example 1d: With flake input staleness checking
   # Combines package updates with stale input detection in one tooltip
   # programs.waybar-nixos-updates = {

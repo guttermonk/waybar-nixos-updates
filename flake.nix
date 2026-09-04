@@ -203,13 +203,28 @@
                   description = "Whether to skip this check, show it only, or also add it to the waybar count.";
                 };
                 current = mkOption {
-                  type = types.enum [ "flake-input" "revision" "tag" "local" ];
+                  type = types.enum [ "flake-input" "package" "revision" "tag" "local" ];
                   description = "Where the currently configured version comes from.";
                 };
                 input = mkOption {
                   type = types.nullOr types.str;
                   default = null;
                   description = "Flake input name, when current = \"flake-input\".";
+                };
+                attribute = mkOption {
+                  type = types.nullOr types.str;
+                  default = null;
+                  example = "codex";
+                  description = ''
+                    Package attribute to read the pin out of, when current = "package".
+                    Dotted paths work ("python3Packages.foo").
+
+                    The attribute is resolved against the configuration's own package set,
+                    so an overlay that pins a source is what gets read. An overrideAttrs
+                    applied at the point of use - inside environment.systemPackages or
+                    home.packages - is not reachable by name and will read the unpinned
+                    nixpkgs version instead. Pin through an overlay for this to be correct.
+                  '';
                 };
                 revision = mkOption {
                   type = types.nullOr types.str;
@@ -227,8 +242,16 @@
                   description = "Local git checkout, when current = \"local\".";
                 };
                 repository = mkOption {
-                  type = types.str;
-                  description = "Canonical upstream Git repository URL to compare against.";
+                  type = types.nullOr types.str;
+                  default = null;
+                  description = ''
+                    Canonical upstream Git repository URL to compare against.
+
+                    Required for every source except current = "package", which reads it
+                    from the package's own src. Set it there too to track a different
+                    upstream than the one the package fetches from, which is the usual
+                    case for a fork.
+                  '';
                 };
                 policy = mkOption {
                   type = types.enum [ "branch" "tag" ];
@@ -476,6 +499,14 @@
                   rather than guessed. Checks run git ls-remote against the upstream repository,
                   bounded by SOURCE_CHECK_TIMEOUT (default 60s) per call, and are skipped
                   entirely when there is no network.
+
+                  current = "package" derives both the pin and the repository from a package
+                  attribute's src instead of restating them here, leaving only the upstream
+                  policy to configure. It costs one nix eval per package check - measured
+                  around 4s warm - bounded by PACKAGE_EVAL_TIMEOUT (default 120s), and
+                  reads sources fetched with
+                  fetchFromGitHub, fetchFromGitLab, fetchFromGitea or fetchgit. A release
+                  tarball or a vendored source carries no revision and is reported as such.
                 '';
               };
 
