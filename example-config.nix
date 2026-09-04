@@ -176,7 +176,9 @@
   # The policy has to match the shape of the pin: "tag" for a src pinned to a
   # tag, "branch" for one pinned to a commit. A mismatch is reported in the
   # tooltip rather than compared, because a commit never equals a tag name and
-  # the check would otherwise show an update on every run.
+  # the check would otherwise show an update on every run. The same rule
+  # applies to hand-written "revision", "tag" and "local" sources - it just
+  # bites more easily here, where you never see the pin.
   #
   # tagPattern matters more here than it does for a hand-written pin, because
   # you are no longer writing the tag out and noticing its shape. A repository

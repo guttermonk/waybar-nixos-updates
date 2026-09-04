@@ -293,18 +293,27 @@ main() {
             continue
         fi
 
-        # Only for derived pins. Where the pin was written out by hand the
-        # policy that goes with it was too, and second-guessing a stated
-        # intent is not this checker's job; a derived pin has no such
-        # statement behind it, and comparing a commit against a tag name (or
-        # the reverse) would report an update on every single run.
-        if [[ "$current_type" == "package" ]]; then
+        # The comparison below is only meaningful when both sides are the same
+        # kind of thing: a branch policy resolves upstream to a commit, a tag
+        # policy to a tag name, and a commit never equals a tag name. A check
+        # whose current value has the wrong shape therefore reports an update
+        # on every single run, forever, and no rebuild can ever clear it.
+        #
+        # Applied to hand-written pins as well as derived ones. That the policy
+        # beside a hand-written pin was also chosen by hand makes the pairing
+        # deliberate, not correct - the two combinations caught here have no
+        # reading under which the comparison does what the user meant, so this
+        # reports a stated intent that cannot be carried out rather than
+        # silently carrying out something else. The check is skipped for
+        # flake-input, which picks its current value from the policy and is
+        # consistent by construction.
+        if [[ "$current_type" != "flake-input" ]]; then
             if [[ "$policy" == "branch" ]] && ! is_revision "$current"; then
-                add_line "$name (pinned to \"$current\", branch policy needs a revision)"
+                add_line "$name (branch policy needs a revision, got \"$current\")"
                 continue
             fi
             if [[ "$policy" == "tag" ]] && is_revision "$current"; then
-                add_line "$name (pinned to a revision, tag policy needs a tag)"
+                add_line "$name (tag policy needs a tag, got a revision)"
                 continue
             fi
         fi

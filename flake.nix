@@ -500,6 +500,13 @@
                   bounded by SOURCE_CHECK_TIMEOUT (default 60s) per call, and are skipped
                   entirely when there is no network.
 
+                  The policy has to match the shape of the current value: "branch" resolves
+                  upstream to a commit and "tag" to a tag name, so pairing a revision with a
+                  tag policy (or a tag with a branch policy) compares two things that can
+                  never be equal and reports an update on every run. Both are reported rather
+                  than compared. flake-input is exempt, taking its current value from the
+                  policy and so consistent by construction.
+
                   current = "package" derives both the pin and the repository from a package
                   attribute's src instead of restating them here, leaving only the upstream
                   policy to configure. It costs one nix eval per package check - measured
