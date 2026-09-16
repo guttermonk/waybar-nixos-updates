@@ -321,6 +321,84 @@ estimate_line() {
     printf '%s' "$out"
 }
 
+# Reduces nix's stderr to the tooltip's reason line, or two lines when nix said
+# what it was doing. A copy of update-checker's nix_error_summary, which is
+# itself a copy of lightweight-checker's report_eval_failure: all three write
+# the same tooltip, and a failure should not read differently depending on which
+# script happened to produce it. Keep them in step.
+#
+# Replaces the "$(tail -1 <<<"$err")" this used to pass at both call sites. The
+# last line of nix's stderr is as often a "For full logs, run ..." hint as it is
+# the cause, and when it is the cause it still arrives with nix's indent and
+# "error:" prefix attached - which is what put "unavailable —        error: ..."
+# in the tooltip.
+nix_error_summary() {
+    local raw="$1"
+    local clean detail context
+
+    clean=$(sed 's/\x1b\[[0-9;]*m//g' <<<"$raw")
+
+    # nix opens with a bare "error:" and puts the actual cause on a later,
+    # indented "error:" line, after the stack trace. Take the last one that has
+    # content, which is the most specific; anything else is trace or chatter.
+    detail=$(grep -E '^[[:space:]]*error:[[:space:]]*[^[:space:]]' <<<"$clean" \
+        | tail -1 \
+        | sed 's/^[[:space:]]*error:[[:space:]]*//; s/[[:space:]]*$//' \
+        | cut -c1-200)
+
+    # The cause on its own does not say what nix was doing when it hit it.
+    # "Path 'x' does not exist in Git repository" is nix reporting an untracked
+    # file, and read alone it does not say whether the path is the
+    # configuration's or something inside an input being fetched. nix already
+    # says which, one line up ("... while updating the lock file ..."), so carry
+    # the nearest trace line preceding the cause.
+    #
+    # The marker is stripped in awk rather than matched around, because the
+    # ellipsis is one thing in nix's output and three dots in a terminal that
+    # could not render it - and only what follows is worth showing.
+    context=$(awk '
+        {
+            trimmed = $0
+            sub(/^[[:space:]]*/, "", trimmed)
+            sub(/^…[[:space:]]*/, "", trimmed)
+            sub(/^\.\.\.[[:space:]]*/, "", trimmed)
+            sub(/[[:space:]]*$/, "", trimmed)
+        }
+        trimmed ~ /^while / { trace = trimmed }
+        /^[[:space:]]*error:[[:space:]]*[^[:space:]]/ { found = trace }
+        END { print found }
+    ' <<<"$clean" | cut -c1-200)
+
+    # run_preview checks the link before starting, but that was minutes and a
+    # full evaluation ago. A drop since then explains the failure better than
+    # whichever fetch nix happened to be inside when it noticed.
+    if ! have_network; then
+        printf 'no network connection'
+        return
+    fi
+
+    # Nothing matched, so fall back to the last non-empty line - which is what
+    # both call sites used to do unconditionally. Kept as the last resort rather
+    # than dropped: a nix that fails without ever printing an "error:" line is
+    # exactly the case with nothing else left to show, and a fixed label there
+    # would discard the only clue there is.
+    if [ -z "$detail" ]; then
+        detail=$(grep -v '^[[:space:]]*$' <<<"$clean" | tail -1 \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | cut -c1-200)
+    fi
+    [ -z "$detail" ] && detail="nix gave no error output"
+
+    # A literal backslash-n, never a real newline: write_state stores this as
+    # one key=value line and the readers parse a line at a time, so a real
+    # newline would truncate the reason and leave a stray line in the state
+    # file. The tooltip renders the escape itself.
+    if [ -n "$context" ]; then
+        printf '%s\\n%s' "$context" "$detail"
+    else
+        printf '%s' "$detail"
+    fi
+}
+
 run_preview() {
     if [ ! -f "$FLAKE_DIR/flake.lock" ]; then
         write_state failed "" "no flake.lock at $FLAKE_DIR"
@@ -329,7 +407,10 @@ run_preview() {
     fi
 
     if ! have_network; then
-        write_state failed "" "no network"
+        # Same wording as nix_error_summary's own network check, which is the
+        # same condition found later: one tooltip should not have two phrasings
+        # for the link being down depending on when it went.
+        write_state failed "" "no network connection"
         refresh_waybar
         return 1
     fi
@@ -349,7 +430,7 @@ run_preview() {
     local update_err
     if ! update_err=$(nix flake update --flake "$FLAKE_DIR" \
             --output-lock-file "$tempdir/flake.lock" 2>&1); then
-        write_state failed "" "$(tail -1 <<<"$update_err")"
+        write_state failed "" "$(nix_error_summary "$update_err")"
         refresh_waybar
         return 1
     fi
@@ -357,7 +438,7 @@ run_preview() {
     local plan
     if ! plan=$(nix build --dry-run --reference-lock-file "$tempdir/flake.lock" \
             "$target" 2>&1 >/dev/null); then
-        write_state failed "" "$(tail -1 <<<"$plan")"
+        write_state failed "" "$(nix_error_summary "$plan")"
         refresh_waybar
         return 1
     fi

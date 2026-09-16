@@ -918,6 +918,85 @@
         return 0
     }
 
+    # Reduces nix's stderr to the tooltip line, or two lines when nix said what
+    # it was doing. The cause and trace extraction is the same as
+    # lightweight-checker's report_eval_failure, because both scripts write the
+    # same tooltip and a failure should not read differently depending on which
+    # checker happened to produce it. Only the last-resort fallback differs, and
+    # the comment on it says why.
+    #
+    # Replaces three separate heuristics that used to live at the call sites:
+    # two took the *first* line indented by exactly seven spaces, one took the
+    # last line of stderr whatever it was. The first indented error is nix's
+    # outermost frame - the least specific thing it knows - and the bare last
+    # line is as often a "For full logs, run ..." hint as it is the cause.
+    function nix_error_summary() {
+        local raw="$1"
+        local clean detail context
+
+        clean=$(sed 's/\x1b\[[0-9;]*m//g' <<<"$raw")
+
+        # nix opens with a bare "error:" and puts the actual cause on a later,
+        # indented "error:" line, after the stack trace. Take the last one that
+        # has content, which is the most specific; anything else is trace or
+        # chatter. Any indent, not seven spaces: nix varies it with nesting
+        # depth, and an unindented single-line error is the whole message.
+        detail=$(grep -E '^[[:space:]]*error:[[:space:]]*[^[:space:]]' <<<"$clean" \
+            | tail -1 \
+            | sed 's/^[[:space:]]*error:[[:space:]]*//; s/[[:space:]]*$//' \
+            | cut -c1-200)
+
+        # The cause on its own does not say what nix was doing when it hit it.
+        # "cannot read file from tarball" is libarchive reporting a truncated
+        # channel download, and read alone it looks like a broken configuration
+        # rather than a network hiccup worth simply retrying. nix already says
+        # which fetch it was, one line up ("... while fetching the input
+        # '<url>'"), so carry the nearest trace line preceding the cause.
+        #
+        # The marker is stripped in awk rather than matched around, because the
+        # ellipsis is one thing in nix's output and three dots in a terminal
+        # that could not render it - and only what follows is worth showing.
+        context=$(awk '
+            {
+                trimmed = $0
+                sub(/^[[:space:]]*/, "", trimmed)
+                sub(/^…[[:space:]]*/, "", trimmed)
+                sub(/^\.\.\.[[:space:]]*/, "", trimmed)
+                sub(/[[:space:]]*$/, "", trimmed)
+            }
+            trimmed ~ /^while / { trace = trimmed }
+            /^[[:space:]]*error:[[:space:]]*[^[:space:]]/ { found = trace }
+            END { print found }
+        ' <<<"$clean" | cut -c1-200)
+
+        # The whole check is gated on the link being up, but that was minutes
+        # and a full build ago. A drop since then explains the failure better
+        # than whichever fetch nix happened to be inside when it noticed.
+        if ! check_network_connectivity; then
+            printf 'no network connection'
+            return
+        fi
+
+        # Nothing matched, so fall back to the last non-empty line - which is
+        # what the flake-update site used to do unconditionally. Kept as the
+        # last resort rather than dropped: a nix that fails without ever
+        # printing an "error:" line is exactly the case with nothing else left
+        # to show, and a fixed label there would discard the only clue there is.
+        if [ -z "$detail" ]; then
+            detail=$(grep -v '^[[:space:]]*$' <<<"$clean" | tail -1 \
+                | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | cut -c1-200)
+        fi
+        [ -z "$detail" ] && detail="nix gave no error output"
+
+        # A literal backslash-n: this is read back a line at a time and the
+        # tooltip renders the escape itself.
+        if [ -n "$context" ]; then
+            printf '%s\\n%s' "$context" "$detail"
+        else
+            printf '%s' "$detail"
+        fi
+    }
+
     # ===== Update Check Logic =====
     function check_for_updates() {
         local tempdir=$(mktemp -d)
@@ -939,9 +1018,7 @@
             if [ "$?" -eq 0 ]; then
                 record_pending_from_nvd "$(nvd diff /run/current-system ./result)"
             else
-                # Extract just the error line starting with "error:"
-                error_line=$(echo "$error_output" | grep "^       error:" | head -1 | sed 's/^[[:space:]]*//')
-                echo "$error_line" > "$LAST_RUN_TOOLTIP"
+                nix_error_summary "$error_output" > "$LAST_RUN_TOOLTIP"
                 return 1
             fi
         else
@@ -960,7 +1037,7 @@
             local update_err
             if ! update_err=$(nix flake update --flake "$NIXOS_CONFIG_PATH" \
                     --output-lock-file "$tempdir/flake.lock" 2>&1); then
-                echo "$(tail -1 <<<"$update_err")" > "$LAST_RUN_TOOLTIP"
+                nix_error_summary "$update_err" > "$LAST_RUN_TOOLTIP"
                 return 1
             fi
             # --out-link keeps the result symlink in the temp directory, so the
@@ -971,9 +1048,7 @@
             if [ "$?" -eq 0 ]; then
                 record_pending_from_nvd "$(nvd diff /run/current-system "$tempdir/result")"
             else
-                # Extract just the error line starting with "error:"
-                error_line=$(echo "$error_output" | grep "^       error:" | head -1 | sed 's/^[[:space:]]*//')
-                echo "$error_line" > "$LAST_RUN_TOOLTIP"
+                nix_error_summary "$error_output" > "$LAST_RUN_TOOLTIP"
                 return 1
             fi
         fi

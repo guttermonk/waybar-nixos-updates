@@ -1267,34 +1267,74 @@ get_package_channel() {
 report_eval_failure() {
     local err_file="$1"
     local detail=""
+    local context=""
 
-    # nix opens with a bare "error:" and puts the actual cause on a later,
-    # indented "error:" line, after the stack trace. Take the last one that has
-    # content, which is the most specific; anything else is trace or chatter.
     if [ -s "$err_file" ]; then
-        detail=$(sed 's/\x1b\[[0-9;]*m//g' "$err_file" \
-            | grep -E '^[[:space:]]*error:[[:space:]]*[^[:space:]]' \
+        local clean
+        clean=$(sed 's/\x1b\[[0-9;]*m//g' "$err_file")
+
+        # nix opens with a bare "error:" and puts the actual cause on a later,
+        # indented "error:" line, after the stack trace. Take the last one that
+        # has content, which is the most specific; anything else is trace or
+        # chatter.
+        detail=$(grep -E '^[[:space:]]*error:[[:space:]]*[^[:space:]]' <<<"$clean" \
             | tail -1 \
             | sed 's/^[[:space:]]*error:[[:space:]]*//; s/[[:space:]]*$//' \
             | cut -c1-200)
+
+        # The cause on its own does not say what nix was doing when it hit it.
+        # "cannot read file from tarball" is libarchive reporting a truncated
+        # channel download, and read alone it looks like a broken configuration
+        # rather than a network hiccup worth simply retrying. nix already says
+        # which fetch it was, one line up ("... while fetching the input
+        # '<url>'"), so carry the nearest trace line preceding the cause.
+        #
+        # The marker is stripped in awk rather than matched around, because the
+        # ellipsis is one thing in nix's output and three dots in a terminal
+        # that could not render it - and only what follows is worth showing.
+        context=$(awk '
+            {
+                trimmed = $0
+                sub(/^[[:space:]]*/, "", trimmed)
+                sub(/^…[[:space:]]*/, "", trimmed)
+                sub(/^\.\.\.[[:space:]]*/, "", trimmed)
+                sub(/[[:space:]]*$/, "", trimmed)
+            }
+            trimmed ~ /^while / { trace = trimmed }
+            /^[[:space:]]*error:[[:space:]]*[^[:space:]]/ { found = trace }
+            END { print found }
+        ' <<<"$clean" | cut -c1-200)
     fi
 
     # A dropped connection is by far the most common cause and is not worth
-    # showing a nix backtrace for.
+    # showing a nix backtrace for. The trace goes with it: which fetch nix was
+    # part way through is noise once the answer is that the link is down.
     if ! check_network; then
         detail="no network connection"
+        context=""
     fi
 
     [ -z "$detail" ] && detail="nix eval failed"
-    echo "$detail" > "$ERROR_FILE"
-    echo "Update check failed:\\n$detail" > "$LAST_RUN_TOOLTIP"
+
+    # A literal backslash-n for the tooltip, which is read back a line at a
+    # time and renders the escape itself, and a real newline for the file and
+    # the notification, which are read as text.
+    local body="$detail"
+    local tooltip_detail="$detail"
+    if [ -n "$context" ]; then
+        body="$context"$'\n'"$detail"
+        tooltip_detail="$context\\n$detail"
+    fi
+
+    echo "$body" > "$ERROR_FILE"
+    echo "Update check failed:\\n$tooltip_detail" > "$LAST_RUN_TOOLTIP"
     # Stamp the run even though it failed. The worker signals waybar as it
     # exits, and without this the next poll sees the interval still elapsed and
     # immediately starts another doomed check - a tight retry loop for as long
     # as the cause persists. The normal interval applies instead, and a
     # right-click still forces an immediate retry.
     echo "$(date +%s)" > "$LAST_RUN_FILE"
-    send_notification "updates-failed" "Update Check Failed" "$detail"
+    send_notification "updates-failed" "Update Check Failed" "$body"
 }
 
 # Package names nvd reports as changed, lowercased, one per line.
