@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+
+# Runs user-configured commands on the update-check cycle and folds their
+# stdout into the tooltip. The escape hatch for periodic checks that are not
+# package or flake-input updates -- anything whose result needs somewhere
+# visible to land, but which this project cannot anticipate.
+#
+# Contract: the command prints plain text. Output means "something to report",
+# no output means clean. Nothing about JSON leaks into user scripts; this file
+# is the only thing that speaks the {count, shown, tooltip} protocol.
+
+set -u
+
+# Deliberately ${VAR-default}, not ${VAR:-default}: only an *unset* value means
+# "no checks configured". An empty value is a broken one, and must fall through
+# to the validation below rather than being silently read as an empty list.
+CUSTOM_CHECKS_JSON="${CUSTOM_CHECKS_JSON-[]}"
+
+# Per-command ceiling. These run serially inside the lock held by the background
+# worker, so an unbounded command would stall every later check and leave the
+# module wedged on "checking". Matches SOURCE_CHECK_TIMEOUT's default.
+CUSTOM_CHECK_TIMEOUT="${CUSTOM_CHECK_TIMEOUT:-60}"
+
+json_result() {
+    jq -cn --argjson count "$1" --argjson shown "$2" --arg tooltip "$3" \
+        '{count: $count, shown: $shown, tooltip: $tooltip}'
+}
+
+have_network() {
+    ip route 2>/dev/null | grep -q "^default"
+}
+
+main() {
+    # shown=1 so this actually reaches the tooltip. Callers render the Checks
+    # section only when shown > 0, so reporting a broken configuration with
+    # shown=0 would leave it looking identical to a clean check.
+    if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$CUSTOM_CHECKS_JSON"; then
+        json_result 0 1 "Invalid customChecks configuration"
+        return
+    fi
+
+    local count=0
+    # Blocks are collected rather than concatenated as they arrive, because
+    # whether a block gets a "name:" header depends on how many other checks
+    # produced output -- which is not known until the loop has finished.
+    local -a names=() blocks=() labelled=()
+
+    while IFS= read -r check; do
+        local mode name command requires_network
+        mode=$(jq -r '.mode' <<<"$check")
+        [[ "$mode" == "disabled" ]] && continue
+
+        name=$(jq -r '.name' <<<"$check")
+        command=$(jq -r '.command' <<<"$check")
+        requires_network=$(jq -r '.requiresNetwork // true' <<<"$check")
+
+        # Skipped silently: no network is a transient condition the callers
+        # already surface on their own, not a broken check worth reporting
+        # every cycle on a disconnected machine.
+        [[ "$requires_network" == "true" ]] && ! have_network && continue
+
+        local output rc
+        # stderr is dropped: a command that wants to say something says it on
+        # stdout. Without this, any tool that logs progress to stderr would
+        # have that noise rendered as findings.
+        output=$(timeout "$CUSTOM_CHECK_TIMEOUT" bash -c "$command" 2>/dev/null)
+        rc=$?
+
+        # Failures are reported rather than swallowed. Without this a command
+        # that is missing, crashing or hanging produces empty output and reads
+        # as a clean check -- the one failure mode a staleness check cannot
+        # afford, since silence is exactly what it reports when all is well.
+        # These lines carry their own name, so they are never given a header.
+        if [[ "$rc" -eq 124 ]]; then
+            names+=("$name"); blocks+=("$name (timed out)"); labelled+=("self")
+            continue
+        fi
+        if [[ "$rc" -ne 0 ]]; then
+            names+=("$name"); blocks+=("$name (exit $rc)"); labelled+=("self")
+            continue
+        fi
+
+        # Trailing newlines from the command must not become blank tooltip
+        # lines, and a command printing only whitespace is a clean result.
+        output=$(printf '%s' "$output" | sed -e '/^[[:space:]]*$/d')
+        [[ -z "$output" ]] && continue
+
+        [[ "$mode" == "count" ]] && count=$((count + $(printf '%s\n' "$output" | wc -l)))
+        names+=("$name"); blocks+=("$output"); labelled+=("none")
+    done < <(jq -c '.[]' <<<"$CUSTOM_CHECKS_JSON")
+
+    # Real newlines throughout, not the literal "\n" source-checker emits: command
+    # output arrives with real ones, and the callers normalise the whole string
+    # for waybar anyway. Mixing both forms here would only invite one to be
+    # missed.
+    #
+    # A lone block speaks for itself; a header would just restate the one name
+    # already implied by the section. Same rule compose_tooltip_body applies to
+    # its own section labels.
+    local n=${#blocks[@]}
+    local tooltip="" shown=0 i
+    for ((i = 0; i < n; i++)); do
+        [[ -n "$tooltip" ]] && tooltip+=$'\n'
+        if [[ "$n" -gt 1 && "${labelled[i]}" == "none" ]]; then
+            tooltip+="${names[i]}:"$'\n'
+            shown=$((shown + 1))
+        fi
+        tooltip+="${blocks[i]}"
+        shown=$((shown + $(printf '%s\n' "${blocks[i]}" | wc -l)))
+    done
+
+    json_result "$count" "$shown" "$tooltip"
+}
+
+main

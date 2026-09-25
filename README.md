@@ -163,6 +163,7 @@ For a manual installation, download the `update-checker` script, put it in your 
 Two optional features are separate helper scripts that `update-checker` invokes by name, so they must be on your `PATH` too if you use them — the flake handles this for you, a manual install does not:
 
 - `source-checker` — required by `sourceChecks`
+- `custom-checker` — required by `customChecks`
 - `preview` — required by the update-cost preview (`update-checker preview`, bound to middle-click)
 
 ### ⚙️ Configuration Options
@@ -239,6 +240,30 @@ When using the Home Manager module, you can configure these options:
     - `tagPattern` matters more here than for a hand-written pin, because you never see the tag's shape. A repository that tags subcrates alongside releases — ripgrep tags `wincolor-0.1.6` — returns the wrong "latest" under the default `"*"`. Anchor the pattern to the release line the package follows.
     - Setting `repository` explicitly still wins, which is how you track a fork's upstream rather than the URL the package fetches from.
   - Only an *unset* `SOURCE_CHECKS_JSON` means "no checks configured". An empty or malformed value is reported as invalid rather than read as an empty list, so a broken environment can't look like a clean result
+- `customChecks`: Arbitrary commands run on the same cycle as the update check, with their stdout folded into the tooltip under a **Checks** section. The escape hatch for things worth knowing on a schedule that aren't package or flake-input updates and so can't be derived from the flake — a retired API model id, an expiring certificate, a drifted remote.
+  - **The contract is plain text, not JSON.** A line of output is a thing worth reporting; no output is a clean result and prints nothing. Your script needs no `jq` and no awareness of this project's internals.
+  - Set `mode` per entry to `"disabled"`, `"show"`, or `"count"`. With `"count"` each output line also adds one to the waybar badge, which is what makes a check *visible* — `"show"` only ever reaches someone already hovering over the module.
+  - `requiresNetwork` (default `true`) skips the check when there's no default route, so a network-dependent check doesn't fail every cycle on a disconnected machine. Set it `false` for a purely local check.
+  - Failures are reported rather than swallowed: a command that is missing, crashes, or exceeds `CUSTOM_CHECK_TIMEOUT` (default 60s) shows up as `name (exit N)` or `name (timed out)`. Silence already means "all clear", so a broken check must not be able to imitate it.
+  - Commands run through `bash -c`, so a pipeline is fine. `PATH` is inherited rather than replaced, but a waybar session's `PATH` is not the one you tested in — prefer an absolute store path.
+  - With one check reporting, its output appears verbatim. With two or more, each block gets a `name:` header so you can tell them apart.
+  - Only an *unset* `CUSTOM_CHECKS_JSON` means "no checks configured". An empty or malformed value is reported as `Invalid customChecks configuration` rather than read as an empty list.
+
+    ```nix
+    customChecks = [{
+      name = "Anthropic models";
+      mode = "count";
+      command = "${pkgs.anthropic-model-check}/bin/anthropic-model-check";
+    }];
+    ```
+
+    A check that prints nothing contributes nothing. One that prints two lines with `mode = "count"` adds 2 to the badge and both lines to the tooltip:
+
+    ```
+    Checks:
+    smartcat: claude-sonnet-4-20250514 no longer resolves
+    zed: claude-sonnet-4-5 is 2 generations behind
+    ```
 
 **Both modes:**
 - `nixosConfigPath`: Path to your NixOS configuration flake directory (default: `~/.config/nixos`)
@@ -561,6 +586,7 @@ The script uses several cache files in your ~/.cache directory:
 - `nix-update-check.lock`: Held while a background check runs, so only one runs at a time (lightweight mode only)
 - `nix-update-error`: Present when the last check failed, holding the reason; makes the module show its error state instead of a healthy count. Removed by the next successful check.
 - `nix-update-diagnostic` / `.prev`: What the last two checks actually resolved — channels, package-to-channel mapping size, and for each reported package which channel it was compared against versus which one the mapping put it in. The previous run is kept because a wrong result is usually followed immediately by a correct one, which would otherwise overwrite the evidence. If the module reports something you don't expect, `cat ~/.cache/nix-update-diagnostic.prev` is the place to start.
+- `nix-update-custom-count` / `-shown` / `-tooltip`: Last `customChecks` result, so a rebuild can redraw the Checks section without re-running your commands
 - `nix-update-force-check`: Set by `refresh` to request a check before the interval is up; cleared once that check starts
 - `nix-update-result-hash`: Fingerprint of what the last check found, used to expire a stored update-cost preview when upstream moves
 - `nix-update-preview`: Last update-cost preview, with the `flake.lock` hash and system path it was computed against, plus the evaluating process while one is running so an interrupted preview is reported rather than left reading "calculating"; removed when `dryRunPreview.enable` is `false`
