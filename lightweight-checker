@@ -178,6 +178,9 @@ PINNED_TOOLTIP_FILE="$CACHE_DIR/nix-update-pinned-tooltip"
 SOURCE_COUNT_FILE="$CACHE_DIR/nix-update-source-count"
 SOURCE_SHOWN_FILE="$CACHE_DIR/nix-update-source-shown"
 SOURCE_TOOLTIP_FILE="$CACHE_DIR/nix-update-source-tooltip"
+CUSTOM_COUNT_FILE="$CACHE_DIR/nix-update-custom-count"
+CUSTOM_SHOWN_FILE="$CACHE_DIR/nix-update-custom-shown"
+CUSTOM_TOOLTIP_FILE="$CACHE_DIR/nix-update-custom-tooltip"
 
 # The reported packages as structured data, not just the rendered line. Written
 # by every check so "reconcile" can drop entries by package name after a rebuild
@@ -1383,11 +1386,13 @@ reconcile_packages() {
 #
 # Args: pkg_count pkg_tooltip input_count input_tooltip
 #       pinned_count pinned_tooltip source_shown source_tooltip
+#       custom_shown custom_tooltip
 compose_tooltip_body() {
     local pkg_count="$1" pkg_tooltip="$2"
     local input_count="$3" input_tooltip="$4"
     local pinned_count="$5" pinned_tooltip="$6"
     local source_shown="$7" source_tooltip="$8"
+    local custom_shown="$9" custom_tooltip="${10}"
 
     local labels=() texts=()
     if [ "$pkg_count" -gt 0 ]; then
@@ -1401,6 +1406,9 @@ compose_tooltip_body() {
     fi
     if [ "$source_shown" -gt 0 ]; then
         labels+=("Sources"); texts+=("$source_tooltip")
+    fi
+    if [ "$custom_shown" -gt 0 ]; then
+        labels+=("Checks"); texts+=("$custom_tooltip")
     fi
 
     local n=${#labels[@]}
@@ -1840,8 +1848,31 @@ check_for_updates_lightweight() {
     echo "$source_shown" > "$SOURCE_SHOWN_FILE"
     echo "$source_tooltip" > "$SOURCE_TOOLTIP_FILE"
 
+    local custom_count=0
+    local custom_shown=0
+    local custom_tooltip=""
+    # Same -1 convention as the source checks above: a value that is set but is
+    # not a JSON array still has to reach custom-checker so the problem gets
+    # reported, rather than being read as "nothing configured".
+    local custom_checks_len
+    custom_checks_len=$(jq 'if type == "array" then length else -1 end' <<<"$CUSTOM_CHECKS_JSON" 2>/dev/null)
+    [[ "$custom_checks_len" =~ ^-?[0-9]+$ ]] || custom_checks_len=-1
+    if [ "$custom_checks_len" -ne 0 ]; then
+        local custom_result
+        custom_result=$(custom-checker 2>/dev/null)
+        custom_count=$(jq -r '.count // 0' <<<"$custom_result" 2>/dev/null || echo 0)
+        custom_shown=$(jq -r '.shown // 0' <<<"$custom_result" 2>/dev/null || echo 0)
+        custom_tooltip=$(jq -r '.tooltip // ""' <<<"$custom_result" 2>/dev/null || echo "")
+        [[ "$custom_count" =~ ^[0-9]+$ ]] || custom_count=0
+        [[ "$custom_shown" =~ ^[0-9]+$ ]] || custom_shown=0
+        custom_tooltip=${custom_tooltip//$'\n'/\\n}
+    fi
+    echo "$custom_count" > "$CUSTOM_COUNT_FILE"
+    echo "$custom_shown" > "$CUSTOM_SHOWN_FILE"
+    echo "$custom_tooltip" > "$CUSTOM_TOOLTIP_FILE"
+
     # Calculate total count (only items with mode="count")
-    local total_count=$((pkg_count + input_count_for_total + pinned_count_for_total + source_count))
+    local total_count=$((pkg_count + input_count_for_total + pinned_count_for_total + source_count + custom_count))
     echo "$total_count" > "$STATE_FILE"
     rm -f "$ERROR_FILE"
     echo "$(date +%s)" > "$LAST_RUN_FILE"
@@ -1852,6 +1883,7 @@ check_for_updates_lightweight() {
     [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ "$input_count" -gt 0 ] && has_items_to_show=true
     [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ "$pinned_count" -gt 0 ] && has_items_to_show=true
     [ "$source_shown" -gt 0 ] && has_items_to_show=true
+    [ "$custom_shown" -gt 0 ] && has_items_to_show=true
 
     if [ "$has_items_to_show" = false ]; then
         echo "System updated" > "$LAST_RUN_TOOLTIP"
@@ -1879,7 +1911,8 @@ check_for_updates_lightweight() {
             "$pkg_count" "$pkg_tooltip" \
             "$input_count" "$input_tooltip" \
             "$pinned_count" "$pinned_tooltip" \
-            "$source_shown" "$source_tooltip" > "$LAST_RUN_TOOLTIP"
+            "$source_shown" "$source_tooltip" \
+            "$custom_shown" "$custom_tooltip" > "$LAST_RUN_TOOLTIP"
 
         if [ "$total_count" -eq 0 ]; then
             send_notification "updates-complete" "Update Check Complete" "No countable updates" -e
@@ -2059,6 +2092,7 @@ main() {
                 local r_input_count=0 r_input_tooltip=""
                 local r_pinned_count=0 r_pinned_tooltip=""
                 local r_source_count=0 r_source_shown=0 r_source_tooltip=""
+                local r_custom_count=0 r_custom_shown=0 r_custom_tooltip=""
                 local r_total=0
 
                 if [ "$INPUT_CHECKER_MODE" != "disabled" ]; then
@@ -2079,6 +2113,12 @@ main() {
                 [[ "$r_source_count" =~ ^[0-9]+$ ]] || r_source_count=0
                 [[ "$r_source_shown" =~ ^[0-9]+$ ]] || r_source_shown=0
                 r_total=$((r_total + r_source_count))
+                r_custom_count=$(cat "$CUSTOM_COUNT_FILE" 2>/dev/null || echo "0")
+                r_custom_shown=$(cat "$CUSTOM_SHOWN_FILE" 2>/dev/null || echo "0")
+                r_custom_tooltip=$(cat "$CUSTOM_TOOLTIP_FILE" 2>/dev/null || echo "")
+                [[ "$r_custom_count" =~ ^[0-9]+$ ]] || r_custom_count=0
+                [[ "$r_custom_shown" =~ ^[0-9]+$ ]] || r_custom_shown=0
+                r_total=$((r_total + r_custom_count))
 
                 # The surviving packages, if any. "assume-updated" keeps none by
                 # construction; "reconcile" keeps whatever the rebuild left
@@ -2107,7 +2147,8 @@ main() {
                     "$r_pkg_count" "$r_pkg_tooltip" \
                     "$r_input_count" "$r_input_tooltip" \
                     "$r_pinned_count" "$r_pinned_tooltip" \
-                    "$r_source_shown" "$r_source_tooltip")
+                    "$r_source_shown" "$r_source_tooltip" \
+                    "$r_custom_shown" "$r_custom_tooltip")
 
                 echo "$r_total" > "$STATE_FILE"
                 echo "$r_body" > "$LAST_RUN_TOOLTIP"
@@ -2277,7 +2318,17 @@ main() {
         exit 0
     else
         # Throttled - show wait notification if triggered manually
-        if [ -t 0 ]; then
+        # Manual invocation is distinguished by stdout, not stdin. stdin is the
+        # wrong test: a session started from a VT hands /dev/tty1 down through
+        # the compositor to waybar and to everything waybar spawns, so `-t 0` is
+        # true for the automatic poll and this fired on every throttled poll --
+        # once every `interval` seconds, all day.
+        #
+        # stdout discriminates because waybar reads the module's JSON from a
+        # pipe, while a person running this in a terminal has a tty there. The
+        # one false negative is `update-checker | something`, which is a fair
+        # price for not notifying a machine.
+        if [ -t 1 ]; then
             send_notification "updates-wait" "Please Wait" "Next update is in $(calc_next_update) min." -e
         fi
     fi
