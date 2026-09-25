@@ -248,7 +248,7 @@ summarise_plan() {
     printf '%s' "$out"
 }
 
-# Turns the plan into "~32m to fetch & unpack" and "~13m+ build (62 timed of
+# Turns the plan into "~32m to fetch & unpack" and "~13m+ to build (62 timed of
 # 105)", one per line. Any part
 # that cannot be estimated is omitted rather than guessed, and the whole thing is
 # dropped if nothing can be worked out at all.
@@ -305,7 +305,7 @@ estimate_line() {
                 # itself, where the eye already is.
                 local floor=""
                 [ "${timed:-0}" -lt "${total:-0}" ] 2>/dev/null && floor="+"
-                parts+=("~$(human_duration "$bsecs")$floor build ($timed timed of $total)")
+                parts+=("~$(human_duration "$bsecs")$floor to build ($timed timed of $total)")
             fi
         fi
     fi
