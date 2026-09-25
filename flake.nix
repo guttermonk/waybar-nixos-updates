@@ -14,7 +14,7 @@
         # The update-checker script package
         waybar-nixos-updates = pkgs.stdenv.mkDerivation {
           pname = "waybar-nixos-updates";
-          version = "4.5";
+          version = "4.6";
           
           src = ./.;
           
@@ -31,6 +31,8 @@
             chmod +x $out/bin/update-checker
             cp source-checker $out/bin/source-checker
             chmod +x $out/bin/source-checker
+            cp custom-checker $out/bin/custom-checker
+            chmod +x $out/bin/custom-checker
             cp preview $out/bin/preview
             chmod +x $out/bin/preview
             
@@ -76,7 +78,7 @@
         # Lightweight mode: uses lazy nix eval instead of a full build + nvd diff
         waybar-nixos-updates-lightweight = pkgs.stdenv.mkDerivation {
           pname = "waybar-nixos-updates-lightweight";
-          version = "4.5";
+          version = "4.6";
           
           src = ./.;
           
@@ -92,6 +94,8 @@
             chmod +x $out/bin/lightweight-checker
             cp source-checker $out/bin/source-checker
             chmod +x $out/bin/source-checker
+            cp custom-checker $out/bin/custom-checker
+            chmod +x $out/bin/custom-checker
             cp preview $out/bin/preview
             chmod +x $out/bin/preview
             
@@ -135,7 +139,7 @@
         # Flake input checker: compares locked revs against upstream via git ls-remote
         waybar-nixos-updates-inputs = pkgs.stdenv.mkDerivation {
           pname = "waybar-nixos-updates-inputs";
-          version = "4.5";
+          version = "4.6";
           src = ./.;
           nativeBuildInputs = [ pkgs.makeWrapper ];
           installPhase = ''
@@ -271,6 +275,41 @@
                   type = types.listOf types.str;
                   default = [ "*-alpha*" "*-beta*" "*-rc*" "*-pre*" ];
                   description = "Tag patterns to ignore, so prereleases don't register as updates.";
+                };
+              };
+            };
+
+            customCheckType = types.submodule {
+              options = {
+                name = mkOption {
+                  type = types.str;
+                  description = "Display name, used as a tooltip header and in failure messages.";
+                };
+                mode = mkOption {
+                  type = types.enum [ "disabled" "show" "count" ];
+                  default = "show";
+                  description = "Whether to skip this check, show it only, or also add it to the waybar count.";
+                };
+                command = mkOption {
+                  type = types.str;
+                  description = ''
+                    Command to run. Its stdout is the result: one line per thing worth
+                    reporting, and no output at all when there is nothing to report.
+
+                    Run through `bash -c`, so a pipeline is fine. PATH is inherited
+                    rather than replaced, but a waybar session's PATH is not the one
+                    you tested in -- prefer an absolute store path.
+                  '';
+                };
+                requiresNetwork = mkOption {
+                  type = types.bool;
+                  default = true;
+                  description = ''
+                    Skip this check when there is no default route. Defaults to true
+                    because a check worth running on a timer usually reaches out
+                    somewhere, and one that fails every cycle on a disconnected
+                    machine is noise. Set false for a purely local check.
+                  '';
                 };
               };
             };
@@ -523,6 +562,39 @@
                 '';
               };
 
+              customChecks = mkOption {
+                type = types.listOf customCheckType;
+                default = [ ];
+                description = ''
+                  Arbitrary commands run on the same cycle as the update check, with their
+                  stdout folded into the tooltip under a "Checks" section.
+
+                  The escape hatch for things that are worth knowing on a schedule but are
+                  not package or flake-input updates, and so cannot be derived from the
+                  flake: a retired API model id, an expiring certificate, a drifted remote.
+
+                  The contract is plain text, not JSON. A line of output is a thing worth
+                  reporting; no output is a clean result and prints nothing. With
+                  mode = "count" each line also adds one to the waybar count, which is what
+                  makes a check visible without opening the tooltip -- mode = "show" only
+                  ever reaches someone already hovering.
+
+                  Failures are reported rather than swallowed: a command that is missing,
+                  crashes, or exceeds CUSTOM_CHECK_TIMEOUT (default 60s) shows up as
+                  "name (exit N)" or "name (timed out)". Silence already means "all clear",
+                  so a broken check must not be able to imitate it.
+                '';
+                example = literalExpression ''
+                  [
+                    {
+                      name = "Anthropic models";
+                      mode = "count";
+                      command = "''${pkgs.anthropic-model-check}/bin/anthropic-model-check";
+                    }
+                  ]
+                '';
+              };
+
               lightweightExcludePatterns = mkOption {
                 type = types.listOf types.str;
                 default = [ "*-fish-completions" ];
@@ -646,6 +718,7 @@
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
                   export LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON=${escapeShellArg (builtins.toJSON cfg.lightweightExcludePatterns)}
                   export SOURCE_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.sourceChecks)}
+                  export CUSTOM_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.customChecks)}
                   export DRY_RUN_PREVIEW="${if cfg.dryRunPreview.enable then "true" else "false"}"
                   export PREVIEW_TARGET="${builtins.replaceStrings ["\${hostname}"] ["$(hostname)"] cfg.dryRunPreview.target}"
                   export PREVIEW_AUTO="${if cfg.dryRunPreview.recalculateOnChange then "true" else "false"}"
@@ -676,6 +749,7 @@
                   export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
                   export SOURCE_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.sourceChecks)}
+                  export CUSTOM_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.customChecks)}
                   export DRY_RUN_PREVIEW="${if cfg.dryRunPreview.enable then "true" else "false"}"
                   export PREVIEW_TARGET="${builtins.replaceStrings ["\${hostname}"] ["$(hostname)"] cfg.dryRunPreview.target}"
                   export PREVIEW_AUTO="${if cfg.dryRunPreview.recalculateOnChange then "true" else "false"}"
