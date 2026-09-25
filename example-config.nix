@@ -194,6 +194,47 @@
   # the unpinned nixpkgs version and quietly compare the wrong thing. Pin
   # through an overlay if you want this to be accurate.
 
+  # Example 1i: Running your own check on the update cycle.
+  # customChecks runs arbitrary commands and folds their stdout into the
+  # tooltip. Use it for things worth knowing on a schedule that are not package
+  # or flake-input updates, and so cannot be derived from the flake at all.
+  # programs.waybar-nixos-updates = {
+  #   enable = true;
+  #   checkMode = "lightweight";
+  #   customChecks = [
+  #     {
+  #       name = "Anthropic models";
+  #       mode = "count";       # each output line also adds 1 to the badge
+  #       command = "${pkgs.anthropic-model-check}/bin/anthropic-model-check";
+  #     }
+  #     {
+  #       name = "TLS expiry";
+  #       mode = "show";        # tooltip only, badge unchanged
+  #       command = "${pkgs.cert-expiry-check}/bin/cert-expiry-check";
+  #     }
+  #     {
+  #       name = "Disk SMART";
+  #       mode = "count";
+  #       requiresNetwork = false;   # purely local, run it offline too
+  #       command = "${pkgs.smart-check}/bin/smart-check";
+  #     }
+  #   ];
+  # };
+  #
+  # The contract is plain text. Print one line per thing worth reporting and
+  # print nothing when there is nothing to report - no output is a clean check.
+  # Your script never needs to know this module exists.
+  #
+  # Failures are reported rather than swallowed: a command that is missing,
+  # crashes, or runs past CUSTOM_CHECK_TIMEOUT (default 60s) shows up as
+  # "name (exit N)" or "name (timed out)". That matters more here than
+  # elsewhere, because silence is also what a passing check prints - without
+  # this a broken check would be indistinguishable from a clean one.
+  #
+  # Commands run through bash -c, so a pipeline is fine. PATH is inherited
+  # rather than replaced, but a waybar session's PATH is not the one you tested
+  # in - prefer an absolute store path over a bare command name.
+
   # Example 1d: With flake input staleness checking
   # Combines package updates with stale input detection in one tooltip
   # programs.waybar-nixos-updates = {
