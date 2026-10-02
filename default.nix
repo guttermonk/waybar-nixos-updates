@@ -79,7 +79,7 @@ let
         local title="$2"
         local message="$3"
         local expire_flag="$4" # Optional fourth parameter for -e flag
-        notify-send -i "$HOME/.icons/$icon.png" "$title" "$message" $expire_flag
+        notify-send -i "$HOME/.icons/$icon.svg" "$title" "$message" $expire_flag
     }
 
     function check_boot_resume() {

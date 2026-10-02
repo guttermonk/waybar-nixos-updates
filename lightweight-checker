@@ -217,8 +217,8 @@ send_notification() {
     local expire_flag="${4:-}" # Optional fourth parameter for -e flag
     
     local args=("$title" "$message")
-    if [ -f "$HOME/.icons/$icon.png" ]; then
-        args=(-i "$HOME/.icons/$icon.png" "${args[@]}")
+    if [ -f "$HOME/.icons/$icon.svg" ]; then
+        args=(-i "$HOME/.icons/$icon.svg" "${args[@]}")
     fi
     if [ -n "$expire_flag" ]; then
         args+=("$expire_flag")
