@@ -28,7 +28,12 @@ When using the flake, all dependencies are automatically handled. The script req
 1. NixOS operating system
 2. A running Waybar instance (the script outputs JSON for Waybar integration)
 3. Internet connectivity for performing update checks
-4. Desktop notification system compatible with `notify-send`
+4. Desktop notification system compatible with `notify-send`, able to render
+   SVG icons — which means librsvg's gdk-pixbuf loader is installed. It is
+   present on most desktops, and on NixOS the common daemons pull it in
+   themselves: mako and swaync are wrapped with `GDK_PIXBUF_MODULE_FILE`
+   pointing at librsvg's loader cache, and dunst links librsvg directly.
+   Without it the notifications still appear, just without their icon.
 
 ### 📋 Configuration Assumptions:
 - Your flake is in `~/.config/nixos` (configurable via Home Manager module)
