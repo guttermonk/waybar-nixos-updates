@@ -1574,7 +1574,7 @@ collect_installed_packages() {
 
 # ===== Core: lightweight version check =====
 check_for_updates_lightweight() {
-    send_notification "updates-checking" "Checking for Updates" "Please be patient (lightweight mode)" -e
+    send_notification "updates-checking" "Checking for Updates" "Please be patient" -e
     
     # Determine mode and channels
     local single_channel_mode=true
