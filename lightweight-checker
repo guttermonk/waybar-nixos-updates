@@ -732,6 +732,12 @@ maybe_auto_preview() {
 }
 
 # ===== Flake Input Checking =====
+
+# Lines are rendered by format-upstream-line, which is shared with the other
+# two checkers and with source-checker so that one grammar is written down
+# once. lastModified is passed along because flake.lock already records it:
+# that is the current side's date for free, and one fewer thing to ask the
+# network for.
 check_flake_inputs() {
     local flake_lock="$FLAKE_DIR/flake.lock"
     [[ ! -f "$flake_lock" ]] && return 1
@@ -748,12 +754,34 @@ check_flake_inputs() {
         latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
             "https://github.com/$owner/$repo" "$remote_ref" 2>/dev/null | cut -f1)
 
-        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
-            count=$((count + 1))
-            local locked_date
-            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+        if [[ -z "$latest" ]]; then
+            # Reported rather than skipped. Going silent made an unreachable
+            # remote indistinguishable from an input that is up to date: the
+            # input simply left the section and the count, which reads as
+            # "nothing to do here" when the truth is "nobody knows".
+            #
+            # Not counted, though. A count is for updates there are to apply,
+            # and whether this input has one is exactly what failed to be
+            # established - so it is shown without being added up.
+            #
+            # Only reachable with the link up: main() answers a missing default
+            # route by reporting the outage and never running the checks, so
+            # this is one remote failing rather than the network being gone.
             [[ -n "$tooltip" ]] && tooltip+="\\n"
-            tooltip+="$name (locked: $locked_date)"
+            tooltip+="$name (upstream unreachable)"
+        elif [[ "$latest" != "$rev" ]]; then
+            # Counted on the renderer's verdict, not on the revisions merely
+            # differing: it exits 10 when the locked revision is strictly
+            # ahead of the tracked branch, which has nothing to update to.
+            # Reachable for a pinned input aimed at a commit that is not on
+            # its branch - a not-yet-merged tip - and counting that put a
+            # number on the waybar that no rebuild could clear.
+            local line status=0
+            line=$(format-upstream-line "$name" \
+                "https://github.com/$owner/$repo" "$rev" "$latest" "$last_modified") || status=$?
+            [[ "$status" -ne 10 ]] && count=$((count + 1))
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$line"
         fi
     done < <(jq -r '
         . as $root |
@@ -770,17 +798,43 @@ check_flake_inputs() {
     # Check generic git inputs (Bitbucket, GitLab, self-hosted, etc.) - unpinned
     while IFS=$'\t' read -r name url rev ref last_modified; do
         local remote_ref="$ref"
-        
-        local latest
-        latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
-            "$url" "$remote_ref" 2>/dev/null | cut -f1)
 
-        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
-            count=$((count + 1))
-            local locked_date
-            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+        # nix writes a local input's url as "file:/path", with one slash. git
+        # reads that as an ssh target and tries to resolve a host called
+        # "file:", so the check failed on a directory it could have read
+        # perfectly well - silently before, and as "upstream unreachable"
+        # once that became something to report. Neither was true, so the
+        # scheme is stripped to the plain path git does accept.
+        case "$url" in
+            file:///*) url="${url#file://}" ;;
+            file:/*)   url="${url#file:}" ;;
+        esac
+
+        # A bare ref name matches refs/heads, refs/tags and the
+        # refs/remotes/origin copy a local clone carries, so the listing can
+        # hold more than one line. Keeping all of them compared a multi-line
+        # string against a single revision - unequal forever, which reads as
+        # an update no rebuild can clear. The branch is preferred; the first
+        # line serves for a ref that is not a branch, such as a tag.
+        local latest="" first="" sha refname
+        while IFS=$'\t' read -r sha refname; do
+            [[ -n "$sha" ]] || continue
+            [[ -n "$first" ]] || first="$sha"
+            [[ "$refname" == "refs/heads/$remote_ref" ]] && { latest="$sha"; break; }
+        done < <(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
+                     "$url" "$remote_ref" 2>/dev/null)
+        [[ -n "$latest" ]] || latest="$first"
+
+        if [[ -z "$latest" ]]; then
             [[ -n "$tooltip" ]] && tooltip+="\\n"
-            tooltip+="$name (locked: $locked_date)"
+            tooltip+="$name (upstream unreachable)"
+        elif [[ "$latest" != "$rev" ]]; then
+            local line status=0
+            line=$(format-upstream-line "$name" \
+                "$url" "$rev" "$latest" "$last_modified") || status=$?
+            [[ "$status" -ne 10 ]] && count=$((count + 1))
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$line"
         fi
     done < <(jq -r '
         . as $root |
@@ -796,11 +850,10 @@ check_flake_inputs() {
 
     echo "$count" > "$INPUT_STATE_FILE"
 
-    if [ "$count" -eq 0 ]; then
-        echo "" > "$INPUT_TOOLTIP_FILE"
-    else
-        echo "$tooltip" > "$INPUT_TOOLTIP_FILE"
-    fi
+    # Written whatever the count is. An unreachable remote produces a line
+    # without producing a count, and discarding the text whenever the count
+    # was zero threw away exactly those lines.
+    echo "$tooltip" > "$INPUT_TOOLTIP_FILE"
     
     return 0
 }
@@ -822,12 +875,34 @@ check_pinned_inputs() {
         latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
             "https://github.com/$owner/$repo" "$remote_ref" 2>/dev/null | cut -f1)
 
-        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
-            count=$((count + 1))
-            local locked_date
-            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+        if [[ -z "$latest" ]]; then
+            # Reported rather than skipped. Going silent made an unreachable
+            # remote indistinguishable from an input that is up to date: the
+            # input simply left the section and the count, which reads as
+            # "nothing to do here" when the truth is "nobody knows".
+            #
+            # Not counted, though. A count is for updates there are to apply,
+            # and whether this input has one is exactly what failed to be
+            # established - so it is shown without being added up.
+            #
+            # Only reachable with the link up: main() answers a missing default
+            # route by reporting the outage and never running the checks, so
+            # this is one remote failing rather than the network being gone.
             [[ -n "$tooltip" ]] && tooltip+="\\n"
-            tooltip+="$name (pinned: $locked_date)"
+            tooltip+="$name (upstream unreachable)"
+        elif [[ "$latest" != "$rev" ]]; then
+            # Counted on the renderer's verdict, not on the revisions merely
+            # differing: it exits 10 when the locked revision is strictly
+            # ahead of the tracked branch, which has nothing to update to.
+            # Reachable for a pinned input aimed at a commit that is not on
+            # its branch - a not-yet-merged tip - and counting that put a
+            # number on the waybar that no rebuild could clear.
+            local line status=0
+            line=$(format-upstream-line "$name" \
+                "https://github.com/$owner/$repo" "$rev" "$latest" "$last_modified") || status=$?
+            [[ "$status" -ne 10 ]] && count=$((count + 1))
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$line"
         fi
     done < <(jq -r '
         . as $root |
@@ -844,17 +919,43 @@ check_pinned_inputs() {
     # Check pinned generic git inputs
     while IFS=$'\t' read -r name url rev ref last_modified; do
         local remote_ref="$ref"
-        
-        local latest
-        latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
-            "$url" "$remote_ref" 2>/dev/null | cut -f1)
 
-        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
-            count=$((count + 1))
-            local locked_date
-            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+        # nix writes a local input's url as "file:/path", with one slash. git
+        # reads that as an ssh target and tries to resolve a host called
+        # "file:", so the check failed on a directory it could have read
+        # perfectly well - silently before, and as "upstream unreachable"
+        # once that became something to report. Neither was true, so the
+        # scheme is stripped to the plain path git does accept.
+        case "$url" in
+            file:///*) url="${url#file://}" ;;
+            file:/*)   url="${url#file:}" ;;
+        esac
+
+        # A bare ref name matches refs/heads, refs/tags and the
+        # refs/remotes/origin copy a local clone carries, so the listing can
+        # hold more than one line. Keeping all of them compared a multi-line
+        # string against a single revision - unequal forever, which reads as
+        # an update no rebuild can clear. The branch is preferred; the first
+        # line serves for a ref that is not a branch, such as a tag.
+        local latest="" first="" sha refname
+        while IFS=$'\t' read -r sha refname; do
+            [[ -n "$sha" ]] || continue
+            [[ -n "$first" ]] || first="$sha"
+            [[ "$refname" == "refs/heads/$remote_ref" ]] && { latest="$sha"; break; }
+        done < <(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
+                     "$url" "$remote_ref" 2>/dev/null)
+        [[ -n "$latest" ]] || latest="$first"
+
+        if [[ -z "$latest" ]]; then
             [[ -n "$tooltip" ]] && tooltip+="\\n"
-            tooltip+="$name (pinned: $locked_date)"
+            tooltip+="$name (upstream unreachable)"
+        elif [[ "$latest" != "$rev" ]]; then
+            local line status=0
+            line=$(format-upstream-line "$name" \
+                "$url" "$rev" "$latest" "$last_modified") || status=$?
+            [[ "$status" -ne 10 ]] && count=$((count + 1))
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$line"
         fi
     done < <(jq -r '
         . as $root |
@@ -870,11 +971,7 @@ check_pinned_inputs() {
 
     echo "$count" > "$PINNED_STATE_FILE"
 
-    if [ "$count" -eq 0 ]; then
-        echo "" > "$PINNED_TOOLTIP_FILE"
-    else
-        echo "$tooltip" > "$PINNED_TOOLTIP_FILE"
-    fi
+    echo "$tooltip" > "$PINNED_TOOLTIP_FILE"
     
     return 0
 }
@@ -1450,10 +1547,14 @@ compose_tooltip_body() {
     if [ "$pkg_count" -gt 0 ]; then
         labels+=("Packages"); texts+=("$pkg_tooltip")
     fi
-    if [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ "$input_count" -gt 0 ]; then
+    # Keyed on there being lines, not on the count being non-zero. The two came
+    # apart once an unreachable remote became something to report: it is a line
+    # with no count behind it, and a section gated on the count would have
+    # dropped it on the floor the same way the loops used to.
+    if [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ -n "$input_tooltip" ]; then
         labels+=("Inputs"); texts+=("$input_tooltip")
     fi
-    if [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ "$pinned_count" -gt 0 ]; then
+    if [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ -n "$pinned_tooltip" ]; then
         labels+=("Pinned"); texts+=("$pinned_tooltip")
     fi
     if [ "$source_shown" -gt 0 ]; then
@@ -1469,11 +1570,16 @@ compose_tooltip_body() {
         return 0
     fi
 
+    # Every section is labelled, including a lone one. The heading used to be
+    # suppressed at n == 1 on the reasoning that a section with nothing to be
+    # distinguished from needs no name - but a lone section is the common case,
+    # and what the reader is left with is a bare list of lines whose subject
+    # they have to infer. "Inputs" and "Packages" are not interchangeable
+    # guesses, and the cost of saying which is one short line.
     local out="" i
     for ((i = 0; i < n; i++)); do
         [ -n "$out" ] && out="$out\\n\\n"
-        [ "$n" -gt 1 ] && out="$out${labels[i]}:\\n"
-        out="$out${texts[i]}"
+        out="$out${labels[i]}:\\n${texts[i]}"
     done
     printf '%s' "$out"
 }

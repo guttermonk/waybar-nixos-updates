@@ -249,17 +249,28 @@
   #     mode = "count";    # "disabled" | "show" | "count"
   #     pinned = "show";   # "disabled" | "show" | "count"
   #   };
+  #   upstreamInfo = {
+  #     mode = "api";              # "api" | "disabled" — dates and commit counts
+  #     # githubTokenFile = "/run/secrets/github-token";  # 60/hr -> 5000/hr
+  #     # allowShallowFetch = true;   # dates for non-GitHub remotes; see README
+  #   };
   #   # Tooltip will show:
   #   #   Packages:
   #   #   brave: 1.87.192 → 1.88.132
   #   #   dprint: 0.51.1 → 0.52.1
   #   #
   #   #   Inputs:
-  #   #   home-manager (locked: 2026-02-14)
-  #   #   hyprland (locked: 2026-02-15)
+  #   #   home-manager: 2026-02-14 → 2026-02-20 (31 commits)
+  #   #   hyprland: 2026-02-15 → 2026-02-19 (8 commits)
+  #   #   self-hosted-thing (upstream unreachable)   <- shown, never counted
   #   #
   #   #   Pinned:
-  #   #   some-fork (pinned: 2025-08-03)
+  #   #   some-fork: 2025-08-03 → 2026-02-18 (204 commits)
+  #   #
+  #   #   Sources:
+  #   #   my-fork: 2026-02-18 ↔ 2026-01-04 (12 behind, 40 ahead)  <- diverged
+  #   #   my-patch: 2026-02-18 ← 2026-01-04 (40 ahead)  <- nothing to pull,
+  #   #                                                    so not counted
   # };
 
   # Example 2: Complete Waybar configuration with the update module

@@ -42,6 +42,19 @@ output_json() {
     echo "{ \"text\":\"$1\", \"alt\":\"$2\", \"tooltip\":\"$3\" }"
 }
 
+# A default route, which is as much as can be established cheaply and is enough
+# to tell "the link is down" from "this one remote did not answer". The same
+# test source-checker uses, for the same reason.
+have_network() {
+    ip route 2>/dev/null | grep -q "^default"
+}
+
+# Lines are rendered by format-upstream-line, which is shared with the other
+# two checkers and with source-checker so that one grammar is written down
+# once. lastModified is passed along because flake.lock already records it:
+# that is the current side's date for free, and one fewer thing to ask the
+# network for.
+
 check_unpinned_inputs() {
     local flake_lock="$FLAKE_DIR/flake.lock"
     [[ ! -f "$flake_lock" ]] && return 1
@@ -58,12 +71,30 @@ check_unpinned_inputs() {
         latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
             "https://github.com/$owner/$repo" "$remote_ref" 2>/dev/null | cut -f1)
 
-        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
-            count=$((count + 1))
-            local locked_date
-            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+        if [[ -z "$latest" ]]; then
+            # Reported rather than skipped. Going silent made an unreachable
+            # remote indistinguishable from an input that is up to date: the
+            # input simply left the section and the count, which reads as
+            # "nothing to do here" when the truth is "nobody knows".
+            #
+            # Not counted, though. A count is for updates there are to apply,
+            # and whether this input has one is exactly what failed to be
+            # established - so it is shown without being added up.
             [[ -n "$tooltip" ]] && tooltip+="\\n"
-            tooltip+="$name (locked: $locked_date)"
+            tooltip+="$name (upstream unreachable)"
+        elif [[ "$latest" != "$rev" ]]; then
+            # Counted on the renderer's verdict, not on the revisions merely
+            # differing: it exits 10 when the locked revision is strictly
+            # ahead of the tracked branch, which has nothing to update to.
+            # Reachable for a pinned input aimed at a commit that is not on
+            # its branch - a not-yet-merged tip - and counting that put a
+            # number on the waybar that no rebuild could clear.
+            local line status=0
+            line=$(format-upstream-line "$name" \
+                "https://github.com/$owner/$repo" "$rev" "$latest" "$last_modified") || status=$?
+            [[ "$status" -ne 10 ]] && count=$((count + 1))
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$line"
         fi
     done < <(jq -r '
         . as $root |
@@ -80,17 +111,43 @@ check_unpinned_inputs() {
     # Check generic git inputs (Bitbucket, GitLab, self-hosted, etc.) - unpinned
     while IFS=$'\t' read -r name url rev ref last_modified; do
         local remote_ref="$ref"
-        
-        local latest
-        latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
-            "$url" "$remote_ref" 2>/dev/null | cut -f1)
 
-        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
-            count=$((count + 1))
-            local locked_date
-            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+        # nix writes a local input's url as "file:/path", with one slash. git
+        # reads that as an ssh target and tries to resolve a host called
+        # "file:", so the check failed on a directory it could have read
+        # perfectly well - silently before, and as "upstream unreachable"
+        # once that became something to report. Neither was true, so the
+        # scheme is stripped to the plain path git does accept.
+        case "$url" in
+            file:///*) url="${url#file://}" ;;
+            file:/*)   url="${url#file:}" ;;
+        esac
+
+        # A bare ref name matches refs/heads, refs/tags and the
+        # refs/remotes/origin copy a local clone carries, so the listing can
+        # hold more than one line. Keeping all of them compared a multi-line
+        # string against a single revision - unequal forever, which reads as
+        # an update no rebuild can clear. The branch is preferred; the first
+        # line serves for a ref that is not a branch, such as a tag.
+        local latest="" first="" sha refname
+        while IFS=$'\t' read -r sha refname; do
+            [[ -n "$sha" ]] || continue
+            [[ -n "$first" ]] || first="$sha"
+            [[ "$refname" == "refs/heads/$remote_ref" ]] && { latest="$sha"; break; }
+        done < <(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
+                     "$url" "$remote_ref" 2>/dev/null)
+        [[ -n "$latest" ]] || latest="$first"
+
+        if [[ -z "$latest" ]]; then
             [[ -n "$tooltip" ]] && tooltip+="\\n"
-            tooltip+="$name (locked: $locked_date)"
+            tooltip+="$name (upstream unreachable)"
+        elif [[ "$latest" != "$rev" ]]; then
+            local line status=0
+            line=$(format-upstream-line "$name" \
+                "$url" "$rev" "$latest" "$last_modified") || status=$?
+            [[ "$status" -ne 10 ]] && count=$((count + 1))
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$line"
         fi
     done < <(jq -r '
         . as $root |
@@ -106,11 +163,10 @@ check_unpinned_inputs() {
 
     echo "$count" > "$INPUT_STATE_FILE"
 
-    if [ "$count" -eq 0 ]; then
-        echo "" > "$INPUT_TOOLTIP_FILE"
-    else
-        echo "$tooltip" > "$INPUT_TOOLTIP_FILE"
-    fi
+    # Written whatever the count is. An unreachable remote produces a line
+    # without producing a count, and discarding the text whenever the count
+    # was zero threw away exactly those lines.
+    echo "$tooltip" > "$INPUT_TOOLTIP_FILE"
     
     return 0
 }
@@ -131,12 +187,30 @@ check_pinned_inputs() {
         latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
             "https://github.com/$owner/$repo" "$remote_ref" 2>/dev/null | cut -f1)
 
-        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
-            count=$((count + 1))
-            local locked_date
-            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+        if [[ -z "$latest" ]]; then
+            # Reported rather than skipped. Going silent made an unreachable
+            # remote indistinguishable from an input that is up to date: the
+            # input simply left the section and the count, which reads as
+            # "nothing to do here" when the truth is "nobody knows".
+            #
+            # Not counted, though. A count is for updates there are to apply,
+            # and whether this input has one is exactly what failed to be
+            # established - so it is shown without being added up.
             [[ -n "$tooltip" ]] && tooltip+="\\n"
-            tooltip+="$name (pinned: $locked_date)"
+            tooltip+="$name (upstream unreachable)"
+        elif [[ "$latest" != "$rev" ]]; then
+            # Counted on the renderer's verdict, not on the revisions merely
+            # differing: it exits 10 when the locked revision is strictly
+            # ahead of the tracked branch, which has nothing to update to.
+            # Reachable for a pinned input aimed at a commit that is not on
+            # its branch - a not-yet-merged tip - and counting that put a
+            # number on the waybar that no rebuild could clear.
+            local line status=0
+            line=$(format-upstream-line "$name" \
+                "https://github.com/$owner/$repo" "$rev" "$latest" "$last_modified") || status=$?
+            [[ "$status" -ne 10 ]] && count=$((count + 1))
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$line"
         fi
     done < <(jq -r '
         . as $root |
@@ -153,17 +227,43 @@ check_pinned_inputs() {
     # Check pinned generic git inputs
     while IFS=$'\t' read -r name url rev ref last_modified; do
         local remote_ref="$ref"
-        
-        local latest
-        latest=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
-            "$url" "$remote_ref" 2>/dev/null | cut -f1)
 
-        if [[ -n "$latest" && "$latest" != "$rev" ]]; then
-            count=$((count + 1))
-            local locked_date
-            locked_date=$(date -d "@$last_modified" +%Y-%m-%d 2>/dev/null || echo "?")
+        # nix writes a local input's url as "file:/path", with one slash. git
+        # reads that as an ssh target and tries to resolve a host called
+        # "file:", so the check failed on a directory it could have read
+        # perfectly well - silently before, and as "upstream unreachable"
+        # once that became something to report. Neither was true, so the
+        # scheme is stripped to the plain path git does accept.
+        case "$url" in
+            file:///*) url="${url#file://}" ;;
+            file:/*)   url="${url#file:}" ;;
+        esac
+
+        # A bare ref name matches refs/heads, refs/tags and the
+        # refs/remotes/origin copy a local clone carries, so the listing can
+        # hold more than one line. Keeping all of them compared a multi-line
+        # string against a single revision - unequal forever, which reads as
+        # an update no rebuild can clear. The branch is preferred; the first
+        # line serves for a ref that is not a branch, such as a tag.
+        local latest="" first="" sha refname
+        while IFS=$'\t' read -r sha refname; do
+            [[ -n "$sha" ]] || continue
+            [[ -n "$first" ]] || first="$sha"
+            [[ "$refname" == "refs/heads/$remote_ref" ]] && { latest="$sha"; break; }
+        done < <(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" git ls-remote \
+                     "$url" "$remote_ref" 2>/dev/null)
+        [[ -n "$latest" ]] || latest="$first"
+
+        if [[ -z "$latest" ]]; then
             [[ -n "$tooltip" ]] && tooltip+="\\n"
-            tooltip+="$name (pinned: $locked_date)"
+            tooltip+="$name (upstream unreachable)"
+        elif [[ "$latest" != "$rev" ]]; then
+            local line status=0
+            line=$(format-upstream-line "$name" \
+                "$url" "$rev" "$latest" "$last_modified") || status=$?
+            [[ "$status" -ne 10 ]] && count=$((count + 1))
+            [[ -n "$tooltip" ]] && tooltip+="\\n"
+            tooltip+="$line"
         fi
     done < <(jq -r '
         . as $root |
@@ -179,11 +279,7 @@ check_pinned_inputs() {
 
     echo "$count" > "$PINNED_STATE_FILE"
 
-    if [ "$count" -eq 0 ]; then
-        echo "" > "$PINNED_TOOLTIP_FILE"
-    else
-        echo "$tooltip" > "$PINNED_TOOLTIP_FILE"
-    fi
+    echo "$tooltip" > "$PINNED_TOOLTIP_FILE"
     
     return 0
 }
@@ -225,15 +321,20 @@ run_checks() {
     # Build tooltip
     local final_tooltip=""
     
-    if [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ "$input_count" -gt 0 ]; then
-        if [ "$INPUT_CHECKER_PINNED" != "disabled" ]; then
-            final_tooltip="Inputs:\\n$input_tooltip"
-        else
-            final_tooltip="$input_tooltip"
-        fi
+    # Labelled whether or not a Pinned section follows it. The heading used to
+    # appear only alongside one, on the reasoning that a lone section needs no
+    # name - but the lone section is the common case, and unlabelled lines left
+    # the reader to infer that flake inputs were what they were looking at.
+    #
+    # Keyed on there being lines, not on the count being non-zero. The two came
+    # apart once an unreachable remote became something to report: it is a line
+    # with no count behind it, and a section gated on the count would have
+    # dropped it the same way the loops used to.
+    if [ "$INPUT_CHECKER_MODE" != "disabled" ] && [ -n "$input_tooltip" ]; then
+        final_tooltip="Inputs:\\n$input_tooltip"
     fi
-    
-    if [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ "$pinned_count" -gt 0 ]; then
+
+    if [ "$INPUT_CHECKER_PINNED" != "disabled" ] && [ -n "$pinned_tooltip" ]; then
         if [ -n "$final_tooltip" ]; then
             final_tooltip="$final_tooltip\\n\\nPinned:\\n$pinned_tooltip"
         else
@@ -269,6 +370,25 @@ if [ -f "$INPUT_UPDATE_FLAG" ]; then
 fi
 
 if [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
+    # Every check below is a network round trip, so with no route there is
+    # nothing to find out and the last result stands. Skipped rather than
+    # attempted, because attempting it would have every input report its
+    # upstream unreachable at once - turning one fact, that the link is down,
+    # into a list as long as the inputs. The two wrapper checkers answer a
+    # missing route the same way, well before they reach their input loops.
+    #
+    # LAST_RUN_FILE is deliberately not stamped: nothing was checked, so the
+    # next poll should try again rather than wait out another interval.
+    if ! have_network; then
+        tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
+        if [ "$updates" -ne 0 ] 2>/dev/null && [ -n "$tooltip" ]; then
+            output_json "$updates" "has-updates" "$tooltip"
+        else
+            output_json "$updates" "updated" "Inputs not checked (no network)"
+        fi
+        exit 0
+    fi
+
     if run_checks; then
         updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
     else
@@ -277,9 +397,16 @@ if [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
     fi
 fi
 
+# The tooltip is shown whatever the count is, because the two are no longer the
+# same question: "nothing to apply" and "nothing to report" came apart once an
+# unreachable remote became a line without a count. Reading the stored text and
+# only falling back when there is none keeps an unreachable-only result
+# visible, where the old "count is zero, so say all up to date" discarded it.
+tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
+[ -n "$tooltip" ] || tooltip="All inputs up to date"
+
 if [ "$updates" -ne 0 ] 2>/dev/null; then
-    tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "$updates inputs behind")
     output_json "$updates" "has-updates" "$tooltip"
 else
-    output_json "0" "updated" "All inputs up to date"
+    output_json "0" "updated" "$tooltip"
 fi

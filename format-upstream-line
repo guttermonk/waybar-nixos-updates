@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+
+# Renders one "something is behind upstream" tooltip line.
+#
+#   format-upstream-line <name> <repository> <current> <upstream> \
+#                        [current-epoch] [current-note]
+#
+#   nixpkgs: 2026-10-14 → 2026-10-20 (412 commits)
+#
+# The single place the grammar is written down. Four callers need it - the
+# unpinned and pinned input loops in each of the three checkers, and
+# source-checker - and the whole point of the format is that a reader learns
+# one shape and applies it everywhere, which cannot survive four copies of the
+# rules drifting apart.
+#
+# current-epoch is the current side's commit time where the caller already
+# knows it for free: flake.lock records lastModified for every locked input,
+# and a working tree can be asked directly. Supplying it saves an API call.
+#
+# current-note is a qualifier that is true of the current side and not of the
+# comparison - "+ uncommitted" for a working tree holding changes that are in
+# no commit.
+
+set -u
+
+main() {
+    local name="${1:-}" repository="${2:-}" current="${3:-}" upstream="${4:-}"
+    local current_epoch="${5:-}" current_note="${6:-}"
+
+    local info="" current_date="" upstream_date="" commits="" diverged="" capped=""
+    info=$(upstream-info "$repository" "$current" "$upstream" "$current_epoch" 2>/dev/null) || info=""
+
+    if [[ -n "$info" ]]; then
+        # One jq rather than one per field: this runs once per stale input, and
+        # four processes each to read four values is four times the cost of
+        # reading them together.
+        #
+        # One value per line into an array, rather than @tsv into "read". An
+        # empty field here is normal - a date that could not be resolved - and
+        # "IFS=$'\t' read" silently drops a leading one, because tab counts as
+        # IFS whitespace no matter that IFS was set to only tab, so leading
+        # runs of it are stripped rather than delimiting an empty field. Every
+        # value then shifts up one and the upstream date gets printed as the
+        # current revision's date: not a cosmetic slip but a false claim about
+        # which commit is from when. mapfile keeps empty lines as empty
+        # elements, so the positions hold.
+        local -a f=()
+        mapfile -t f < <(
+            jq -r '(.current_date // ""),
+                   (.upstream_date // ""),
+                   (if .commits == null then "" else (.commits | tostring) end),
+                   (if .diverged == null then "" else (.diverged | tostring) end),
+                   (if .commits_capped then "capped" else "" end)' \
+                <<<"$info" 2>/dev/null
+        ) || true
+        current_date="${f[0]:-}"
+        upstream_date="${f[1]:-}"
+        commits="${f[2]:-}"
+        diverged="${f[3]:-}"
+        capped="${f[4]:-}"
+    fi
+
+    # Which way the two sides have moved relative to each other, which the
+    # glyph between them then states:
+    #
+    #   behind    name: 2026-10-14 → 2026-10-20 (412 commits)
+    #   ahead     name: 793a394 ← 913c43b (85 ahead)
+    #   diverged  name: 793a394 ↔ 913c43b (51 behind, 85 ahead)
+    #
+    # The operands keep their positions in all three - current on the left,
+    # upstream on the right - and only the glyph changes. Swapping them to
+    # express direction would mean the reader could no longer tell which side
+    # is theirs without stopping to read the counts, which costs more than the
+    # direction conveys.
+    local behind=0 ahead=0
+    local behind_known=false ahead_known=false
+    if [[ "$commits" =~ ^[0-9]+$ ]]; then behind="$commits"; behind_known=true; fi
+    if [[ "$diverged" =~ ^[0-9]+$ ]]; then ahead="$diverged"; ahead_known=true; fi
+
+    # Upstream's tip predating the current revision is only possible if the
+    # current side carries commits upstream does not have, so the date
+    # ordering establishes "ahead" on its own. That matters for the backends
+    # that cannot count both directions - a shallow fetch establishes no
+    # counts at all - and it is the exact condition that would otherwise print
+    # an arrow running backwards through time.
+    #
+    # ISO dates, so a lexicographic comparison is a chronological one.
+    if [[ "$ahead_known" == false && -n "$current_date" && -n "$upstream_date" ]] &&
+       [[ "$upstream_date" < "$current_date" ]]; then
+        ahead=1   # a floor, not a count: only the direction is established
+    fi
+
+    local arrow='→'
+    if [[ "$ahead" -gt 0 && "$behind" -gt 0 ]]; then
+        arrow='↔'
+    elif [[ "$ahead" -gt 0 ]]; then
+        # Reversed rather than dropped. There is still a relationship to
+        # state - upstream could move to this revision, not the other way -
+        # and the arrowhead is where that belongs. Dropping it would leave two
+        # revisions side by side saying nothing about how they relate.
+        arrow='←'
+    fi
+
+    # Whether the suffix below names one distance or two.
+    local fast_forward=true
+    [[ "$arrow" == '→' ]] || fast_forward=false
+
+    # Dates whenever both are known, on every relationship.
+    #
+    # They were once confined to "→" on the grounds that a date pair across an
+    # arrow asserts a sequence, and between two diverged lines there is none to
+    # assert. That held while "→" was the only glyph: the direction lived in
+    # the left-to-right order, so reversed dates read as time running
+    # backwards. It does not hold now. The glyph carries the direction, and
+    # carries it well enough that the arrowhead always points at the more
+    # recent side - rightward when upstream is newer, leftward when the current
+    # side is - while "↔" has a head at each end and so claims no order at all.
+    # A date pair under it says "this side last moved then, that side then",
+    # which is exactly true of two lines that have both moved.
+    #
+    # Dates on both sides or revisions on both sides, never one of each: the
+    # arrow is a comparison, and a comparison between a date and a hash asks
+    # the reader to hold two different kinds of thing in mind to read one line.
+    # The locked date is still worth printing when it is all there is, so it
+    # rides along on the side it describes rather than being dropped.
+    local left right
+    if [[ -n "$current_date" && -n "$upstream_date" ]]; then
+        left="$current_date"
+        right="$upstream_date"
+    else
+        left="${current:0:7}"
+        right="${upstream:0:7}"
+        [[ -n "$current_date" ]] && left+=" ($current_date)"
+    fi
+
+    [[ -n "$current_note" ]] && left+=" $current_note"
+
+    # The distance, when it could be established. Spelled out in full rather
+    # than abbreviated: "412 commits" is the answer to "how far behind am I",
+    # which is the question the line exists to answer.
+    #
+    # Both directions are named once the comparison is not a fast-forward,
+    # because then "412 commits" is ambiguous about which way it points -
+    # "51 behind, 7 ahead" says what a fork's position actually is, and the
+    # "7 ahead" is the part that explains why the dates went missing.
+    # "+" where the count is a floor rather than a total, because the walk
+    # that produced it was stopped short. Saying "500 commits" there would be
+    # a number the checker does not actually have.
+    local more=""
+    [[ "$capped" == "capped" ]] && more="+"
+
+    # Only counts that were actually counted. The glyph already states the
+    # relationship, so the suffix has nothing to hedge about in prose: a "←"
+    # with no number after it says "ahead, by an amount nobody established",
+    # and writing that out added length without adding knowledge. An inferred
+    # direction contributes a glyph and no number.
+    local -a notes=()
+    if [[ "$fast_forward" == true ]]; then
+        if [[ "$behind" == "1" && -z "$more" ]]; then
+            notes+=("1 commit")
+        elif [[ "$behind" -gt 0 ]]; then
+            notes+=("$behind$more commits")
+        fi
+    else
+        [[ "$behind_known" == true && "$behind" -gt 0 ]] && \
+            notes+=("$behind$more behind")
+        [[ "$ahead_known" == true && "$ahead" -gt 0 ]] && \
+            notes+=("$ahead ahead")
+    fi
+
+    local suffix=""
+    if [[ "${#notes[@]}" -gt 0 ]]; then
+        local joined
+        joined=$(printf '%s, ' "${notes[@]}")
+        suffix=" (${joined%, })"
+    fi
+
+    printf '%s: %s %s %s%s' "$name" "$left" "$arrow" "$right" "$suffix"
+
+    # The exit status reports whether there is anything upstream to move to,
+    # which is the question a caller's count is actually asking. 10 means
+    # there is not: the current revision carries commits upstream does not
+    # have, and upstream carries none the current side is missing. A "←" line
+    # is a thing worth showing - the two sides genuinely differ - but counting
+    # it puts a number on the waybar for work that does not exist, and no
+    # rebuild can ever clear it.
+    #
+    # Behind by an unknown amount still exits 0. The revisions differ, and
+    # without a count there is no basis for claiming the difference runs in
+    # only one direction - so the benefit of the doubt goes to counting it,
+    # which is also what every caller did before this status existed.
+    if [[ "$behind_known" == true && "$behind" -eq 0 && "$ahead" -gt 0 ]]; then
+        return 10
+    fi
+    return 0
+}
+
+main "$@"

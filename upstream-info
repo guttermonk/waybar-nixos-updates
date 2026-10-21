@@ -1,0 +1,576 @@
+#!/usr/bin/env bash
+
+# Resolves the two facts a revision pair cannot state on its own: the date of
+# the upstream commit, and how many commits separate it from the current one.
+#
+#   upstream-info <repository> <current-rev> <upstream-rev> [current-epoch]
+#
+# Prints one JSON object on stdout. Every field is optional, and an empty one
+# means "could not be resolved", not "zero":
+#
+#   {"current_date":"2026-10-14","upstream_date":"2026-10-20","commits":412,"diverged":0}
+#
+# Callers render dates when they are present and fall back to abbreviated
+# revisions when they are not, so this failing is a plainer tooltip rather than
+# a broken check. Nothing here is allowed to be fatal to the caller: every exit
+# is 0 and every failure path prints a well-formed object.
+
+set -u
+
+CACHE_DIR="${CACHE_DIR:-$HOME/.cache}"
+
+# "api" | "disabled". Disabling it leaves callers on the revision-pair form.
+UPSTREAM_INFO_MODE="${UPSTREAM_INFO_MODE:-api}"
+
+# Whether a non-GitHub remote may be asked for the upstream date with a
+# shallow fetch, since it has no compare endpoint to ask instead. GitHub is
+# handled by the API path above and unaffected by this either way.
+#
+# On by default, which is only defensible because of the size guard in
+# fetch_upstream_date: the cheap form of the fetch needs the server to
+# advertise uploadpack.allowFilter, and one that does not serves the whole
+# tree at that commit instead. The guard makes that overrun happen once per
+# server rather than once per hour, which is the difference between a cost and
+# a leak.
+UPSTREAM_INFO_FETCH="${UPSTREAM_INFO_FETCH:-enabled}"
+
+# What a filtered depth-1 fetch is allowed to put on disk before the server is
+# taken to have ignored the filter. A single commit object is a few KiB; a
+# tree-bearing snapshot of any real repository is orders of magnitude more, so
+# anything in between does as a threshold and this one leaves room for an
+# unusually fat commit without coming close to a tree.
+UPSTREAM_INFO_FETCH_MAX_KIB="${UPSTREAM_INFO_FETCH_MAX_KIB:-2048}"
+
+# Per-call ceiling. These run serially inside the lock the checker holds, so an
+# unbounded call against a slow host would stall every check behind it.
+UPSTREAM_INFO_TIMEOUT="${UPSTREAM_INFO_TIMEOUT:-10}"
+
+INFO_CACHE_DIR="$CACHE_DIR/nix-update-upstream-info"
+
+# How many pages of 100 a commit count may be walked before it is reported as
+# a floor instead. Bitbucket does not return a total for a commit range, so the
+# only way to a number there is to walk it - and a busy repository must not be
+# able to turn one tooltip line into an unbounded series of requests.
+UPSTREAM_INFO_PAGE_MAX="${UPSTREAM_INFO_PAGE_MAX:-5}"
+
+# Servers observed to ignore --filter=tree:0, one empty file per host. A
+# subdirectory so these do not sit among the result files, which are pruned on
+# a schedule that would be wrong for them.
+NOFILTER_DIR="$INFO_CACHE_DIR/nofilter"
+
+# Resolved by github_slug() from the repository URL.
+GITHUB_SLUG=""
+
+# Accumulated by the resolvers, emitted once at the end.
+CURRENT_DATE=""
+UPSTREAM_DATE=""
+COMMITS=""
+DIVERGED=""
+
+# True when COMMITS is a floor rather than a total, because the walk that
+# produced it hit UPSTREAM_INFO_PAGE_MAX before the range ran out. Reported
+# rather than smoothed over: "500 commits" and "at least 500 commits" are
+# different claims, and only one of them is true here.
+COMMITS_CAPPED=false
+
+emit() {
+    jq -cn \
+        --arg current_date "$CURRENT_DATE" \
+        --arg upstream_date "$UPSTREAM_DATE" \
+        --arg commits "$COMMITS" \
+        --arg diverged "$DIVERGED" \
+        --arg capped "$COMMITS_CAPPED" \
+        '{
+            current_date: $current_date,
+            upstream_date: $upstream_date,
+            commits: (if $commits == "" then null else ($commits | tonumber) end),
+            diverged: (if $diverged == "" then null else ($diverged | tonumber) end),
+            commits_capped: ($capped == "true")
+        }'
+}
+
+# An ISO-8601 instant as the plain day. The day is the unit the tooltip reads
+# in, and the time of day would only make the line longer without making it
+# more answerable.
+iso_day() {
+    [[ -n "$1" ]] || return 1
+    printf '%s' "${1%%T*}"
+}
+
+epoch_day() {
+    date -d "@$1" +%Y-%m-%d 2>/dev/null
+}
+
+# owner/repo for a GitHub remote, empty for anything else. Covers the forms a
+# flake.lock or a sourceChecks entry actually carries: the flake ref shorthand,
+# https with and without a .git suffix, nix's git+https, and scp-style ssh.
+github_slug() {
+    local url="$1"
+    local slug=""
+
+    case "$url" in
+        github:*)                  slug="${url#github:}" ;;
+        git+https://github.com/*)  slug="${url#git+https://github.com/}" ;;
+        https://github.com/*)      slug="${url#https://github.com/}" ;;
+        git+ssh://git@github.com/*) slug="${url#git+ssh://git@github.com/}" ;;
+        ssh://git@github.com/*)    slug="${url#ssh://git@github.com/}" ;;
+        git@github.com:*)          slug="${url#git@github.com:}" ;;
+        *) return 1 ;;
+    esac
+
+    slug="${slug%.git}"
+    slug="${slug%/}"
+
+    # A flake ref carries the tracked branch as a third path segment
+    # ("owner/repo/main"); the API wants only the first two.
+    local owner="${slug%%/*}"
+    local rest="${slug#*/}"
+    local repo="${rest%%/*}"
+    [[ -n "$owner" && -n "$repo" && "$owner" != "$slug" ]] || return 1
+
+    GITHUB_SLUG="$owner/$repo"
+}
+
+# Both hosts give an unauthenticated caller 60 requests an hour against its
+# whole IP, not this process - so exhausting one is a condition to wait out
+# rather than retry into. The reset instant is recorded and every call declines
+# until it passes, which keeps one busy hour from spending the next one too.
+#
+# Tracked per provider. The two budgets are separate, and a spent GitHub hour
+# must not stop a Bitbucket line from resolving.
+ratelimit_file() {
+    printf '%s/nix-update-%s-ratelimit' "$CACHE_DIR" "$1"
+}
+
+ratelimited() {
+    local file reset
+    file=$(ratelimit_file "$1")
+    reset=$(cat "$file" 2>/dev/null) || return 1
+    [[ "$reset" =~ ^[0-9]+$ ]] || return 1
+    if [[ "$(date +%s)" -lt "$reset" ]]; then
+        return 0
+    fi
+    rm -f "$file"
+    return 1
+}
+
+note_ratelimited() {
+    local provider="$1" reset="$2"
+    [[ "$reset" =~ ^[0-9]+$ ]] || reset=$(( $(date +%s) + 900 ))
+    printf '%s\n' "$reset" > "$(ratelimit_file "$provider")"
+}
+
+# One GitHub API GET. Prints the body and returns non-zero on any status that
+# is not a 200, recording a rate-limit reset when that is what the status
+# means. The token is optional and lifts the budget from 60/hour to 5000; it is
+# read from the environment so that a NixOS module can pass it from a file
+# without it ever reaching the store or a command line.
+github_get() {
+    local path="$1"
+    local token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    local -a auth=()
+    [[ -n "$token" ]] && auth=(-H "Authorization: Bearer $token")
+
+    # ${arr[@]+"${arr[@]}"} rather than "${arr[@]}": under set -u an empty
+    # array is an unbound expansion on bash before 4.4, and an unauthenticated
+    # call is the default rather than the edge case.
+    local response status body
+    response=$(curl -sS --max-time "$UPSTREAM_INFO_TIMEOUT" \
+        -w $'\n%{http_code}' \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28' \
+        ${auth[@]+"${auth[@]}"} \
+        "https://api.github.com$path" 2>/dev/null) || return 1
+
+    status="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+
+    case "$status" in
+        200) printf '%s' "$body"; return 0 ;;
+        403|429)
+            # Both statuses also cover things that are not the budget, so the
+            # backoff is only recorded when the body says the budget is what
+            # ran out. A 403 for a private repository must not silence every
+            # other repository for an hour.
+            if grep -qi 'rate limit' <<<"$body"; then
+                note_ratelimited github "$(github_reset_epoch)"
+            fi
+            return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# The instant the budget refills. Asked only after a rejection, so it costs
+# nothing on the normal path - and /rate_limit is itself exempt from the budget
+# it reports on, so asking is always possible even once nothing else is.
+github_reset_epoch() {
+    curl -sS --max-time "$UPSTREAM_INFO_TIMEOUT" \
+        -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/rate_limit" 2>/dev/null \
+        | jq -r '.resources.core.reset // empty' 2>/dev/null
+}
+
+# The upstream date and the distance, from a single compare call.
+#
+# The comparison is deliberately reversed - upstream as the base, current as
+# the head - because the response describes its base and only summarises its
+# head. That way "base_commit" is the upstream commit, carrying the date that
+# is wanted, and "behind_by" is how many commits the current revision is short
+# of it.
+#
+# Reading the head date out of the returned "commits" array instead would be
+# wrong rather than merely different: that array is capped at 250 entries, so
+# for anything nixpkgs-sized its last element is the 250th commit of the range
+# and not upstream's tip at all. The cap cannot be seen in the response for a
+# range of exactly 250, which is what makes it worth avoiding by construction.
+github_compare() {
+    local current="$1" upstream="$2"
+    local body
+    body=$(github_get "/repos/$GITHUB_SLUG/compare/$upstream...$current") || return 1
+
+    local date behind ahead
+    date=$(jq -r '.base_commit.commit.committer.date // empty' <<<"$body" 2>/dev/null)
+    behind=$(jq -r '.behind_by // empty' <<<"$body" 2>/dev/null)
+    ahead=$(jq -r '.ahead_by // empty' <<<"$body" 2>/dev/null)
+
+    [[ -n "$date" ]] && UPSTREAM_DATE=$(iso_day "$date")
+    [[ "$behind" =~ ^[0-9]+$ ]] && COMMITS="$behind"
+    [[ "$ahead" =~ ^[0-9]+$ ]] && DIVERGED="$ahead"
+
+    [[ -n "$UPSTREAM_DATE" || -n "$COMMITS" ]]
+}
+
+# The current revision's own date, for the callers that have no local source
+# for it: a hand-written pin, or a revision read out of a package's src. One
+# extra call, made only when it is the only way to have the date at all.
+github_commit_date() {
+    local rev="$1"
+    local body
+    body=$(github_get "/repos/$GITHUB_SLUG/commits/$rev") || return 1
+    CURRENT_DATE=$(iso_day "$(jq -r '.commit.committer.date // empty' <<<"$body" 2>/dev/null)")
+    [[ -n "$CURRENT_DATE" ]]
+}
+
+# ===== Bitbucket =====
+#
+# Resolved by bitbucket_slug() from the repository URL.
+BITBUCKET_SLUG=""
+
+bitbucket_slug() {
+    local url="$1" slug=""
+    case "$url" in
+        git+https://bitbucket.org/*) slug="${url#git+https://bitbucket.org/}" ;;
+        https://bitbucket.org/*)     slug="${url#https://bitbucket.org/}" ;;
+        git+ssh://git@bitbucket.org/*) slug="${url#git+ssh://git@bitbucket.org/}" ;;
+        ssh://git@bitbucket.org/*)   slug="${url#ssh://git@bitbucket.org/}" ;;
+        git@bitbucket.org:*)         slug="${url#git@bitbucket.org:}" ;;
+        *) return 1 ;;
+    esac
+    slug="${slug%.git}"
+    slug="${slug%/}"
+
+    # Separate statements, not one "local a=.. b=.. c=${b..}": the names in a
+    # single local are all established before any of them are assigned, so the
+    # third would read the second while it is still unset and set -u would
+    # abort the whole run over a URL that parses perfectly well.
+    local workspace="${slug%%/*}"
+    local rest="${slug#*/}"
+    local repo="${rest%%/*}"
+    [[ -n "$workspace" && -n "$repo" && "$workspace" != "$slug" ]] || return 1
+    BITBUCKET_SLUG="$workspace/$repo"
+}
+
+# One Bitbucket API GET, with the same contract as github_get.
+bitbucket_get() {
+    local url="$1"
+    local response status body
+    response=$(curl -sS --max-time "$UPSTREAM_INFO_TIMEOUT" \
+        -w $'\n%{http_code}' \
+        -H 'Accept: application/json' \
+        "$url" 2>/dev/null) || return 1
+
+    status="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+
+    case "$status" in
+        200) printf '%s' "$body"; return 0 ;;
+        429)
+            # x-ratelimit-reset is a delay in seconds here rather than an
+            # instant, so it is turned into one. Fetching the header costs
+            # another request, which is the thing being avoided - the default
+            # in note_ratelimited is used instead.
+            note_ratelimited bitbucket ""
+            return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# The upstream commit's date, for when no shallow fetch supplied it.
+bitbucket_commit_date() {
+    local rev="$1" body
+    body=$(bitbucket_get "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_SLUG/commit/$rev?fields=date") || return 1
+    UPSTREAM_DATE=$(iso_day "$(jq -r '.date // empty' <<<"$body" 2>/dev/null)")
+    [[ -n "$UPSTREAM_DATE" ]]
+}
+
+# How many commits upstream has that the current revision does not.
+#
+# Bitbucket's commit listing carries no total - the "size" field every other
+# paginated collection there provides is simply absent for commits, at every
+# page length and for every range - so the only number available is the one
+# counted by walking. What makes that workable is that the absence of a "next"
+# link proves the walk is finished: the running total is then exact, not a
+# sample. A range of 100 or fewer therefore costs a single request.
+#
+# fields= trims each page from around 187KB to 3.4KB, because none of the
+# commit bodies, author records or links are wanted - only how many there are
+# and whether another page follows.
+#
+# The walk stops at UPSTREAM_INFO_PAGE_MAX and says so through COMMITS_CAPPED,
+# rather than following "next" for as long as a repository cares to produce
+# pages.
+bitbucket_count() {
+    local include="$1" exclude="$2" max_pages="$3"
+    local url="https://api.bitbucket.org/2.0/repositories/$BITBUCKET_SLUG/commits"
+    url+="?include=$include&exclude=$exclude&pagelen=100&fields=next,values.hash"
+
+    BITBUCKET_COUNT=""
+    BITBUCKET_COUNT_CAPPED=false
+
+    local total=0 pages=0 body page_len next
+    while [[ -n "$url" ]]; do
+        if [[ "$pages" -ge "$max_pages" ]]; then
+            BITBUCKET_COUNT_CAPPED=true
+            break
+        fi
+
+        body=$(bitbucket_get "$url") || break
+        pages=$((pages + 1))
+
+        page_len=$(jq -r '(.values // []) | length' <<<"$body" 2>/dev/null)
+        [[ "$page_len" =~ ^[0-9]+$ ]] || break
+        total=$((total + page_len))
+
+        next=$(jq -r '.next // empty' <<<"$body" 2>/dev/null)
+        url="$next"
+    done
+
+    [[ "$pages" -gt 0 ]] || return 1
+    BITBUCKET_COUNT="$total"
+}
+
+# Set by bitbucket_count.
+BITBUCKET_COUNT=""
+BITBUCKET_COUNT_CAPPED=false
+
+# Both distances, with the second one asked for only when it is in doubt.
+#
+# The reverse range establishes whether the current revision carries commits
+# upstream does not have, which is what tells "behind" apart from "diverged"
+# and so which glyph the line gets. It is requested only when upstream's tip
+# turns out to predate the current revision, because that ordering is the only
+# way a non-fast-forward can arise - so the ordinary case stays at one request
+# and the exact numbers are bought only where they change the answer.
+#
+# One page for the reverse direction. A fork's own commits are the kind of
+# thing there are tens of, and knowing "more than 100" would not read any
+# differently from knowing the number.
+bitbucket_distances() {
+    local current="$1" upstream="$2"
+
+    bitbucket_count "$upstream" "$current" "$UPSTREAM_INFO_PAGE_MAX" || return 1
+    COMMITS="$BITBUCKET_COUNT"
+    COMMITS_CAPPED="$BITBUCKET_COUNT_CAPPED"
+
+    if [[ -n "$CURRENT_DATE" && -n "$UPSTREAM_DATE" ]] &&
+       [[ "$UPSTREAM_DATE" < "$CURRENT_DATE" ]]; then
+        if bitbucket_count "$current" "$upstream" 1; then
+            DIVERGED="$BITBUCKET_COUNT"
+        fi
+    else
+        # Not in doubt: upstream's tip is at least as new, so there is nothing
+        # on the current side that upstream lacks.
+        DIVERGED=0
+    fi
+}
+
+# The host of a git URL, which is the unit filter support is a property of:
+# whether --filter=tree:0 is honoured is a server configuration, so one
+# repository's answer holds for every repository beside it.
+url_host() {
+    local url="$1"
+    case "$url" in
+        # scp-style, git@host:owner/repo
+        *@*:*[!0-9]*) url="${url#*@}"; url="${url%%:*}" ;;
+        *://*)
+            url="${url#*://}"   # strip scheme
+            url="${url%%/*}"    # strip path
+            url="${url#*@}"     # strip userinfo
+            url="${url%%:*}"    # strip port
+            ;;
+        *) return 1 ;;
+    esac
+    [[ -n "$url" ]] || return 1
+    printf '%s' "$url"
+}
+
+# The upstream date from a non-GitHub remote, with no API to ask. A commit-only
+# fetch - depth 1, trees filtered out - into a scratch repository, which is the
+# cheapest shape that still carries a committer date. No distance comes out of
+# this: counting commits needs the history between the two revisions, and
+# deepening until it is present is unbounded in exactly the way a tooltip
+# refresh must not be.
+#
+# The size guard is what makes this safe to leave on. A server cannot be asked
+# in advance whether it will honour the filter, and a fetch cannot be capped by
+# size, so the only honest test is what actually arrived - measured after the
+# fact, against a threshold a commit object cannot reach and a tree cannot
+# avoid. A server that overran is recorded by host and never fetched from
+# again, so the overrun costs one fetch rather than one per hour forever.
+fetch_upstream_date() {
+    local repository="$1" upstream="$2"
+    [[ "$UPSTREAM_INFO_FETCH" == "enabled" ]] || return 1
+
+    local host key
+    host=$(url_host "$repository") || host="$repository"
+    key=$(printf '%s' "$host" | sha256sum | cut -d' ' -f1)
+
+    # Expired rather than permanent: filter support arrives with a git upgrade
+    # on the server, and a host written off once should not be written off for
+    # good. A month is long enough that the re-probe is not a recurring cost
+    # and short enough that an upgrade is noticed.
+    find "$NOFILTER_DIR" -maxdepth 1 -type f -mtime +30 -delete 2>/dev/null || true
+
+    [[ -f "$NOFILTER_DIR/$key" ]] && return 1
+    mkdir -p "$NOFILTER_DIR" 2>/dev/null || return 1
+
+    # A scratch repository per fetch rather than one reused across them. Only
+    # ever one commit is wanted, so there is nothing to carry over, and a
+    # fresh directory makes the size below the size of this fetch instead of
+    # everything ever fetched. Leftovers from a killed run are cleared on the
+    # way past.
+    find "$INFO_CACHE_DIR" -maxdepth 1 -type d -name 'fetch.*' -mmin +60 \
+        -exec rm -rf {} + 2>/dev/null || true
+
+    local scratch
+    scratch=$(mktemp -d "$INFO_CACHE_DIR/fetch.XXXXXX" 2>/dev/null) || return 1
+
+    # --template= so git writes no sample hooks, leaving the measurement below
+    # reading the fetch rather than a fixed tare weight.
+    local epoch="" kib=0
+    if git init -q --bare --template= "$scratch" 2>/dev/null &&
+       GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="" timeout "$UPSTREAM_INFO_TIMEOUT" \
+           git -C "$scratch" fetch -q --depth=1 --filter=tree:0 --no-tags \
+               "$repository" "$upstream" 2>/dev/null; then
+        epoch=$(git -C "$scratch" log -1 --format=%ct FETCH_HEAD 2>/dev/null) || epoch=""
+        kib=$(du -sk "$scratch" 2>/dev/null | cut -f1)
+    fi
+
+    rm -rf "$scratch" 2>/dev/null || true
+
+    if [[ "${kib:-0}" =~ ^[0-9]+$ ]] && [[ "$kib" -gt "$UPSTREAM_INFO_FETCH_MAX_KIB" ]]; then
+        : > "$NOFILTER_DIR/$key" 2>/dev/null || true
+    fi
+
+    # The date is still used when it arrived, even from a fetch that overran:
+    # it has already been paid for, and discarding it would mean the one
+    # expensive fetch bought nothing at all.
+    [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+    UPSTREAM_DATE=$(epoch_day "$epoch")
+    [[ -n "$UPSTREAM_DATE" ]]
+}
+
+# Keyed on the revision pair, so a result stays valid for exactly as long as
+# the comparison it describes does: the moment either side moves, the key
+# changes and the answer is fetched again. That also makes a second checker
+# reading the same pair free, which matters because the full and lightweight
+# wrappers both do.
+#
+# Only successes are stored. Caching a failure would pin a transient one in
+# place until upstream happened to move, and the rate-limit backoff already
+# covers the case that needs suppressing.
+cache_key() {
+    printf '%s|%s|%s' "$1" "$2" "$3" | sha256sum | cut -d' ' -f1
+}
+
+main() {
+    local repository="${1:-}" current="${2:-}" upstream="${3:-}" current_epoch="${4:-}"
+
+    if [[ -z "$repository" || -z "$current" || -z "$upstream" ]]; then
+        emit
+        return 0
+    fi
+
+    # nix locks a local flake input as "file:/path", with one slash, which git
+    # reads as an ssh target: it tries to resolve a host called "file:" and
+    # fails on a directory it could read perfectly well. The callers normalise
+    # it before their own ls-remote, but it is done again here so that the
+    # shallow fetch below is right for any caller rather than only the ones
+    # that remembered - and so the cache key is the same string whichever
+    # caller asked.
+    case "$repository" in
+        file:///*) repository="${repository#file://}" ;;
+        file:/*)   repository="${repository#file:}" ;;
+    esac
+
+    # Free and local, so it is taken before anything is asked of the network:
+    # flake.lock records lastModified for every locked input, and a working
+    # tree can be asked directly.
+    if [[ -n "$current_epoch" && "$current_epoch" =~ ^[0-9]+$ ]]; then
+        CURRENT_DATE=$(epoch_day "$current_epoch")
+    fi
+
+    if [[ "$UPSTREAM_INFO_MODE" == "disabled" ]]; then
+        emit
+        return 0
+    fi
+
+    mkdir -p "$INFO_CACHE_DIR" 2>/dev/null || { emit; return 0; }
+
+    local key cached
+    key=$(cache_key "$repository" "$current" "$upstream")
+    if cached=$(cat "$INFO_CACHE_DIR/$key" 2>/dev/null) && [[ -n "$cached" ]]; then
+        printf '%s\n' "$cached"
+        return 0
+    fi
+
+    if github_slug "$repository" && ! ratelimited github; then
+        github_compare "$current" "$upstream" || true
+        # Asked for only when the caller had no local date to give, which is
+        # the pin-and-package case rather than the flake-input one.
+        [[ -z "$CURRENT_DATE" ]] && { github_commit_date "$current" || true; }
+    elif bitbucket_slug "$repository"; then
+        # The fetch first, and the API only for what the fetch cannot give.
+        # Bitbucket has no compare endpoint pairing a date with a distance the
+        # way GitHub's does, so the date and the count are separate requests -
+        # and the date is the one obtainable without spending any of a 60/hour
+        # budget, so it is taken from the fetch whenever that is allowed.
+        fetch_upstream_date "$repository" "$upstream" || true
+        if ! ratelimited bitbucket; then
+            [[ -z "$UPSTREAM_DATE" ]] && { bitbucket_commit_date "$upstream" || true; }
+            bitbucket_distances "$current" "$upstream" || true
+        fi
+    else
+        fetch_upstream_date "$repository" "$upstream" || true
+    fi
+
+    local result
+    result=$(emit)
+    printf '%s\n' "$result"
+
+    # A result is only worth keeping if it says something a revision pair did
+    # not already say.
+    if [[ -n "$UPSTREAM_DATE" || -n "$COMMITS" ]]; then
+        printf '%s\n' "$result" > "$INFO_CACHE_DIR/$key" 2>/dev/null || true
+        # Entries are superseded rather than updated, so without this the
+        # directory only ever grows - one dead file per revision pair that ever
+        # held still long enough to be asked about.
+        find "$INFO_CACHE_DIR" -maxdepth 1 -type f -mtime +30 -delete 2>/dev/null || true
+    fi
+
+    return 0
+}
+
+main "$@"

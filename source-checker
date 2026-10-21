@@ -100,6 +100,15 @@ CURRENT_ERROR=""
 # that stayed silent on it would be claiming more than it knows.
 CURRENT_DIRTY=false
 
+# Set by current_value() wherever the current revision's commit time can be
+# read without asking the network: a working tree has it in its own history,
+# and flake.lock records lastModified for every locked input. Passed on to
+# format-upstream-line, which would otherwise have to spend an API call
+# establishing a date that was sitting on disk. Left empty for a hand-written
+# pin and for a revision out of a package's src, which genuinely have no local
+# source for it.
+CURRENT_EPOCH=""
+
 # Records whether a working tree has changes that are in no commit. Its own
 # function so that the callers below can end on an explicit "return 0": a
 # trailing "[[ ... ]] && CURRENT_DIRTY=true" would hand its own false status
@@ -120,6 +129,7 @@ worktree_revision() {
     git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
     CURRENT_VALUE=$(git -C "$path" rev-parse HEAD 2>/dev/null)
     [[ -n "$CURRENT_VALUE" ]] || return 1
+    CURRENT_EPOCH=$(git -C "$path" log -1 --format=%ct HEAD 2>/dev/null) || CURRENT_EPOCH=""
     note_worktree_dirty "$path"
     return 0
 }
@@ -285,6 +295,7 @@ current_value() {
                 CURRENT_VALUE=$(jq -r '.original.ref // empty' <<<"$node")
             else
                 CURRENT_VALUE=$(jq -r '.locked.rev // empty' <<<"$node")
+                CURRENT_EPOCH=$(jq -r '.locked.lastModified // empty' <<<"$node")
             fi
             ;;
         local)
@@ -349,6 +360,7 @@ main() {
         DERIVED_REPOSITORY=""
         CURRENT_ERROR="current revision not found"
         CURRENT_DIRTY=false
+        CURRENT_EPOCH=""
         if ! current_value "$check" || [[ -z "$CURRENT_VALUE" || "$CURRENT_VALUE" == "null" ]]; then
             add_line "$name ($CURRENT_ERROR)"
             continue
@@ -363,6 +375,26 @@ main() {
             add_line "$name (no upstream repository configured)"
             continue
         fi
+
+        # "file:/path", with one slash, is what nix writes for a local source
+        # and what gets copied out of a flake.lock into a check by hand. git
+        # reads it as an ssh target - resolving a host called "file:" - and
+        # fails on a directory it could read perfectly well.
+        #
+        # Repaired rather than reported, which is the opposite of how the
+        # checks below treat a bad policy, and for a reason: those are
+        # reported because two different repairs are plausible and picking one
+        # would be guessing at intent. This has a single possible reading, and
+        # the form never works, so normalising it cannot mask a mistake or
+        # change what a working configuration does. The rule is "do not
+        # guess", not "do not repair".
+        #
+        # Applied after the fallback above, so a repository derived from a
+        # package's own src gets the same treatment as a configured one.
+        case "$repository" in
+            file:///*) repository="${repository#file://}" ;;
+            file:/*)   repository="${repository#file:}" ;;
+        esac
 
         # The comparison below is only meaningful when both sides are the same
         # kind of thing: a branch policy resolves upstream to a commit, a tag
@@ -439,23 +471,67 @@ main() {
         # going silent there would say "current" about something that was built
         # from code existing in no commit at all. Not counted either way: there
         # is nothing upstream to move to, which is the thing a count is for.
+        #
+        # The current value is abbreviated for a revision and left whole for a
+        # tag: a tag name is already what a human would call the version, and
+        # cutting it to seven characters turns "v1.2.3-rc1" into "v1.2.3-",
+        # which is what this line used to do.
         if [[ "$current" == "$upstream" ]]; then
-            [[ "$CURRENT_DIRTY" == true ]] && \
-                add_line "$name (${current:0:7}, uncommitted local changes)"
+            if [[ "$CURRENT_DIRTY" == true ]]; then
+                local at="$current"
+                [[ "$policy" == "tag" ]] || at="${current:0:7}"
+                add_line "$name: $at, uncommitted local changes"
+            fi
             continue
         fi
 
-        [[ "$mode" == "count" ]] && count=$((count + 1))
         # The qualifier rides on the current side, which is the side it is true
         # of: the tree is that revision plus changes that are not in it.
-        local current_label="$current"
-        [[ "$policy" == "tag" ]] || current_label="${current:0:7}"
-        [[ "$CURRENT_DIRTY" == true ]] && current_label+=" + uncommitted"
-        if [[ "$policy" == "tag" ]]; then
-            add_line "$name ($current_label → $upstream)"
-        else
-            add_line "$name ($current_label → ${upstream:0:7})"
-        fi
+        local note=""
+        [[ "$CURRENT_DIRTY" == true ]] && note="+ uncommitted"
+
+        case "$policy" in
+            tag)
+                # No date enrichment for a tag policy, deliberately. A release
+                # name is already the most legible thing either side could be
+                # called, so replacing it with the day it was cut would cost
+                # information rather than add it - and dating a tag means
+                # resolving it to a commit first, which is a round trip spent
+                # making the line worse.
+                local note_suffix=""
+                [[ -n "$note" ]] && note_suffix=" $note"
+                # Always counted. Two different tag names mean a different
+                # release is out, which is actionable whichever way round the
+                # version numbers happen to sort.
+                [[ "$mode" == "count" ]] && count=$((count + 1))
+                add_line "$name: $current$note_suffix → $upstream"
+                ;;
+            *)
+                # Dates and distance where they can be had, abbreviated
+                # revisions where they cannot. Failure lines above keep their
+                # "name (reason)" shape on purpose: a finding and a check that
+                # could not be made should not read as the same kind of
+                # statement.
+                #
+                # CURRENT_EPOCH is whatever could be read locally - a working
+                # tree's own history, or the lock's lastModified - and empty
+                # for a hand-written pin or a package src, which have no local
+                # source for it and fall back to one more API call.
+                # Counted on the renderer's verdict rather than on the
+                # revisions merely differing. It exits 10 for a current
+                # revision that is strictly ahead - a fork with nothing to
+                # pull - and a count there would put a number on the waybar
+                # for work that does not exist, which no rebuild can clear.
+                # Shown either way: the two sides do differ, and that is worth
+                # knowing even when there is nothing to do about it.
+                local line status=0
+                line=$(format-upstream-line \
+                    "$name" "$repository" "$current" "$upstream" \
+                    "$CURRENT_EPOCH" "$note") || status=$?
+                [[ "$mode" == "count" && "$status" -ne 10 ]] && count=$((count + 1))
+                add_line "$line"
+                ;;
+        esac
     done < <(jq -c '.[]' <<<"$SOURCE_CHECKS_JSON")
 
     json_result "$count" "$shown" "$tooltip"

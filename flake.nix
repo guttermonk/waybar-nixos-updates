@@ -31,6 +31,10 @@
             chmod +x $out/bin/update-checker
             cp source-checker $out/bin/source-checker
             chmod +x $out/bin/source-checker
+            cp upstream-info $out/bin/upstream-info
+            chmod +x $out/bin/upstream-info
+            cp format-upstream-line $out/bin/format-upstream-line
+            chmod +x $out/bin/format-upstream-line
             cp custom-checker $out/bin/custom-checker
             chmod +x $out/bin/custom-checker
             cp preview $out/bin/preview
@@ -61,6 +65,7 @@
                 pkgs.util-linux  # flock - serialises the check
                 pkgs.sqlite  # reads the nix store db for build-time estimates
                 pkgs.git  # source-checker
+                pkgs.curl  # upstream-info: the GitHub compare API
               ]}"
             
             runHook postInstall
@@ -94,6 +99,10 @@
             chmod +x $out/bin/lightweight-checker
             cp source-checker $out/bin/source-checker
             chmod +x $out/bin/source-checker
+            cp upstream-info $out/bin/upstream-info
+            chmod +x $out/bin/upstream-info
+            cp format-upstream-line $out/bin/format-upstream-line
+            chmod +x $out/bin/format-upstream-line
             cp custom-checker $out/bin/custom-checker
             chmod +x $out/bin/custom-checker
             cp preview $out/bin/preview
@@ -122,6 +131,7 @@
                 pkgs.util-linux  # flock, setsid - background check serialisation
                 pkgs.sqlite  # reads the nix store db for build-time estimates
                 pkgs.git  # source-checker
+                pkgs.curl  # upstream-info: the GitHub compare API
               ]}"
 
             runHook postInstall
@@ -147,12 +157,23 @@
             mkdir -p $out/bin
             cp input-checker $out/bin/input-checker
             chmod +x $out/bin/input-checker
+            cp upstream-info $out/bin/upstream-info
+            chmod +x $out/bin/upstream-info
+            cp format-upstream-line $out/bin/format-upstream-line
+            chmod +x $out/bin/format-upstream-line
+            # $out/bin first, as the other two packages already do: the checker
+            # calls format-upstream-line, which calls upstream-info, and
+            # neither is on a PATH this package controls otherwise.
             wrapProgram $out/bin/input-checker \
-              --prefix PATH : ${pkgs.lib.makeBinPath [
+              --prefix PATH : "$out/bin:${pkgs.lib.makeBinPath [
                 pkgs.coreutils
                 pkgs.git
                 pkgs.jq
-              ]}
+                pkgs.curl  # upstream-info: the GitHub compare API
+                pkgs.findutils  # upstream-info: cache and scratch pruning
+                pkgs.gnugrep  # upstream-info: reads the rate-limit rejection
+                pkgs.iproute2  # have_network: is there a default route
+              ]}"
             runHook postInstall
           '';
           meta = with pkgs.lib; {
@@ -623,6 +644,13 @@
                     - "disabled": Don't check inputs (no resources used)
                     - "show": Check and show in tooltip, but don't include in count
                     - "count": Check, show in tooltip, and include in waybar count
+
+                    Two kinds of line are shown without being counted even under "count",
+                    because a count is for updates there are to apply and neither of these
+                    is one: an input whose upstream could not be reached, where whether
+                    there is an update is exactly what failed to be established, and an
+                    input whose locked revision is ahead of the ref it tracks, which has
+                    nothing to move to.
                   '';
                 };
                 pinned = mkOption {
@@ -633,6 +661,98 @@
                     - "disabled": Don't check pinned inputs (no resources used)
                     - "show": Check and show in separate "Pinned:" section, but don't count
                     - "count": Check, show, and include in waybar count
+                  '';
+                };
+              };
+
+              upstreamInfo = {
+                mode = mkOption {
+                  type = types.enum [ "api" "disabled" ];
+                  default = "api";
+                  description = ''
+                    Whether input and source lines may resolve the upstream commit's date
+                    and the number of commits behind, turning
+                    "nixpkgs: 1a62cd4 → b03ef19" into
+                    "nixpkgs: 2026-10-14 → 2026-10-20 (412 commits)".
+
+                    "api" asks the host's API; "disabled" leaves every line on the
+                    revision-pair form and makes no network calls beyond the git ls-remote
+                    the check already performs.
+
+                    GitHub answers with the upstream date and both distances in a single
+                    request per stale input. Bitbucket needs a different shape: its commit
+                    listing returns no total, so a count is reached by walking it, and the
+                    absence of a "next" link is what proves the running total exact rather
+                    than a sample -- a range of 100 or fewer costs one request, and the
+                    walk stops at UPSTREAM_INFO_PAGE_MAX pages (default 5) and reports a
+                    floor, "(500+ commits)", instead of following pages indefinitely. Any
+                    other host gets a date from allowShallowFetch and no count.
+
+                    The glyph between the two sides states how they have moved relative to
+                    each other: "->" behind, "<-" ahead of upstream with nothing to pull,
+                    "<->" diverged. The operands keep their positions throughout -- current
+                    on the left, upstream on the right -- so only the glyph changes. A "<-"
+                    line is shown but not counted, since there is nothing there to apply.
+
+                    Results are cached on the revision pair, so a line costs a request only
+                    when one of its two sides actually moves, and a second checker reading
+                    the same pair costs nothing.
+
+                    Both hosts give an unauthenticated caller 60 requests per hour against
+                    the whole outbound IP -- not per process, and shared with anything else
+                    making API calls from the same address. The two budgets are tracked
+                    separately, so a spent hour on one does not stop the other resolving. A
+                    configuration with a handful of inputs on the default interval sits well
+                    inside them; a large one, or a shared address, may not. Set
+                    githubTokenFile to lift GitHub's to 5000/hour. Exhausting a budget is
+                    not an error: its reset time is recorded, calls are declined until it
+                    passes, and lines fall back to revision pairs in the meantime.
+                  '';
+                };
+
+                githubTokenFile = mkOption {
+                  type = types.nullOr types.path;
+                  default = null;
+                  example = "/run/secrets/github-token";
+                  description = ''
+                    Path to a file holding a GitHub token, read at check time to raise the
+                    API budget from 60 to 5000 requests per hour.
+
+                    A path rather than the token itself, so the secret stays out of the Nix
+                    store and out of the process table. Only public repository metadata is
+                    read, so a token with no scopes selected is sufficient and is what to
+                    use -- nothing here needs the access a broader one would grant.
+
+                    Ignored when upstreamInfo.mode is "disabled".
+                  '';
+                };
+
+                allowShallowFetch = mkOption {
+                  type = types.bool;
+                  default = true;
+                  description = ''
+                    Whether a non-GitHub remote may be asked for the upstream commit date
+                    with a shallow fetch, since it has no compare endpoint to ask instead.
+                    No commit distance comes out of this -- counting commits needs the
+                    history between the two revisions, and deepening a fetch until it is
+                    present has no bound that a tooltip refresh can live with. So a line
+                    from such a host reads "name: 2026-10-10 -> 2026-10-18", with dates
+                    on both sides and no commit count.
+
+                    The cheap form of that fetch -- depth 1 with trees filtered out --
+                    needs the server to advertise uploadpack.allowFilter, and one that
+                    does not serves the entire tree at that commit instead. A server
+                    cannot be asked in advance which it will do, and a fetch cannot be
+                    capped by size, so what arrived is measured afterwards: past
+                    UPSTREAM_INFO_FETCH_MAX_KIB (default 2048) the filter is taken to
+                    have been ignored and that host is recorded and not fetched from
+                    again for 30 days. The overrun therefore costs one fetch rather than
+                    one per hour, which is what makes leaving this on reasonable.
+
+                    Turn it off to keep non-GitHub lines on the revision-pair form and
+                    make no fetches at all.
+
+                    GitHub inputs are unaffected either way.
                   '';
                 };
               };
@@ -716,6 +836,19 @@
                   export AFTER_REBUILD="${cfg.afterRebuild}"
                   export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
+                  export UPSTREAM_INFO_MODE="${cfg.upstreamInfo.mode}"
+                  export UPSTREAM_INFO_FETCH="${if cfg.upstreamInfo.allowShallowFetch then "enabled" else "disabled"}"
+                  ${lib.optionalString (cfg.upstreamInfo.githubTokenFile != null) ''
+                  # Read at check time rather than interpolated: the point of a
+                  # token *file* is that the secret never enters the store.
+                  # Exported only when non-empty, so an unreadable or empty file
+                  # leaves upstream-info unauthenticated instead of sending an
+                  # "Authorization: Bearer" header with nothing after it, which
+                  # GitHub answers with 401 rather than the 60/hour it would
+                  # otherwise have allowed.
+                  GITHUB_TOKEN="$(cat ${escapeShellArg (toString cfg.upstreamInfo.githubTokenFile)} 2>/dev/null || true)"
+                  [ -n "$GITHUB_TOKEN" ] && export GITHUB_TOKEN || unset GITHUB_TOKEN
+                  ''}
                   export LIGHTWEIGHT_EXCLUDE_PATTERNS_JSON=${escapeShellArg (builtins.toJSON cfg.lightweightExcludePatterns)}
                   export SOURCE_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.sourceChecks)}
                   export CUSTOM_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.customChecks)}
@@ -748,6 +881,19 @@
                   export AFTER_REBUILD="${cfg.afterRebuild}"
                   export INPUT_CHECKER_MODE="${cfg.inputChecker.mode}"
                   export INPUT_CHECKER_PINNED="${cfg.inputChecker.pinned}"
+                  export UPSTREAM_INFO_MODE="${cfg.upstreamInfo.mode}"
+                  export UPSTREAM_INFO_FETCH="${if cfg.upstreamInfo.allowShallowFetch then "enabled" else "disabled"}"
+                  ${lib.optionalString (cfg.upstreamInfo.githubTokenFile != null) ''
+                  # Read at check time rather than interpolated: the point of a
+                  # token *file* is that the secret never enters the store.
+                  # Exported only when non-empty, so an unreadable or empty file
+                  # leaves upstream-info unauthenticated instead of sending an
+                  # "Authorization: Bearer" header with nothing after it, which
+                  # GitHub answers with 401 rather than the 60/hour it would
+                  # otherwise have allowed.
+                  GITHUB_TOKEN="$(cat ${escapeShellArg (toString cfg.upstreamInfo.githubTokenFile)} 2>/dev/null || true)"
+                  [ -n "$GITHUB_TOKEN" ] && export GITHUB_TOKEN || unset GITHUB_TOKEN
+                  ''}
                   export SOURCE_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.sourceChecks)}
                   export CUSTOM_CHECKS_JSON=${escapeShellArg (builtins.toJSON cfg.customChecks)}
                   export DRY_RUN_PREVIEW="${if cfg.dryRunPreview.enable then "true" else "false"}"
