@@ -67,7 +67,11 @@ SOURCE_CHECKS_JSON="${SOURCE_CHECKS_JSON-[]}"
 # everything.
 #
 # None of them affect the input, pinned or source sections: a rebuild does not
-# resolve those, so they carry over intact.
+# resolve those, so they carry over intact. The one exception is a rebuild that
+# changed the sourceChecks or customChecks definitions, or the code that
+# evaluates them, either of which leaves cached results that no longer answer
+# the question being asked - see CHECK_DEFS_HASH_FILE. Both fast paths degrade
+# to "recheck" in that case.
 AFTER_REBUILD="${AFTER_REBUILD:-recheck}"
 case "$AFTER_REBUILD" in
     assume-updated|reconcile) ;;
@@ -181,6 +185,21 @@ SOURCE_TOOLTIP_FILE="$CACHE_DIR/nix-update-source-tooltip"
 CUSTOM_COUNT_FILE="$CACHE_DIR/nix-update-custom-count"
 CUSTOM_SHOWN_FILE="$CACHE_DIR/nix-update-custom-shown"
 CUSTOM_TOOLTIP_FILE="$CACHE_DIR/nix-update-custom-tooltip"
+
+# Fingerprint of the sourceChecks and customChecks definitions *and* of the code
+# that evaluates them, which is what tells a fast path whether the cached
+# results above are still worth anything. Both come in with a rebuild - the
+# definitions from the configuration, the code from an upgrade - and a rebuild
+# is also the one moment the fast paths replay cached results instead of
+# re-running the checks. Without this, a rebuild that corrected a check went on
+# reporting whatever the broken version had found, for up to a full
+# updateInterval after the fix landed, which reads exactly like the fix not
+# working.
+#
+# One fingerprint covering all of it rather than one each: a mismatch anywhere
+# means the same thing - the cached sections cannot be replayed, so a real check
+# has to run, and that check re-runs everything regardless.
+CHECK_DEFS_HASH_FILE="$CACHE_DIR/nix-update-check-defs-hash"
 
 # The reported packages as structured data, not just the rendered line. Written
 # by every check so "reconcile" can drop entries by package name after a rebuild
@@ -475,6 +494,39 @@ write_app_list_hash() {
     # and retire a preview for no reason, so leave the last good value in place.
     [ -n "$list" ] || return 0
     printf '%s\n' "$list" | sha256sum | cut -d' ' -f1 > "$APP_LIST_HASH_FILE"
+}
+
+# Fingerprint of everything a cached source or custom result depends on: the two
+# definition lists, and the code that turns them into findings.
+#
+# The definitions are hashed as they arrive rather than normalised first. They
+# come straight from builtins.toJSON over the module's options, so the same
+# configuration always renders the same bytes. Both values are quoted raw and
+# separated, so a list ending where the next begins cannot produce the same
+# digest as a different split of the same bytes.
+#
+# The implementations are in here because a cached finding is only comparable
+# against one the *same code* would produce. An upgrade that changes how a
+# source resolves - reading a path override's revision out of its checkout
+# instead of reporting it missing, say - leaves behind findings the new code
+# would never have written, while the definitions have not moved an inch. Hashed
+# by content and not by store path, so this holds for a checkout being run in
+# place during development as well as for an installed derivation, and so a
+# version bump that changes no behaviour does not force a check for nothing.
+check_defs_fingerprint() {
+    {
+        printf '%s\n%s\n' "$SOURCE_CHECKS_JSON" "$CUSTOM_CHECKS_JSON"
+        local impl
+        for impl in "$0" "$(command -v source-checker)" "$(command -v custom-checker)"; do
+            if [ -r "$impl" ]; then
+                sha256sum "$impl" 2>/dev/null | cut -d' ' -f1
+            else
+                # Recorded rather than skipped: a checker that cannot be
+                # resolved now and can be later is itself a change.
+                printf 'unresolved %s\n' "$impl"
+            fi
+        done
+    } | sha256sum | cut -d' ' -f1
 }
 
 # True while the process that recorded a "calculating" preview is still alive.
@@ -2026,6 +2078,30 @@ main() {
     # first poll on a new machine, and costs its half second exactly once.
     [ -s "$APP_LIST_HASH_FILE" ] || write_app_list_hash
 
+    # The cached source and custom sections can only be replayed while the
+    # definitions that produced them still stand. Tested here, ahead of the
+    # rebuild detection below, for two reasons: a rebuild is exactly when these
+    # definitions move, and the fast paths in that block exit without ever
+    # reaching the flake.lock test further down.
+    #
+    # A missing fingerprint counts as changed rather than initialising quietly -
+    # the opposite of what the flake.lock test does, and deliberately so. An
+    # upgrade from a version that kept no fingerprint leaves cached results of
+    # unknown provenance, and on a machine with no cached results there is
+    # nothing for the forced check to duplicate: it was going to run anyway.
+    local check_defs_changed=false
+    local current_check_defs cached_check_defs
+    current_check_defs=$(check_defs_fingerprint)
+    cached_check_defs=$(cat "$CHECK_DEFS_HASH_FILE" 2>/dev/null || echo "")
+    if [ "$current_check_defs" != "$cached_check_defs" ]; then
+        check_defs_changed=true
+        printf '%s\n' "$current_check_defs" > "$CHECK_DEFS_HASH_FILE"
+        # The flag rather than removing LAST_RUN_FILE: a check does have to run,
+        # but the header's "Last checked" time is read from that file, and the
+        # previous check really did happen when it says it did.
+        touch "$FORCE_CHECK_FLAG"
+    fi
+
     # Auto-detect rebuild by comparing /run/current-system to cached path.
     # Triggers whenever nixos-rebuild switch completes, regardless of what changed.
     # No flag files or alias modifications needed.
@@ -2079,6 +2155,17 @@ main() {
                 fi
             fi
 
+            # The same reasoning applied to the sections the fast paths carry
+            # over rather than the one they decide. Both of them replay the
+            # cached source and custom results, and this rebuild changed the
+            # definitions those results came from, so there is nothing valid
+            # left to replay. Degrades both modes, not just "reconcile":
+            # "assume-updated" zeroes the package count but carries these two
+            # sections over just as faithfully.
+            if [ "$check_defs_changed" = true ]; then
+                rebuild_mode="recheck"
+            fi
+
             if [ "$rebuild_mode" != "recheck" ]; then
                 # Neither fast path runs a check. "assume-updated" takes the
                 # rebuild as having applied every pending package update and
@@ -2088,7 +2175,10 @@ main() {
                 # Either way only the package section is decided here. A rebuild
                 # does not resolve stale inputs, pinned inputs or source drift,
                 # so those keep both their counts and their tooltip sections -
-                # rebuilt from cached state rather than dropped.
+                # rebuilt from cached state rather than dropped. Reaching this
+                # point already establishes that the source and custom
+                # definitions are unchanged, so replaying their results is
+                # sound; the degrade above is what guarantees it.
                 local r_input_count=0 r_input_tooltip=""
                 local r_pinned_count=0 r_pinned_tooltip=""
                 local r_source_count=0 r_source_shown=0 r_source_tooltip=""

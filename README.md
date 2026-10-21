@@ -555,6 +555,15 @@ The checker caches the `/run/current-system` path (in `nix-update-system-path`) 
 #### Automatic Input-Update Detection
 The checker caches a hash of your `flake.lock` (in `nix-update-flake-lock-input-hash`). When the hash changes - i.e. any input was updated via `nix flake update`, regardless of which command or alias ran - it triggers an immediate input re-check while preserving package state.
 
+#### Automatic Check-Definition Detection
+`sourceChecks` and `customChecks` results are cached, so that a rebuild can redraw the Sources and Checks sections without re-running network calls or your commands. But a cached finding is only worth anything while two things hold: the definition that asked for it, and the code that produced it. Both arrive with a rebuild — the definitions from your configuration, the code from an upgrade — and a rebuild is also the one moment those cached results get replayed instead of recomputed.
+
+So the checker caches a hash (in `nix-update-check-defs-hash`) covering both lists *and* the content of the checker scripts themselves. When it changes, the cached results are answers to a question no longer being asked, and both `afterRebuild` fast paths degrade to `recheck` rather than redrawing them.
+
+Without this, editing a check and rebuilding kept showing what the *old* run found, for up to a full `updateInterval` afterwards — so a `sourceChecks` entry corrected to point at the right branch went on reporting the phantom update the wrong branch produced, and the fix looked like it had not worked. The same held for upgrading the module itself: the new code never got to speak, because the rebuild that installed it also stamped `last-run` as though a check had just completed.
+
+The scripts are hashed by content rather than by store path, so this works for a checkout run in place during development, and a version bump that changes no behaviour doesn't force a check for nothing.
+
 Because of the above, a rebuild/update script can be as simple as:
 ```nix
 nixup =
@@ -594,7 +603,9 @@ The script uses several cache files in your ~/.cache directory:
 - `nix-update-check.lock`: Held while a background check runs, so only one runs at a time (lightweight mode only)
 - `nix-update-error`: Present when the last check failed, holding the reason; makes the module show its error state instead of a healthy count. Removed by the next successful check.
 - `nix-update-diagnostic` / `.prev`: What the last two checks actually resolved — channels, package-to-channel mapping size, and for each reported package which channel it was compared against versus which one the mapping put it in. The previous run is kept because a wrong result is usually followed immediately by a correct one, which would otherwise overwrite the evidence. If the module reports something you don't expect, `cat ~/.cache/nix-update-diagnostic.prev` is the place to start.
+- `nix-update-source-count` / `-shown` / `-tooltip`: Last `sourceChecks` result, so a rebuild can redraw the Sources section without reaching the network
 - `nix-update-custom-count` / `-shown` / `-tooltip`: Last `customChecks` result, so a rebuild can redraw the Checks section without re-running your commands
+- `nix-update-check-defs-hash`: Hash of the `sourceChecks` and `customChecks` definitions, plus the content of the checker scripts, that produced the two results above. When it no longer matches, those results are discarded instead of redrawn — see [Automatic Check-Definition Detection](#automatic-check-definition-detection)
 - `nix-update-force-check`: Set by `refresh` to request a check before the interval is up; cleared once that check starts
 - `nix-update-result-hash`: Fingerprint of what the last check found, used to expire a stored update-cost preview when upstream moves
 - `nix-update-preview`: Last update-cost preview, with the `flake.lock` hash and system path it was computed against, plus the evaluating process while one is running so an interrupted preview is reported rather than left reading "calculating"; removed when `dryRunPreview.enable` is `false`
