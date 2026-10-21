@@ -94,6 +94,47 @@ DERIVED_REPOSITORY=""
 # revision in it and a typo'd input name do not all report the same thing.
 CURRENT_ERROR=""
 
+# Set by current_value() when the revision was read out of a working tree that
+# has uncommitted changes. What the system got built from is the tree, not the
+# commit, so a HEAD that matches upstream is not the whole story - and a check
+# that stayed silent on it would be claiming more than it knows.
+CURRENT_DIRTY=false
+
+# Records whether a working tree has changes that are in no commit. Its own
+# function so that the callers below can end on an explicit "return 0": a
+# trailing "[[ ... ]] && CURRENT_DIRTY=true" would hand its own false status
+# back as the caller's return value on every clean tree, turning a perfectly
+# resolved revision into a reported failure.
+note_worktree_dirty() {
+    [[ -n "$(git -C "$1" status --porcelain 2>/dev/null)" ]] && CURRENT_DIRTY=true
+    return 0
+}
+
+# Revision of a git working tree, which is how a source gets its current value
+# when the lock does not carry one: a local path override, or current =
+# "local". Sets CURRENT_DIRTY as a side effect for the same reason
+# current_value() sets its own globals rather than printing them.
+worktree_revision() {
+    local path="$1"
+    [[ -n "$path" ]] || return 1
+    git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+    CURRENT_VALUE=$(git -C "$path" rev-parse HEAD 2>/dev/null)
+    [[ -n "$CURRENT_VALUE" ]] || return 1
+    note_worktree_dirty "$path"
+    return 0
+}
+
+# The same for a tag policy: the nearest tag reachable from HEAD, which is what
+# the tree would call its own version.
+worktree_tag() {
+    local path="$1"
+    [[ -n "$path" ]] || return 1
+    CURRENT_VALUE=$(git -C "$path" describe --tags --abbrev=0 2>/dev/null)
+    [[ -n "$CURRENT_VALUE" ]] || return 1
+    note_worktree_dirty "$path"
+    return 0
+}
+
 # Set by package_pin(): the rev, tag and repository read out of a package's src.
 PACKAGE_PIN=""
 
@@ -217,7 +258,30 @@ current_value() {
         flake-input)
             local node
             node=$(flake_input_node "$(jq -r '.input' <<<"$check")") || return 1
-            if [[ "$(jq -r '.policy' <<<"$check")" == "tag" ]]; then
+
+            # A local path override - url = "path:/..." while a change is being
+            # tested before it is pushed - locks to {path, narHash} and carries
+            # neither rev nor ref. That is a property of the lock entry, not of
+            # the source: the tree being built is a checkout with a HEAD, so the
+            # revision is there to be read, just not out of flake.lock. Reading
+            # it from the tree keeps the check working across an override,
+            # instead of reporting a revision missing that plainly exists.
+            local locked_type
+            locked_type=$(jq -r '.locked.type // empty' <<<"$node")
+            if [[ "$locked_type" == "path" ]]; then
+                local locked_path
+                locked_path=$(jq -r '.locked.path // empty' <<<"$node")
+                if [[ "$(jq -r '.policy' <<<"$check")" == "tag" ]]; then
+                    if ! worktree_tag "$locked_path"; then
+                        CURRENT_ERROR="local path override has no tag at HEAD"
+                        return 1
+                    fi
+                elif ! worktree_revision "$locked_path"; then
+                    CURRENT_ERROR="local path override is not a git checkout"
+                    return 1
+                fi
+                return 0
+            elif [[ "$(jq -r '.policy' <<<"$check")" == "tag" ]]; then
                 CURRENT_VALUE=$(jq -r '.original.ref // empty' <<<"$node")
             else
                 CURRENT_VALUE=$(jq -r '.locked.rev // empty' <<<"$node")
@@ -227,7 +291,7 @@ current_value() {
             local path
             path=$(jq -r '.path' <<<"$check")
             path=${path/#\~/$HOME}
-            CURRENT_VALUE=$(git -C "$path" rev-parse HEAD 2>/dev/null)
+            worktree_revision "$path"
             ;;
         revision)
             CURRENT_VALUE=$(jq -r '.revision // empty' <<<"$check")
@@ -284,6 +348,7 @@ main() {
 
         DERIVED_REPOSITORY=""
         CURRENT_ERROR="current revision not found"
+        CURRENT_DIRTY=false
         if ! current_value "$check" || [[ -z "$CURRENT_VALUE" || "$CURRENT_VALUE" == "null" ]]; then
             add_line "$name ($CURRENT_ERROR)"
             continue
@@ -369,12 +434,27 @@ main() {
             continue
         fi
 
-        [[ "$current" != "$upstream" ]] || continue
+        # Equal revisions mean there is no update to report - but a working tree
+        # with uncommitted changes is not actually at the revision it claims, so
+        # going silent there would say "current" about something that was built
+        # from code existing in no commit at all. Not counted either way: there
+        # is nothing upstream to move to, which is the thing a count is for.
+        if [[ "$current" == "$upstream" ]]; then
+            [[ "$CURRENT_DIRTY" == true ]] && \
+                add_line "$name (${current:0:7}, uncommitted local changes)"
+            continue
+        fi
+
         [[ "$mode" == "count" ]] && count=$((count + 1))
+        # The qualifier rides on the current side, which is the side it is true
+        # of: the tree is that revision plus changes that are not in it.
+        local current_label="$current"
+        [[ "$policy" == "tag" ]] || current_label="${current:0:7}"
+        [[ "$CURRENT_DIRTY" == true ]] && current_label+=" + uncommitted"
         if [[ "$policy" == "tag" ]]; then
-            add_line "$name ($current → $upstream)"
+            add_line "$name ($current_label → $upstream)"
         else
-            add_line "$name (${current:0:7} → ${upstream:0:7})"
+            add_line "$name ($current_label → ${upstream:0:7})"
         fi
     done < <(jq -c '.[]' <<<"$SOURCE_CHECKS_JSON")
 
