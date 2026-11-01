@@ -27,7 +27,8 @@ main() {
     local name="${1:-}" repository="${2:-}" current="${3:-}" upstream="${4:-}"
     local current_epoch="${5:-}" current_note="${6:-}"
 
-    local info="" current_date="" upstream_date="" commits="" diverged="" capped=""
+    local info="" current_date="" upstream_date="" commits="" diverged=""
+    local capped="" diverged_capped=""
     info=$(upstream-info "$repository" "$current" "$upstream" "$current_epoch" 2>/dev/null) || info=""
 
     if [[ -n "$info" ]]; then
@@ -50,7 +51,8 @@ main() {
                    (.upstream_date // ""),
                    (if .commits == null then "" else (.commits | tostring) end),
                    (if .diverged == null then "" else (.diverged | tostring) end),
-                   (if .commits_capped then "capped" else "" end)' \
+                   (if .commits_capped then "capped" else "" end),
+                   (if .diverged_capped then "capped" else "" end)' \
                 <<<"$info" 2>/dev/null
         ) || true
         current_date="${f[0]:-}"
@@ -58,6 +60,7 @@ main() {
         commits="${f[2]:-}"
         diverged="${f[3]:-}"
         capped="${f[4]:-}"
+        diverged_capped="${f[5]:-}"
     fi
 
     # Which way the two sides have moved relative to each other, which the
@@ -77,12 +80,22 @@ main() {
     if [[ "$commits" =~ ^[0-9]+$ ]]; then behind="$commits"; behind_known=true; fi
     if [[ "$diverged" =~ ^[0-9]+$ ]]; then ahead="$diverged"; ahead_known=true; fi
 
-    # Upstream's tip predating the current revision is only possible if the
-    # current side carries commits upstream does not have, so the date
-    # ordering establishes "ahead" on its own. That matters for the backends
-    # that cannot count both directions - a shallow fetch establishes no
-    # counts at all - and it is the exact condition that would otherwise print
-    # an arrow running backwards through time.
+    # A last resort for the one backend that establishes no counts at all: a
+    # shallow fetch brings back a date and nothing else, so where there is no
+    # ahead count the date ordering is the only thing left to read a direction
+    # out of. Upstream's tip predating the current revision takes commits on
+    # the current side to explain, and it is the exact condition that would
+    # otherwise print an arrow running backwards through time.
+    #
+    # Only ever in that one direction, and deliberately not generalised. The
+    # converse does not hold: a tip date says when a side last moved, not what
+    # it contains, so upstream being newer rules nothing out - a fork commit
+    # older than upstream's tip is still a commit upstream does not have.
+    # Inferring "not ahead" from a newer upstream is how the bitbucket path
+    # came to print a diverged fork as a fast-forward, and the counts are the
+    # only honest answer where that matters. Hence the gate on ahead_known:
+    # a backend that counted both directions has already said, including when
+    # what it said was zero.
     #
     # ISO dates, so a lexicographic comparison is a chronological one.
     if [[ "$ahead_known" == false && -n "$current_date" && -n "$upstream_date" ]] &&
@@ -146,8 +159,14 @@ main() {
     # "+" where the count is a floor rather than a total, because the walk
     # that produced it was stopped short. Saying "500 commits" there would be
     # a number the checker does not actually have.
-    local more=""
-    [[ "$capped" == "capped" ]] && more="+"
+    #
+    # Tracked per direction, because the two ranges are walked to different
+    # depths: the one behind runs to several pages, the one ahead stops at the
+    # first. A fork 120 commits ahead has to read "100+ ahead", and a single
+    # flag would have put the "+" on whichever side it was not true of.
+    local behind_more="" ahead_more=""
+    [[ "$capped" == "capped" ]] && behind_more="+"
+    [[ "$diverged_capped" == "capped" ]] && ahead_more="+"
 
     # Only counts that were actually counted. The glyph already states the
     # relationship, so the suffix has nothing to hedge about in prose: a "←"
@@ -156,16 +175,16 @@ main() {
     # direction contributes a glyph and no number.
     local -a notes=()
     if [[ "$fast_forward" == true ]]; then
-        if [[ "$behind" == "1" && -z "$more" ]]; then
+        if [[ "$behind" == "1" && -z "$behind_more" ]]; then
             notes+=("1 commit")
         elif [[ "$behind" -gt 0 ]]; then
-            notes+=("$behind$more commits")
+            notes+=("$behind$behind_more commits")
         fi
     else
         [[ "$behind_known" == true && "$behind" -gt 0 ]] && \
-            notes+=("$behind$more behind")
+            notes+=("$behind$behind_more behind")
         [[ "$ahead_known" == true && "$ahead" -gt 0 ]] && \
-            notes+=("$ahead ahead")
+            notes+=("$ahead$ahead_more ahead")
     fi
 
     local suffix=""

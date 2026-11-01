@@ -683,10 +683,14 @@
                     request per stale input. Bitbucket needs a different shape: its commit
                     listing returns no total, so a count is reached by walking it, and the
                     absence of a "next" link is what proves the running total exact rather
-                    than a sample -- a range of 100 or fewer costs one request, and the
-                    walk stops at UPSTREAM_INFO_PAGE_MAX pages (default 5) and reports a
-                    floor, "(500+ commits)", instead of following pages indefinitely. Any
-                    other host gets a date from allowShallowFetch and no count.
+                    than a sample -- a range of 100 or fewer costs one request per
+                    direction, and the walk stops at UPSTREAM_INFO_PAGE_MAX pages
+                    (default 5) and reports a floor, "(500+ commits)", instead of following
+                    pages indefinitely. Both directions are walked, because the reverse
+                    range is the only thing that tells behind apart from diverged: a newer
+                    tip upstream says when upstream last moved, not that the current side
+                    carries nothing of its own. Any other host gets a date from
+                    allowShallowFetch and no count.
 
                     The glyph between the two sides states how they have moved relative to
                     each other: "->" behind, "<-" ahead of upstream with nothing to pull,

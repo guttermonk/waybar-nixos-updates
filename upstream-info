@@ -71,7 +71,12 @@ DIVERGED=""
 # produced it hit UPSTREAM_INFO_PAGE_MAX before the range ran out. Reported
 # rather than smoothed over: "500 commits" and "at least 500 commits" are
 # different claims, and only one of them is true here.
+#
+# One flag per direction. The two ranges are walked to different depths - the
+# reverse one stops at a single page - so a cap on one says nothing about the
+# other, and a shared flag would have to describe whichever was written last.
 COMMITS_CAPPED=false
+DIVERGED_CAPPED=false
 
 emit() {
     jq -cn \
@@ -80,12 +85,14 @@ emit() {
         --arg commits "$COMMITS" \
         --arg diverged "$DIVERGED" \
         --arg capped "$COMMITS_CAPPED" \
+        --arg diverged_capped "$DIVERGED_CAPPED" \
         '{
             current_date: $current_date,
             upstream_date: $upstream_date,
             commits: (if $commits == "" then null else ($commits | tonumber) end),
             diverged: (if $diverged == "" then null else ($diverged | tonumber) end),
-            commits_capped: ($capped == "true")
+            commits_capped: ($capped == "true"),
+            diverged_capped: ($diverged_capped == "true")
         }'
 }
 
@@ -365,14 +372,22 @@ bitbucket_count() {
 BITBUCKET_COUNT=""
 BITBUCKET_COUNT_CAPPED=false
 
-# Both distances, with the second one asked for only when it is in doubt.
+# Both distances, each from its own range.
 #
 # The reverse range establishes whether the current revision carries commits
 # upstream does not have, which is what tells "behind" apart from "diverged"
-# and so which glyph the line gets. It is requested only when upstream's tip
-# turns out to predate the current revision, because that ordering is the only
-# way a non-fast-forward can arise - so the ordinary case stays at one request
-# and the exact numbers are bought only where they change the answer.
+# and so which glyph the line gets. It used to be asked for only when
+# upstream's tip turned out to predate the current revision, on the theory that
+# a newer tip upstream ruled out commits on the current side. It does not: a
+# tip date says when a side last moved, not what it contains, so a fork commit
+# made before upstream's tip is still a commit upstream does not have. The
+# shortcut printed a two-behind, one-ahead fork as "2 commits" behind a
+# fast-forward arrow, which is the exact reading the glyph exists to prevent.
+#
+# So both ranges are counted, every time. Once "behind" is non-zero nothing
+# short of the reverse range settles the question, and the cost is one extra
+# request per revision pair - held by the cache for as long as that pair is
+# what the two sides are.
 #
 # One page for the reverse direction. A fork's own commits are the kind of
 # thing there are tens of, and knowing "more than 100" would not read any
@@ -384,15 +399,12 @@ bitbucket_distances() {
     COMMITS="$BITBUCKET_COUNT"
     COMMITS_CAPPED="$BITBUCKET_COUNT_CAPPED"
 
-    if [[ -n "$CURRENT_DATE" && -n "$UPSTREAM_DATE" ]] &&
-       [[ "$UPSTREAM_DATE" < "$CURRENT_DATE" ]]; then
-        if bitbucket_count "$current" "$upstream" 1; then
-            DIVERGED="$BITBUCKET_COUNT"
-        fi
-    else
-        # Not in doubt: upstream's tip is at least as new, so there is nothing
-        # on the current side that upstream lacks.
-        DIVERGED=0
+    # Left empty rather than zeroed when the second range cannot be had, since
+    # the callers read an empty field as "not established" and a 0 as "nothing
+    # on this side" - and a request that failed has established neither.
+    if bitbucket_count "$current" "$upstream" 1; then
+        DIVERGED="$BITBUCKET_COUNT"
+        DIVERGED_CAPPED="$BITBUCKET_COUNT_CAPPED"
     fi
 }
 
@@ -491,8 +503,18 @@ fetch_upstream_date() {
 # Only successes are stored. Caching a failure would pin a transient one in
 # place until upstream happened to move, and the rate-limit backoff already
 # covers the case that needs suppressing.
+#
+# The version prefix is what retires an answer the current code would not
+# write. A stored result is a claim about a revision pair, and a pair holding
+# still is exactly what keeps a wrong claim alive: the bitbucket shortcut's
+# "diverged": 0 would have gone on being served for up to a month after the
+# code that stopped inferring it landed. Bumping this on any change to what
+# the resolvers conclude orphans the old entries, which the pruning below then
+# clears on its own schedule.
+CACHE_VERSION=2
+
 cache_key() {
-    printf '%s|%s|%s' "$1" "$2" "$3" | sha256sum | cut -d' ' -f1
+    printf '%s|%s|%s|%s' "$CACHE_VERSION" "$1" "$2" "$3" | sha256sum | cut -d' ' -f1
 }
 
 main() {
