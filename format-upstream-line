@@ -69,12 +69,20 @@ main() {
     #   behind    name: 2026-10-14 → 2026-10-20 (412 commits)
     #   ahead     name: 793a394 ← 913c43b (85 ahead)
     #   diverged  name: 793a394 ↔ 913c43b (51 behind, 85 ahead)
+    #   unknown   name: 2026-10-14 — 2026-10-20
     #
-    # The operands keep their positions in all three - current on the left,
+    # The operands keep their positions in all four - current on the left,
     # upstream on the right - and only the glyph changes. Swapping them to
     # express direction would mean the reader could no longer tell which side
     # is theirs without stopping to read the counts, which costs more than the
     # direction conveys.
+    #
+    # The em dash is the one that claims nothing, and it exists because "→" was
+    # previously doing two jobs: stating a clean forward move, and standing in
+    # for "nobody established otherwise". Those are different, and only one of
+    # them is a fact. Between two dates the dash reads as a range - this side
+    # last moved then, that side then - which is the whole of what a line
+    # without counts knows.
     local behind=0 ahead=0
     local behind_known=false ahead_known=false
     if [[ "$commits" =~ ^[0-9]+$ ]]; then behind="$commits"; behind_known=true; fi
@@ -98,20 +106,34 @@ main() {
     # what it said was zero.
     #
     # ISO dates, so a lexicographic comparison is a chronological one.
+    local direction_known="$ahead_known"
     if [[ "$ahead_known" == false && -n "$current_date" && -n "$upstream_date" ]] &&
        [[ "$upstream_date" < "$current_date" ]]; then
         ahead=1   # a floor, not a count: only the direction is established
+        direction_known=true
     fi
 
-    local arrow='→'
-    if [[ "$ahead" -gt 0 && "$behind" -gt 0 ]]; then
-        arrow='↔'
-    elif [[ "$ahead" -gt 0 ]]; then
-        # Reversed rather than dropped. There is still a relationship to
-        # state - upstream could move to this revision, not the other way -
-        # and the arrowhead is where that belongs. Dropping it would leave two
-        # revisions side by side saying nothing about how they relate.
-        arrow='←'
+    # An arrow needs the ahead count, or the inference above standing in for
+    # it. Not the behind count: knowing that upstream carries five commits this
+    # side lacks says nothing about whether this side carries any of its own,
+    # so "→ (5 commits)" on a half-resolved line asserts a fast-forward from
+    # the half that cannot establish one. That is the same step the bitbucket
+    # path used to take from the dates, and it reaches the reader the same way.
+    local arrow='—'
+    if [[ "$direction_known" == true ]]; then
+        if [[ "$ahead" -gt 0 && "$behind" -gt 0 ]]; then
+            arrow='↔'
+        elif [[ "$ahead" -gt 0 ]]; then
+            # Reversed rather than dropped. There is still a relationship to
+            # state - upstream could move to this revision, not the other way -
+            # and the arrowhead is where that belongs. The dash is for lines
+            # with nothing to say, which is not this one.
+            arrow='←'
+        else
+            # Counted as not ahead, which is what makes this a fast-forward
+            # rather than an absence of evidence against one.
+            arrow='→'
+        fi
     fi
 
     # Whether the suffix below names one distance or two.
@@ -127,9 +149,11 @@ main() {
     # backwards. It does not hold now. The glyph carries the direction, and
     # carries it well enough that the arrowhead always points at the more
     # recent side - rightward when upstream is newer, leftward when the current
-    # side is - while "↔" has a head at each end and so claims no order at all.
-    # A date pair under it says "this side last moved then, that side then",
-    # which is exactly true of two lines that have both moved.
+    # side is - while "↔" has a head at each end, and "—" none, so neither
+    # claims an order at all. A date pair under either says "this side last
+    # moved then, that side then", which is exactly true of two lines that have
+    # both moved, and all that is true of two whose relationship went
+    # unresolved.
     #
     # Dates on both sides or revisions on both sides, never one of each: the
     # arrow is a comparison, and a comparison between a date and a hash asks
@@ -152,10 +176,13 @@ main() {
     # than abbreviated: "412 commits" is the answer to "how far behind am I",
     # which is the question the line exists to answer.
     #
-    # Both directions are named once the comparison is not a fast-forward,
-    # because then "412 commits" is ambiguous about which way it points -
-    # "51 behind, 7 ahead" says what a fork's position actually is, and the
-    # "7 ahead" is the part that explains why the dates went missing.
+    # Each counted direction is named once the comparison is not a
+    # fast-forward, because then "412 commits" is ambiguous about which way it
+    # points - "51 behind, 7 ahead" says what a fork's position actually is,
+    # and the "7 ahead" is the part that explains why the dates went missing.
+    # A "—" line with only the behind count resolved names that one alone,
+    # "(5 behind)", for the same reason: the bare "5 commits" would be read as
+    # the whole distance when it is only the half that got counted.
     # "+" where the count is a floor rather than a total, because the walk
     # that produced it was stopped short. Saying "500 commits" there would be
     # a number the checker does not actually have.
@@ -204,10 +231,14 @@ main() {
     # it puts a number on the waybar for work that does not exist, and no
     # rebuild can ever clear it.
     #
-    # Behind by an unknown amount still exits 0. The revisions differ, and
-    # without a count there is no basis for claiming the difference runs in
-    # only one direction - so the benefit of the doubt goes to counting it,
-    # which is also what every caller did before this status existed.
+    # Behind by an unknown amount still exits 0, and so does a "—" line. The
+    # revisions differ, and without a count there is no basis for claiming the
+    # difference runs in only one direction - so the benefit of the doubt goes
+    # to counting it, which is also what every caller did before this status
+    # existed. That the glyph declines to name a direction and the status counts
+    # one anyway is the honest pair: the tooltip says what was established,
+    # while the waybar number has to choose, and choosing "nothing to do" would
+    # hide real updates behind a resolver that fell short.
     if [[ "$behind_known" == true && "$behind" -eq 0 && "$ahead" -gt 0 ]]; then
         return 10
     fi

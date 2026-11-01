@@ -700,9 +700,17 @@
 
                     The glyph between the two sides states how they have moved relative to
                     each other: "->" behind, "<-" ahead of upstream with nothing to pull,
-                    "<->" diverged. The operands keep their positions throughout -- current
-                    on the left, upstream on the right -- so only the glyph changes. A "<-"
-                    line is shown but not counted, since there is nothing there to apply.
+                    "<->" diverged, and an em dash where no resolver established which way.
+                    The operands keep their positions throughout -- current on the left,
+                    upstream on the right -- so only the glyph changes. A "<-" line is shown
+                    but not counted, since there is nothing there to apply.
+
+                    An arrow takes a counted distance in both directions, so the hosts
+                    without a compare endpoint get the em dash rather than a "->" asserting
+                    a fast-forward nothing checked. Those lines are still counted: the glyph
+                    reports what was established, while the waybar number has to choose, and
+                    choosing "nothing to do" would hide real updates behind a resolver that
+                    fell short.
 
                     Results are cached on the revision pair, so a line costs a request only
                     when one of its two sides actually moves, and a second checker reading
