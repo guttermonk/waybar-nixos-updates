@@ -433,24 +433,75 @@ calc_next_update() {
 # keep with the link down: no check runs, so nothing advances the timestamp the
 # next-check time is derived from, and it drifts into the past the longer the
 # outage lasts.
+# A clock time for the header, carrying the day only when it is not today.
+#
+# The bare time is the common case and stays bare. A marker on every line would
+# spend width permanently to state what the reader already assumes, and this
+# line is already the longest thing in the tooltip.
+#
+# What makes the marker necessary at all is that the offset is not reliably a
+# single day. The hourly default puts "Last checked" in yesterday for the first
+# hour after midnight and "Next check" in tomorrow for the last hour before it,
+# which is the small case; the large one is the "offline" state above, where
+# nothing advances last-run and the time it reports drifts arbitrarily far into
+# the past. That is where a bare "09:12" misleads most, and it is further than
+# "yesterday" can reach.
+#
+# Weekday inside the week, month-day past it. A weekday name repeats every
+# seven days, so beyond that "Thu" no longer distinguishes three days ago from
+# ten and the date is the only form that still says which.
+header_time() {
+    local epoch="$1"
+    local fmt
+    if [ "$CLOCK_FORMAT" = "12h" ]; then
+        fmt="%I:%M %p"
+    else
+        fmt="%H:%M"
+    fi
+
+    # One date call per side rather than one per field. This runs twice per
+    # header and the header is re-rendered on a timer, so the fields are asked
+    # for together and split afterwards.
+    local -a f=() n=()
+    mapfile -t f < <(date -d "@$epoch" +"$fmt%n%Y-%m-%d%n%a%n%m-%d" 2>/dev/null)
+    mapfile -t n < <(date +'%Y-%m-%d%n%s' 2>/dev/null)
+
+    # A failed date call leaves the caller with the bare time it had before this
+    # function existed, rather than an empty field where a time goes.
+    [ "${#f[@]}" -ge 4 ] && [ "${#n[@]}" -ge 2 ] || {
+        date -d "@$epoch" +"$fmt" 2>/dev/null
+        return 0
+    }
+
+    [ "${f[1]}" = "${n[0]}" ] && { printf '%s' "${f[0]}"; return 0; }
+
+    # Measured between the two timestamps rather than between the two local
+    # midnights, which can read a day out at the edges and does not matter: the
+    # threshold only decides when a weekday name stops being unambiguous, and
+    # either reading of a gap near seven days answers that question the same
+    # way.
+    local gap=$(( epoch - n[1] ))
+    [ "$gap" -lt 0 ] && gap=$(( -gap ))
+
+    if [ "$gap" -lt $(( 6 * 86400 )) ]; then
+        printf '%s %s' "${f[2]}" "${f[0]}"
+    else
+        printf '%s %s' "${f[3]}" "${f[0]}"
+    fi
+}
+
 format_tooltip_header() {
     local state="${1:-idle}"
     local last_run
     last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
-    local time_fmt
-    if [ "$CLOCK_FORMAT" = "12h" ]; then
-        time_fmt="+%I:%M %p"
-    else
-        time_fmt="+%H:%M"
-    fi
 
     local last_checked next_check
     if [ "$last_run" = "0" ]; then
         last_checked="never"
         next_check="soon"
     else
-        last_checked=$(date -d "@$last_run" "$time_fmt")
-        next_check=$(date -d "@$((last_run + UPDATE_INTERVAL))" "$time_fmt")
+        last_checked=$(header_time "$last_run")
+        next_check=$(header_time "$((last_run + UPDATE_INTERVAL))")
     fi
 
     case "$state" in
@@ -2403,8 +2454,12 @@ main() {
         updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
         local last_run
         last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "0")
+        # The same grammar as the idle header, rather than a full ISO datetime
+        # of its own. This line used to spend eleven characters on a date for a
+        # check twenty minutes old, and ignored CLOCK_FORMAT while doing it - a
+        # 12h configuration got one 24h time here and nowhere else.
         local last_fmt="never"
-        [ "$last_run" != "0" ] && last_fmt=$(date -d "@$last_run" "+%Y-%m-%d %H:%M")
+        [ "$last_run" != "0" ] && last_fmt=$(header_time "$last_run")
         local existing
         existing=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
         if [ "$updates" = "0" ] || [ -z "$updates" ]; then

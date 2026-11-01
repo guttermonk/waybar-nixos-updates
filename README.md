@@ -196,6 +196,7 @@ When using the Home Manager module, you can configure these options:
 - `skipAfterBoot`: Whether to skip update checks right after boot/resume (default: true)
 - `gracePeriod`: Time in seconds to wait after boot/resume before checking (default: 60)
 - `clockFormat`: Clock format for tooltip timestamps - `"24h"` (e.g. `14:23`, default) or `"12h"` (e.g. `2:23 PM`)
+  - **A time that isn't from today carries its day in front.** `Last checked: Sat 23:47 · Next check: 00:47` for the hour after midnight, and `Last checked: 10-23 09:12 · Offline` once the gap passes a week, where a weekday name no longer says which week it means. Times from today stay bare, which is almost all of them — the marker costs width only when it's saying something. It matters most in the `Offline` state, where nothing advances the timestamp and it drifts further into the past the longer the outage lasts.
 - `inputChecker.mode`: How to handle stale flake inputs (default: `"disabled"`)
   - `"disabled"`: Don't check inputs (no resources used)
   - `"show"`: Check and show in tooltip, but don't include in count

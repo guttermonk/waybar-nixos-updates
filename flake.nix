@@ -479,6 +479,12 @@
                   Clock format for tooltip timestamps.
                   - "24h": 14:23
                   - "12h": 2:23 PM
+
+                  A time that is not from today carries its day in front:
+                  "Last checked: Sat 23:47" for the hour after midnight, and
+                  "10-23 09:12" once the gap passes a week and a weekday name
+                  stops saying which week it means. Times from today are bare,
+                  which is almost all of them.
                 '';
               };
               
