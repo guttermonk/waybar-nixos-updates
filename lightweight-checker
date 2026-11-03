@@ -618,9 +618,18 @@ preview_owner_alive() {
 
 PREVIEW_SECTION=""
 PREVIEW_HAS_STATE=false
+# True while an evaluation is actually under way, which the bar reports with the
+# "updating" glyph: a preview runs for minutes and the icon is where its start
+# and finish are visible. Read from the preview's own record rather than from
+# the lock, so it is still true for the moment between "preview start" writing
+# the record and its worker acquiring the lock - and false for a record left
+# behind by an evaluation that died, which the section already reports as
+# interrupted.
+PREVIEW_RUNNING=false
 build_preview_section() {
     PREVIEW_SECTION=""
     PREVIEW_HAS_STATE=false
+    PREVIEW_RUNNING=false
 
     # Disabled: drop any result so turning the feature off also clears what it
     # left behind, rather than stranding a number with no way to dismiss it.
@@ -660,6 +669,7 @@ build_preview_section() {
             # else rewrites the record.
             if preview_owner_alive "$owner"; then
                 body="calculating... (~3 min)"
+                PREVIEW_RUNNING=true
             else
                 body="interrupted — middle-click to retry"
             fi
@@ -2671,13 +2681,21 @@ main() {
     # checks shows up on the very next poll instead of waiting for one.
     build_preview_section
 
+    # A running preview takes the glyph from whatever state the module would
+    # otherwise report, the error state below included: it is the only report
+    # that an evaluation started and the only one that will say it finished,
+    # and the state it shadows for those minutes is still in the body of the
+    # tooltip beside it.
+    local busy_alt=""
+    [ "$PREVIEW_RUNNING" = true ] && busy_alt="updating"
+
     # The last check failed. Show the error state and keep whatever count the
     # last good check found, rather than reporting a healthy "0". An already
     # computed cost is independent of that failure, so it still shows.
     if [ -f "$ERROR_FILE" ]; then
         local err_body="$tooltip"
         [ -n "$PREVIEW_SECTION" ] && err_body="$err_body\\n\\n$PREVIEW_SECTION"
-        output_json "$updates" "error" "$header\\n${TOOLTIP_HR}\\n$err_body"
+        output_json "$updates" "${busy_alt:-error}" "$header\\n${TOOLTIP_HR}\\n$err_body"
         exit 0
     fi
 
@@ -2706,6 +2724,11 @@ main() {
         alt="has-updates"
         text="$updates"
     fi
+    # The glyph reports the preview, the header does not. They answer different
+    # questions: the icon says something long is running, which is true, while
+    # "Checking for updates..." would say what it is, which would not be. The
+    # count keeps its own text either way.
+    [ -n "$busy_alt" ] && alt="$busy_alt"
 
     if [ -n "$body" ]; then
         output_json "$text" "$alt" "$header\\n${TOOLTIP_HR}\\n$body"

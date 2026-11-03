@@ -643,9 +643,18 @@
 
     PREVIEW_SECTION=""
     PREVIEW_HAS_STATE=false
+    # True while an evaluation is actually under way, which the bar reports with
+    # the "updating" glyph: a preview runs for minutes and the icon is where its
+    # start and finish are visible. Read from the preview's own record rather
+    # than from the lock, so it is still true for the moment between "preview
+    # start" writing the record and its worker acquiring the lock - and false
+    # for a record left behind by an evaluation that died, which the section
+    # already reports as interrupted.
+    PREVIEW_RUNNING=false
     function build_preview_section() {
         PREVIEW_SECTION=""
         PREVIEW_HAS_STATE=false
+        PREVIEW_RUNNING=false
 
         # Disabled: drop any result so turning the feature off also clears what
         # it left behind, rather than stranding a number with no way to dismiss.
@@ -685,6 +694,7 @@
                 # since nothing else rewrites the record.
                 if preview_owner_alive "$owner"; then
                     body="calculating... (~3 min)"
+                    PREVIEW_RUNNING=true
                 else
                     body="interrupted — middle-click to retry"
                 fi
@@ -1882,6 +1892,16 @@
         # Built here rather than during the check, so a preview requested
         # between checks shows up on the very next poll instead of waiting.
         build_preview_section
+
+        # The glyph reports a running preview, the header does not. They answer
+        # different questions: the icon says something long is running, which is
+        # true, while "Checking for updates..." would say what it is, which
+        # would not be. Applied to every branch above, including the error and
+        # offline ones - the icon is the only report that an evaluation started
+        # and the only one that will say it finished, and the state it shadows
+        # for those minutes is still in the body of the tooltip.
+        [ "$PREVIEW_RUNNING" = true ] && alt="updating"
+
         if [ -n "$PREVIEW_SECTION" ]; then
             # The affordance hint alone must not conjure a tooltip for an
             # otherwise up-to-date system; only real preview state earns one.

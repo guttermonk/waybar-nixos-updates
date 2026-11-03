@@ -360,7 +360,7 @@ When using the Home Manager module, you can configure these options:
     - The extraction is a heuristic and its contents are noisy; only whether it *changed* matters here, so a stable false positive cancels. If it can find nothing to read it simply never fires, rather than retiring a cost on no evidence.
   - Setting this back to `false` removes the binding *and* clears any result already computed.
   - Shares a lock with the background check, so the two never evaluate at once. Middle-clicking during a check reports `check in progress — try again shortly` rather than queueing.
-    - The reverse does not borrow the check's reporting: while a preview runs, the header keeps saying `Next check` and the glyph stays as it was. Only the cost section changes, to `calculating... (~3 min)`. A check that falls due inside those minutes waits for the lock and runs on the first poll after it frees.
+    - The reverse borrows the glyph but not the header. While a preview runs the module shows the `updating` icon, because an evaluation that takes minutes should be visible on the bar from the moment it starts until the moment it finishes — but the header keeps saying `Next check`, because nothing is checking for updates, and the cost section reports `calculating... (~3 min)` on its own. A check that falls due inside those minutes waits for the lock and runs on the first poll after it frees.
   - `dryRunPreview.target`: flake target to price; literal `${hostname}` is replaced at run time. A leading `.#` resolves against `nixosConfigPath`, not your shell's working directory.
   - `dryRunPreview.recalculateOnChange`: Recompute the cost by itself when it goes stale, instead of showing `middle-click to recalculate` and waiting (default: `false`). Requires `dryRunPreview.enable`.
     - Fires on all three staleness reasons above: `flake.lock` changing, a check finding something different, and the declared package set changing. **Not on a rebuild alone**, which is consistent with a rebuild no longer retiring a cost — what happens after one is already `afterRebuild`'s business, and each of its options leads to a check whose result fires this anyway.
@@ -416,7 +416,7 @@ The script reports its state in the JSON `alt` field, which waybar uses for two 
 | `alt` | Default glyph | Nerd Font name | Meaning |
 | --- | --- | --- | --- |
 | `has-updates` | 󰚰 | `md-update` | There is something to apply. |
-| `updating` |  | `fa-rotate` | A check is running now. |
+| `updating` |  | `fa-rotate` | A check is running now, or an update-cost preview is. A preview takes the glyph but not the header, which keeps saying `Next check`. |
 | `updated` |  | `fa-ok_sign` | A check ran and found nothing outstanding. |
 | `error` |  | `seti-error` | The check itself broke. |
 | `disabled` | 󰔞 | `md-timer_off_outline` | Checking is toggled off. The count is whatever was last measured. |
@@ -601,7 +601,7 @@ The flake provides the following outputs:
    - A check still holding the lock after 15 minutes is treated as wedged — its process group is killed and the next check proceeds. Override with `MAX_CHECK_SECONDS`.
    - Force a fresh check: `update-checker refresh` — this keeps the current count, tooltip and last-checked time on screen, and swaps the header's "Next check" for "Checking for updates..." while it runs
    - Refreshing while a check is already running shows a "Please Wait" notification instead of doing nothing, and does not queue a second check for when the current one finishes. Refreshing while an update-cost preview is running does queue one: the preview holds the same lock but learns nothing about updates, so the check starts as soon as it finishes.
-   - An update-cost preview does **not** put the module in the checking state. It takes the same lock as a check, but it is not one — the header keeps saying "Next check" and the cost section reports `calculating...` on its own.
+   - An update-cost preview also shows the `updating` glyph, for the two or three minutes it runs — that is deliberate, so a long evaluation is visible on the bar from start to finish. It does **not** put the header in the checking state: it takes the same lock as a check but is not one, so the header keeps saying "Next check" and the cost section reports `calculating...` on its own. If the glyph is stuck there, check that section — `interrupted — middle-click to retry` means the evaluation died.
    - In full mode, clear the updating flag: `rm ~/.cache/nix-update-updating-flag`
    - Restart waybar: `pkill waybar && waybar &`
 
