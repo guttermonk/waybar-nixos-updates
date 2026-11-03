@@ -159,8 +159,15 @@ REPARSE_REQUEST_FLAG="$CACHE_DIR/nix-update-reparse-request"
 DIAG_FILE="$CACHE_DIR/nix-update-diagnostic"
 DIAG_PREV_FILE="$CACHE_DIR/nix-update-diagnostic.prev"
 
-# Held for the duration of a background check so only one runs at a time.
-# The file holds "<pgid> <start-epoch>" of the worker that owns it.
+# Held for the duration of a background check so only one runs at a time. The
+# update-cost preview takes the same lock, because each of the two is a full
+# system evaluation and neither can afford to run beside the other.
+#
+# The file holds "<pgid> <start-epoch> <role>" of the job that owns it, where
+# role is "preview" for a cost evaluation and empty for a check. The role is
+# what keeps the two apart in a reader: they share the lock but not the
+# meaning, and a preview reported as a check puts "Checking for updates..." in
+# the header of a module that is checking nothing.
 CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
 
 # A check still holding the lock after this long is treated as wedged and killed.
@@ -2157,7 +2164,20 @@ refresh_updates() {
     # A check is already under way. Say so rather than appearing to ignore the
     # click, and do not set the force flag: leaving it set would queue a second,
     # redundant check to fire the moment this one finishes.
+    #
+    # A preview is the other way round. It holds the same lock, so the check
+    # cannot start now, but it answers a different question and leaves this
+    # click entirely unanswered - so the flag is set and the check runs when
+    # the lock frees. Queueing is only redundant behind something that is
+    # already finding out what this click asked for.
     if worker_running; then
+        if [ "$LOCK_ROLE" = "preview" ]; then
+            touch "$FORCE_CHECK_FLAG"
+            send_notification "updates-wait" "Please Wait" \
+                "An update cost preview is running. The check will start when it finishes." -e
+            refresh_waybar
+            return 0
+        fi
         send_notification "updates-wait" "Please Wait" \
             "An update check is already running. Wait for it to finish before checking again." -e
         return 0
@@ -2166,16 +2186,28 @@ refresh_updates() {
     refresh_waybar
 }
 
-# True while a background check holds the lock. A lock held past
-# MAX_CHECK_SECONDS is considered wedged: its process group is killed and this
-# reports "not running" so the next check can proceed.
+# Which job holds the lock, for the callers of worker_running that care: either
+# "preview" or empty for a check. Only set when worker_running returns true,
+# and empty on the paths that cannot read the role, so an unreadable lock is
+# treated as a check - the conservative reading, since that is what the lock is
+# mostly held for.
+LOCK_ROLE=""
+
+# True while a background job holds the lock - a check or an update-cost
+# preview, told apart by LOCK_ROLE. A lock held past MAX_CHECK_SECONDS is
+# considered wedged: its process group is killed and this reports "not running"
+# so the next check can proceed. That applies to either job, because what makes
+# a wedged holder worth killing is the lock it is sitting on.
 worker_running() {
-    # Lock free means nothing is running.
+    LOCK_ROLE=""
+    # Lock free means nothing is running. Tested before the contents, which
+    # survive the holder's exit: every holder truncates on acquire, so the file
+    # describes the last job to run and not necessarily a current one.
     flock -n "$CHECK_LOCK_FILE" true 2>/dev/null && return 1
 
-    local pgid started now
+    local pgid started role now
     # Racing a worker between its truncate and its write - assume it is live.
-    read -r pgid started < "$CHECK_LOCK_FILE" 2>/dev/null || return 0
+    read -r pgid started role < "$CHECK_LOCK_FILE" 2>/dev/null || return 0
     [[ "$pgid" =~ ^[0-9]+$ && "$started" =~ ^[0-9]+$ ]] || return 0
 
     now=$(date +%s)
@@ -2187,6 +2219,7 @@ worker_running() {
         kill -KILL "-$pgid" 2>/dev/null
         return 1
     fi
+    LOCK_ROLE="$role"
     return 0
 }
 
@@ -2203,7 +2236,9 @@ run_check_worker() {
         flock -n 9 || exit 0
         # Record owner and start time so a wedged check can be identified.
         # setsid makes the worker its own process group leader, so this pgid
-        # covers every child the check spawns.
+        # covers every child the check spawns. No role field: a check is the
+        # default reading of this lock, and the preview is the job that has to
+        # name itself.
         printf '%s %s\n' "$(($(ps -o pgid= -p $$)))" "$(date +%s)" >&9
         # Refresh even on failure so the widget leaves the "checking" state.
         trap 'refresh_waybar' EXIT INT TERM
@@ -2560,7 +2595,16 @@ main() {
     # interval would flip straight back to "Next check" while still running.
     local checking=false
     if worker_running; then
-        checking=true
+        # A preview holds the same lock but is not a check: it prices an update
+        # and learns nothing about whether there is one. Reporting it here put
+        # "Checking for updates..." in the header and the checking glyph on the
+        # bar for the three minutes an evaluation takes, while the thing
+        # actually running already says so in its own section of the tooltip.
+        #
+        # No check is started either - the lock is busy, and the elif below is
+        # skipped. FORCE_CHECK_FLAG is left alone, so a refresh requested
+        # during a preview is honoured once the lock frees rather than dropped.
+        [ "$LOCK_ROLE" = "preview" ] || checking=true
     elif [ "$in_grace" = false ] && \
          { [ -f "$FORCE_CHECK_FLAG" ] || [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; }; then
         # Cleared here rather than in the worker: the request has been honoured
@@ -2589,7 +2633,11 @@ main() {
         [ -n "$PREVIEW_SECTION" ] && tooltip="$tooltip\\n\\n$PREVIEW_SECTION"
         output_json "$updates" "updating" "$tooltip"
         exit 0
-    else
+    elif [ "$LOCK_ROLE" != "preview" ]; then
+        # The preview case is excluded because this message would be wrong
+        # there: a check waiting on the lock is not throttled, and the interval
+        # it reports has already elapsed - "next update is in -2 min."
+        #
         # Throttled - show wait notification if triggered manually
         # Manual invocation is distinguished by stdout, not stdin. stdin is the
         # wrong test: a session started from a VT hands /dev/tty1 down through

@@ -18,7 +18,8 @@ PREVIEW_TARGET="${PREVIEW_TARGET:-.#nixosConfigurations.$(hostname).config.syste
 PREVIEW_FILE="$CACHE_DIR/nix-update-preview"
 
 # Shared with the background update check so the two never evaluate at once -
-# each costs well over a gigabyte of RAM.
+# each costs well over a gigabyte of RAM. The holder records
+# "<pgid> <start-epoch> <role>" in it; see the worker below for the role.
 CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
 
 # Fingerprint of what the last check found, recorded so a preview can expire
@@ -488,7 +489,11 @@ worker() {
             refresh_waybar
             exit 0
         fi
-        printf '%s %s\n' "$(($(ps -o pgid= -p $$)))" "$(date +%s)" >&9
+        # "<pgid> <start-epoch> <role>", the format the checkers read. The role
+        # is what stops a cost evaluation being reported as an update check:
+        # the two share this lock, and a reader that only sees it held has no
+        # way to tell which of them is holding it. A check writes no role.
+        printf '%s %s preview\n' "$(($(ps -o pgid= -p $$)))" "$(date +%s)" >&9
         # Re-stamp with this process's identity so a reader can tell a running
         # evaluation from one that was killed part way through.
         write_state calculating "" "" \

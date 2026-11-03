@@ -360,6 +360,7 @@ When using the Home Manager module, you can configure these options:
     - The extraction is a heuristic and its contents are noisy; only whether it *changed* matters here, so a stable false positive cancels. If it can find nothing to read it simply never fires, rather than retiring a cost on no evidence.
   - Setting this back to `false` removes the binding *and* clears any result already computed.
   - Shares a lock with the background check, so the two never evaluate at once. Middle-clicking during a check reports `check in progress — try again shortly` rather than queueing.
+    - The reverse does not borrow the check's reporting: while a preview runs, the header keeps saying `Next check` and the glyph stays as it was. Only the cost section changes, to `calculating... (~3 min)`. A check that falls due inside those minutes waits for the lock and runs on the first poll after it frees.
   - `dryRunPreview.target`: flake target to price; literal `${hostname}` is replaced at run time. A leading `.#` resolves against `nixosConfigPath`, not your shell's working directory.
   - `dryRunPreview.recalculateOnChange`: Recompute the cost by itself when it goes stale, instead of showing `middle-click to recalculate` and waiting (default: `false`). Requires `dryRunPreview.enable`.
     - Fires on all three staleness reasons above: `flake.lock` changing, a check finding something different, and the declared package set changing. **Not on a rebuild alone**, which is consistent with a rebuild no longer retiring a cost — what happens after one is already `afterRebuild`'s business, and each of its options leads to a check whose result fires this anyway.
@@ -599,7 +600,8 @@ The flake provides the following outputs:
    - In lightweight mode a background check may still be running; it holds `~/.cache/nix-update-check.lock` for its duration
    - A check still holding the lock after 15 minutes is treated as wedged — its process group is killed and the next check proceeds. Override with `MAX_CHECK_SECONDS`.
    - Force a fresh check: `update-checker refresh` — this keeps the current count, tooltip and last-checked time on screen, and swaps the header's "Next check" for "Checking for updates..." while it runs
-   - Refreshing while a check is already running shows a "Please Wait" notification instead of doing nothing, and does not queue a second check for when the current one finishes
+   - Refreshing while a check is already running shows a "Please Wait" notification instead of doing nothing, and does not queue a second check for when the current one finishes. Refreshing while an update-cost preview is running does queue one: the preview holds the same lock but learns nothing about updates, so the check starts as soon as it finishes.
+   - An update-cost preview does **not** put the module in the checking state. It takes the same lock as a check, but it is not one — the header keeps saying "Next check" and the cost section reports `calculating...` on its own.
    - In full mode, clear the updating flag: `rm ~/.cache/nix-update-updating-flag`
    - Restart waybar: `pkill waybar && waybar &`
 
@@ -663,7 +665,7 @@ The script uses several cache files in your ~/.cache directory:
 - `nix-update-system-path`: Caches the last-seen `/run/current-system` path, used to auto-detect rebuilds
 - `nix-update-flake-lock-input-hash`: Caches a hash of `flake.lock`, used to auto-detect input updates
 - `nix-update-updating-flag`: Signals that a check is mid-run (full mode only)
-- `nix-update-check.lock`: Held while a background check runs, so only one runs at a time (lightweight mode only)
+- `nix-update-check.lock`: Held while a check or an update-cost preview runs, so only one of them evaluates at a time. The holder records `<pgid> <start-epoch> <role>` in it, where the role is `preview` for a cost evaluation and empty for a check — which is what keeps a preview from being reported as a check
 - `nix-update-error`: Present when the last check failed, holding the reason; makes the module show its error state instead of a healthy count. Removed by the next successful check.
 - `nix-update-diagnostic` / `.prev`: What the last two checks actually resolved — channels, package-to-channel mapping size, and for each reported package which channel it was compared against versus which one the mapping put it in. The previous run is kept because a wrong result is usually followed immediately by a correct one, which would otherwise overwrite the evidence. If the module reports something you don't expect, `cat ~/.cache/nix-update-diagnostic.prev` is the place to start.
 - `nix-update-source-count` / `-shown` / `-tooltip`: Last `sourceChecks` result, so a rebuild can redraw the Sources section without reaching the network

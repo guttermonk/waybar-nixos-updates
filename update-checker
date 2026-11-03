@@ -77,6 +77,10 @@
     # update takes to fetch and build - which can exceed updateInterval, putting
     # a second poll inside the first check. Two of those would fetch and build
     # the same paths concurrently and race to write the same result files.
+    #
+    # The update-cost preview takes the same lock - each of the two is a full
+    # system evaluation - and records "<pgid> <start-epoch> preview" in the file
+    # so a reader can tell which of them is holding it. See lock_role.
     CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
 
     # The grace period prevents the update checker from running immediately after:
@@ -817,6 +821,27 @@
         flock -n "$CHECK_LOCK_FILE" true 2>/dev/null || return 0
 
         preview start >/dev/null 2>&1 || true
+    }
+
+    # Which job holds the shared evaluation lock: "preview" for an update-cost
+    # evaluation, empty for a check or for a free lock. A check writes nothing
+    # to the file, so empty is its reading, and the preview is the job that has
+    # to name itself.
+    #
+    # The flock test comes first and is what makes the answer about now. The
+    # contents survive the holder's exit - every holder truncates on acquire, so
+    # the file otherwise describes the last job to run rather than a running
+    # one, and a preview from an hour ago would read as one in progress.
+    function lock_role() {
+        # No flock, no way to tell a held lock from a finished one - and no
+        # preview either, since the preview declines to start without it. Said
+        # here because the alternative is reading a stale file as a live preview
+        # and suspending checks for good.
+        command -v flock >/dev/null 2>&1 || return 0
+        flock -n "$CHECK_LOCK_FILE" true 2>/dev/null && return 0
+        local pgid started role
+        read -r pgid started role < "$CHECK_LOCK_FILE" 2>/dev/null || return 0
+        printf '%s' "$role"
     }
 
     function var_setter() {
@@ -1687,8 +1712,21 @@
              
               # Decide whether to show saved state or perform new check
               if [ -f "$FORCE_CHECK_FLAG" ] || [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; then
+                  # An update-cost preview holds the shared lock. A check cannot
+                  # start until it frees, so this poll shows the last result and
+                  # waits: the pending flag is not armed and the header is not
+                  # switched to "Checking for updates...", because nothing is.
+                  # Arming either would have the module claim a check for the
+                  # three minutes an evaluation takes - the preview already
+                  # reports itself, in the section that is about it.
+                  #
+                  # Neither flag is cleared here, so a check that is due or was
+                  # asked for still runs on the first poll after the lock frees.
+                  if [ "$(lock_role)" = "preview" ]; then
+                      var_setter
+
                   # Separating updating and updated phase
-                  if [ -f "$UPDATING_FLAG" ]; then
+                  elif [ -f "$UPDATING_FLAG" ]; then
                       # The check is happening now, so the refresh request has
                       # been honoured. Cleared here rather than after the check
                       # so a failing check does not re-trigger on every poll.
@@ -1712,9 +1750,11 @@
                       fi
 
                       if [ "$check_locked" = false ]; then
-                          # Another check owns the lock. Report it as in progress
-                          # rather than starting a second one, and leave its
-                          # UPDATING_FLAG alone - it belongs to that process.
+                          # Another check owns the lock - a preview holding it is
+                          # answered above and never reaches here. Report it as
+                          # in progress rather than starting a second one, and
+                          # leave its UPDATING_FLAG alone - it belongs to that
+                          # process.
                           updates=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
                           alt="updating"
                           local busy_tooltip=$(cat "$LAST_RUN_TOOLTIP" 2>/dev/null || echo "")
