@@ -410,6 +410,19 @@ If you're using the Home Manager module, the waybar configuration is automatical
 
 To configure manually, add one of the following configurations to your Waybar config (`~/.config/waybar/config`).
 
+The script reports its state in the JSON `alt` field, which waybar uses for two things: picking the glyph out of `format-icons`, and setting a CSS class on the module. Every state the script can emit needs an entry in `format-icons` — **an alt with no entry renders `{icon}` as nothing at all**, so a hand-written config missing one of these silently loses its icon.
+
+| `alt` | Default glyph | Nerd Font name | Meaning |
+| --- | --- | --- | --- |
+| `has-updates` | 󰚰 | `md-update` | There is something to apply. |
+| `updating` |  | `fa-rotate` | A check is running now. |
+| `updated` |  | `fa-ok_sign` | A check ran and found nothing outstanding. |
+| `error` |  | `seti-error` | The check itself broke. |
+| `disabled` | 󰔞 | `md-timer_off_outline` | Checking is toggled off. The count is whatever was last measured. |
+| `offline` | 󰓨 | `md-sync_off` | The network could not be reached, so no check ran. The count is whatever was last measured. |
+
+**`offline` is not `updated`.** The count shown beside it is a cached one and nothing is refreshing it, which is a different claim from "there is nothing to do" — the distinction the `gone (upstream unreachable)` lines draw for a single input, drawn here for the module as a whole. The glyph is `md-update` with a slash through it, so an outage reads as the same thing crossed out. It is emitted whether the cached count is zero or not: a check mark for a check that never ran is the same overclaim either way.
+
 In json (if adding directly to the config file):
 ```json
 "custom/nix-updates": {
@@ -428,7 +441,8 @@ In json (if adding directly to the config file):
         "has-updates": "󰚰", // icon when updates needed
         "updating": "", // icon when updating
         "updated": "", // icon when all packages updated
-        "disabled": "󰚰", // icon when update checking is disabled
+        "disabled": "󰔞", // icon when update checking is disabled
+        "offline": "󰓨", // icon when the last check could not reach the network
         "error": "" // icon when errot occurs
     },
 },
@@ -452,7 +466,8 @@ In nix (if adding it "the nix way" through home-manager):
     has-updates = "󰚰";
     updating = "";
     updated = "";
-    disabled = "󰚰";
+    disabled = "󰔞";
+    offline = "󰓨";
     error = "";
   };
 };
@@ -530,6 +545,9 @@ Here's a complete example of using waybar-nixos-updates with Home Manager:
                 #custom-nix-updates.disabled {
                   color: #6c7086;
                   opacity: 0.7;
+                }
+                #custom-nix-updates.offline {
+                  color: #6c7086;
                 }
                 #custom-nix-updates.error {
                   color: #eba0ac;

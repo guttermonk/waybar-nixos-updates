@@ -1795,7 +1795,24 @@
             if [ -z "$updates" ]; then
                 updates="0"
             fi
-            alt="updated"
+            # Its own state, not "updated". This read "updated" regardless of
+            # the count beside it, so an outage with six packages pending drew
+            # the check glyph against a six - the module claiming the system was
+            # up to date and reporting six outstanding updates in the same
+            # breath. Every other branch derives the alt from the count; this
+            # one ignored it.
+            #
+            # Deriving it from the count here would fix the contradiction but
+            # still not say what is true, which is that the number is a cached
+            # one and nothing is refreshing it. "offline" is the only channel
+            # that reaches both the glyph and the CSS class, so it is what lets
+            # a stale count be styled as stale rather than merely be one.
+            #
+            # Not conditioned on the count: the state is "nobody could check",
+            # and that is equally true of a cached zero. The zero case is the
+            # same lie as the six, only quieter - a check mark for a check that
+            # never ran. Same shape as "disabled", which also shadows its count.
+            alt="offline"
             # The header carries the state now, so the body does not repeat it
             # and keeps showing what is actually pending. The last result is not
             # invalidated by the link being down - the same reasoning the

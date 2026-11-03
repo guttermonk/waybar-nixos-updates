@@ -811,12 +811,27 @@
                   tooltip = true;
                   return-type = "json";
                   format = "{icon} {text}";
+                  # One entry per alt the scripts emit. An alt with no entry
+                  # here renders {icon} as nothing at all, so a state added to
+                  # the scripts without a glyph added here is a state that
+                  # silently loses its icon - which is what "offline" would have
+                  # been for anyone overriding these.
                   format-icons = {
                     has-updates = "󰚰";
                     updating = "";
                     updated = "";
                     error = "";
                     disabled = "󰔞";
+                    # md-sync_off: md-update above with a slash through it, so
+                    # the outage reads as the same thing crossed out rather than
+                    # as an unrelated glyph. Chosen over the cloud and wifi
+                    # candidates on legibility - at the 13px a bar actually
+                    # renders, the slash is the dominant stroke and survives,
+                    # where cloud_off_outline dissolves into a blob and
+                    # cloud_question loses its mark entirely. It also avoids
+                    # naming the transport: the check tests for a default route
+                    # and a global IP, so it knows it did not check, not why.
+                    offline = "󰓨";
                   };
                 };
                 description = "Waybar module configuration for nix-updates";

@@ -340,7 +340,16 @@
         color: #eba0ac;
         font-weight: bold;
       }
-      
+
+      /* Offline: the count is the last one that could be measured, and
+         nothing is refreshing it. Styled as muted rather than as an alarm --
+         it is not an error, and not being able to check is not itself a
+         thing to act on. Deliberately not blinking like has-updates, which
+         would spend attention on an outage the user can see for themselves. */
+      #custom-nix-updates.offline {
+        color: #6c7086;
+      }
+
       @keyframes blink {
         0% { opacity: 1; }
         50% { opacity: 0.5; }
@@ -407,6 +416,8 @@
   #     updating = "󰇚";
   #     updated = "󰄴";
   #     error = "󰅚";
+  #     disabled = "󰔞";
+  #     offline = "󰓨";
   #   };
   # };
 

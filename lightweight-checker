@@ -2512,11 +2512,33 @@ main() {
                 body="$PREVIEW_SECTION"
             fi
         fi
+        # "offline" is its own state, not "updated". This read "updated"
+        # regardless of the count beside it, so an outage with six packages
+        # pending drew the check glyph against a six - the module claiming the
+        # system was up to date and reporting six outstanding updates in the
+        # same breath. The tail below derives the alt from the count; this
+        # branch ignored it.
+        #
+        # Deriving it from the count here would fix the contradiction but still
+        # not say what is true, which is that the number is a cached one and
+        # nothing is refreshing it. "offline" is the only channel that reaches
+        # both the glyph and the CSS class, so it is what lets a stale count be
+        # styled as stale rather than merely be one.
+        #
+        # Not conditioned on the count: the state is "nobody could check", and
+        # that is equally true of a cached zero - a check mark for a check that
+        # never ran. Same shape as "disabled", which also shadows its count.
+        #
+        # Guarded the way the tail guards it rather than with ${updates:-0},
+        # which only catches an empty state file: a corrupt one is non-empty and
+        # went into the bar verbatim.
+        local off_text="0"
+        [[ "$updates" =~ ^[0-9]+$ ]] && off_text="$updates"
         if [ -n "$body" ]; then
-            output_json "${updates:-0}" "updated" \
+            output_json "$off_text" "offline" \
                 "$header\\n${TOOLTIP_HR}\\n$body"
         else
-            output_json "${updates:-0}" "updated" "$header"
+            output_json "$off_text" "offline" "$header"
         fi
         exit 0
     fi
