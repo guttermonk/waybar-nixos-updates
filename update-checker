@@ -78,10 +78,15 @@
     # a second poll inside the first check. Two of those would fetch and build
     # the same paths concurrently and race to write the same result files.
     #
-    # The update-cost preview takes the same lock - each of the two is a full
-    # system evaluation - and records "<pgid> <start-epoch> preview" in the file
-    # so a reader can tell which of them is holding it. See lock_role.
+    # The update-cost preview takes the same lock, since each of the two is a
+    # full system evaluation.
     CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
+    # Held by a preview, and only by a preview, for as long as its evaluation
+    # runs - the lock that tells the two jobs above apart. A second lock rather
+    # than a field in the first one, because a process that loses the race for a
+    # lock truncates the file in the act of opening it to try, which erased the
+    # running holder's own entry.
+    PREVIEW_LOCK_FILE="$CACHE_DIR/nix-update-preview.lock"
 
     # The grace period prevents the update checker from running immediately after:
     # 1. First boot - when the system has just started up
@@ -130,6 +135,11 @@
     APP_LIST_HASH_FILE="$CACHE_DIR/nix-update-app-list-hash"
     # Result of the last update-cost preview, written by the preview script.
     PREVIEW_FILE="$CACHE_DIR/nix-update-preview"
+    # Set by a middle-click that could not start an evaluation, and cleared by
+    # the first poll that reports it. Separate from the record above so that a
+    # refused click costs nothing: it is the one event that certainly did not
+    # change the stored cost, and it used to overwrite it.
+    PREVIEW_DECLINED_FILE="$CACHE_DIR/nix-update-preview-declined"
 
 
     # ===== Initialize Files =====
@@ -652,6 +662,28 @@
     # already reports as interrupted.
     PREVIEW_RUNNING=false
     function build_preview_section() {
+        render_preview_section
+
+        # A middle-click that could not start an evaluation, reported once and
+        # cleared here: the click has been answered, and the message must not
+        # outlive the state it refers to. Laid over whatever the section already
+        # says rather than written into the record, so a refused click costs
+        # nothing - it is the one event that certainly changed no cost.
+        [ -f "$PREVIEW_DECLINED_FILE" ] || return 0
+        rm -f "$PREVIEW_DECLINED_FILE"
+        [ "$DRY_RUN_PREVIEW" = "true" ] || return 0
+
+        if [ "$PREVIEW_HAS_STATE" = true ]; then
+            PREVIEW_SECTION="$PREVIEW_SECTION\ncheck in progress — try again shortly"
+        else
+            # With nothing stored the affordance line is replaced rather than
+            # followed: "middle-click to calculate" is what this click just did.
+            PREVIEW_SECTION="Update cost:\ncheck in progress — try again shortly"
+            PREVIEW_HAS_STATE=true
+        fi
+    }
+
+    function render_preview_section() {
         PREVIEW_SECTION=""
         PREVIEW_HAS_STATE=false
         PREVIEW_RUNNING=false
@@ -659,7 +691,7 @@
         # Disabled: drop any result so turning the feature off also clears what
         # it left behind, rather than stranding a number with no way to dismiss.
         if [ "$DRY_RUN_PREVIEW" != "true" ]; then
-            rm -f "$PREVIEW_FILE"
+            rm -f "$PREVIEW_FILE" "$PREVIEW_DECLINED_FILE"
             return 0
         fi
 
@@ -700,9 +732,11 @@
                 fi
                 ;;
             declined)
+                # No longer written: a refused click is its own flag now,
+                # because writing it here replaced whatever the record held.
+                # Kept to clear one left by the preceding version, which
+                # nothing else would.
                 body="check in progress — try again shortly"
-                # Cleared on read: the click has been answered, and the message
-                # should not outlive the check it refers to.
                 rm -f "$PREVIEW_FILE"
                 ;;
             failed)
@@ -833,25 +867,18 @@
         preview start >/dev/null 2>&1 || true
     }
 
-    # Which job holds the shared evaluation lock: "preview" for an update-cost
-    # evaluation, empty for a check or for a free lock. A check writes nothing
-    # to the file, so empty is its reading, and the preview is the job that has
-    # to name itself.
+    # True while a cost evaluation is running, which is how this mode tells a
+    # preview holding the shared lock from a check holding it. Lock state only,
+    # so there is nothing to go stale: it cannot outlive the process holding it
+    # the way a file's contents outlive their writer.
     #
-    # The flock test comes first and is what makes the answer about now. The
-    # contents survive the holder's exit - every holder truncates on acquire, so
-    # the file otherwise describes the last job to run rather than a running
-    # one, and a preview from an hour ago would read as one in progress.
-    function lock_role() {
-        # No flock, no way to tell a held lock from a finished one - and no
-        # preview either, since the preview declines to start without it. Said
-        # here because the alternative is reading a stale file as a live preview
-        # and suspending checks for good.
-        command -v flock >/dev/null 2>&1 || return 0
-        flock -n "$CHECK_LOCK_FILE" true 2>/dev/null && return 0
-        local pgid started role
-        read -r pgid started role < "$CHECK_LOCK_FILE" 2>/dev/null || return 0
-        printf '%s' "$role"
+    # Without flock it answers false, and the module behaves as it did before
+    # any of this: there is no way to tell a held lock from a finished one, and
+    # no preview either, since the preview declines to start without flock.
+    function preview_running() {
+        command -v flock >/dev/null 2>&1 || return 1
+        flock -n "$PREVIEW_LOCK_FILE" true 2>/dev/null && return 1
+        return 0
     }
 
     function var_setter() {
@@ -1732,7 +1759,7 @@
                   #
                   # Neither flag is cleared here, so a check that is due or was
                   # asked for still runs on the first poll after the lock frees.
-                  if [ "$(lock_role)" = "preview" ]; then
+                  if preview_running; then
                       var_setter
 
                   # Separating updating and updated phase

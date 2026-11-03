@@ -137,6 +137,12 @@ APP_LIST_HASH_FILE="$CACHE_DIR/nix-update-app-list-hash"
 # Result of the last update-cost preview, written by the preview script.
 PREVIEW_FILE="$CACHE_DIR/nix-update-preview"
 
+# Set by a middle-click that could not start an evaluation, and cleared by the
+# first poll that reports it. Separate from the record above so that a refused
+# click costs nothing: it is the one event that certainly did not change the
+# stored cost, and it used to overwrite it.
+PREVIEW_DECLINED_FILE="$CACHE_DIR/nix-update-preview-declined"
+
 # Set when a check fails, so the module can show an error state instead of
 # rendering the failure as a healthy result. Cleared by the next good check.
 ERROR_FILE="$CACHE_DIR/nix-update-error"
@@ -162,13 +168,17 @@ DIAG_PREV_FILE="$CACHE_DIR/nix-update-diagnostic.prev"
 # Held for the duration of a background check so only one runs at a time. The
 # update-cost preview takes the same lock, because each of the two is a full
 # system evaluation and neither can afford to run beside the other.
-#
-# The file holds "<pgid> <start-epoch> <role>" of the job that owns it, where
-# role is "preview" for a cost evaluation and empty for a check. The role is
-# what keeps the two apart in a reader: they share the lock but not the
-# meaning, and a preview reported as a check puts "Checking for updates..." in
-# the header of a module that is checking nothing.
+# The file holds "<pgid> <start-epoch>" of the job that owns it.
 CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
+
+# Held by a preview, and only by a preview, for as long as its evaluation runs.
+# The two jobs share the lock above but not the meaning, and a preview reported
+# as a check puts "Checking for updates..." in the header of a module that is
+# checking nothing - so this is the lock that tells them apart. A second lock
+# rather than a field in the first one, because a process that loses the race
+# for a lock truncates the file in the act of opening it to try, which erased
+# the running holder's own entry.
+PREVIEW_LOCK_FILE="$CACHE_DIR/nix-update-preview.lock"
 
 # A check still holding the lock after this long is treated as wedged and killed.
 # The lock fd is inherited by every process the check spawns, so an orphaned nix
@@ -627,6 +637,28 @@ PREVIEW_HAS_STATE=false
 # interrupted.
 PREVIEW_RUNNING=false
 build_preview_section() {
+    render_preview_section
+
+    # A middle-click that could not start an evaluation, reported once and
+    # cleared here: the click has been answered, and the message must not
+    # outlive the state it refers to. Laid over whatever the section already
+    # says rather than written into the record, so a refused click costs
+    # nothing - it is the one event that certainly changed no cost.
+    [ -f "$PREVIEW_DECLINED_FILE" ] || return 0
+    rm -f "$PREVIEW_DECLINED_FILE"
+    [ "$DRY_RUN_PREVIEW" = "true" ] || return 0
+
+    if [ "$PREVIEW_HAS_STATE" = true ]; then
+        PREVIEW_SECTION="$PREVIEW_SECTION\\ncheck in progress — try again shortly"
+    else
+        # With nothing stored the affordance line is replaced rather than
+        # followed: "middle-click to calculate" is what this click just did.
+        PREVIEW_SECTION="Update cost:\\ncheck in progress — try again shortly"
+        PREVIEW_HAS_STATE=true
+    fi
+}
+
+render_preview_section() {
     PREVIEW_SECTION=""
     PREVIEW_HAS_STATE=false
     PREVIEW_RUNNING=false
@@ -634,7 +666,7 @@ build_preview_section() {
     # Disabled: drop any result so turning the feature off also clears what it
     # left behind, rather than stranding a number with no way to dismiss it.
     if [ "$DRY_RUN_PREVIEW" != "true" ]; then
-        rm -f "$PREVIEW_FILE"
+        rm -f "$PREVIEW_FILE" "$PREVIEW_DECLINED_FILE"
         return 0
     fi
 
@@ -675,9 +707,10 @@ build_preview_section() {
             fi
             ;;
         declined)
+            # No longer written: a refused click is its own flag now, because
+            # writing it here replaced whatever the record held. Kept to clear
+            # one left by the preceding version, which nothing else would.
             body="check in progress — try again shortly"
-            # Cleared on read: the click has been answered, and the message
-            # should not outlive the check it refers to.
             rm -f "$PREVIEW_FILE"
             ;;
         failed)
@@ -2181,7 +2214,7 @@ refresh_updates() {
     # the lock frees. Queueing is only redundant behind something that is
     # already finding out what this click asked for.
     if worker_running; then
-        if [ "$LOCK_ROLE" = "preview" ]; then
+        if preview_running; then
             touch "$FORCE_CHECK_FLAG"
             send_notification "updates-wait" "Please Wait" \
                 "An update cost preview is running. The check will start when it finishes." -e
@@ -2196,28 +2229,19 @@ refresh_updates() {
     refresh_waybar
 }
 
-# Which job holds the lock, for the callers of worker_running that care: either
-# "preview" or empty for a check. Only set when worker_running returns true,
-# and empty on the paths that cannot read the role, so an unreadable lock is
-# treated as a check - the conservative reading, since that is what the lock is
-# mostly held for.
-LOCK_ROLE=""
-
 # True while a background job holds the lock - a check or an update-cost
-# preview, told apart by LOCK_ROLE. A lock held past MAX_CHECK_SECONDS is
-# considered wedged: its process group is killed and this reports "not running"
-# so the next check can proceed. That applies to either job, because what makes
-# a wedged holder worth killing is the lock it is sitting on.
+# preview, told apart by preview_running below. A lock held past
+# MAX_CHECK_SECONDS is considered wedged: its process group is killed and this
+# reports "not running" so the next check can proceed. That applies to either
+# job, because what makes a wedged holder worth killing is the lock it is
+# sitting on.
 worker_running() {
-    LOCK_ROLE=""
-    # Lock free means nothing is running. Tested before the contents, which
-    # survive the holder's exit: every holder truncates on acquire, so the file
-    # describes the last job to run and not necessarily a current one.
+    # Lock free means nothing is running.
     flock -n "$CHECK_LOCK_FILE" true 2>/dev/null && return 1
 
-    local pgid started role now
+    local pgid started now
     # Racing a worker between its truncate and its write - assume it is live.
-    read -r pgid started role < "$CHECK_LOCK_FILE" 2>/dev/null || return 0
+    read -r pgid started < "$CHECK_LOCK_FILE" 2>/dev/null || return 0
     [[ "$pgid" =~ ^[0-9]+$ && "$started" =~ ^[0-9]+$ ]] || return 0
 
     now=$(date +%s)
@@ -2229,7 +2253,17 @@ worker_running() {
         kill -KILL "-$pgid" 2>/dev/null
         return 1
     fi
-    LOCK_ROLE="$role"
+    return 0
+}
+
+# True while a cost evaluation is running. Lock state only, so there is nothing
+# to go stale: it cannot outlive the process holding it the way a file's
+# contents outlive their writer. Without flock it answers false, which leaves
+# the module reporting what it reported before any of this - and a preview
+# cannot run without flock either.
+preview_running() {
+    command -v flock >/dev/null 2>&1 || return 1
+    flock -n "$PREVIEW_LOCK_FILE" true 2>/dev/null && return 1
     return 0
 }
 
@@ -2246,9 +2280,7 @@ run_check_worker() {
         flock -n 9 || exit 0
         # Record owner and start time so a wedged check can be identified.
         # setsid makes the worker its own process group leader, so this pgid
-        # covers every child the check spawns. No role field: a check is the
-        # default reading of this lock, and the preview is the job that has to
-        # name itself.
+        # covers every child the check spawns.
         printf '%s %s\n' "$(($(ps -o pgid= -p $$)))" "$(date +%s)" >&9
         # Refresh even on failure so the widget leaves the "checking" state.
         trap 'refresh_waybar' EXIT INT TERM
@@ -2603,18 +2635,23 @@ main() {
     # Report the checking state for as long as a worker is actually alive, not
     # just on the poll that started it - otherwise a manual refresh inside the
     # interval would flip straight back to "Next check" while still running.
-    local checking=false
+    local checking=false previewing=false
     if worker_running; then
         # A preview holds the same lock but is not a check: it prices an update
         # and learns nothing about whether there is one. Reporting it here put
-        # "Checking for updates..." in the header and the checking glyph on the
-        # bar for the three minutes an evaluation takes, while the thing
-        # actually running already says so in its own section of the tooltip.
+        # "Checking for updates..." in the header for the three minutes an
+        # evaluation takes, while the thing actually running already says so in
+        # its own section of the tooltip. The glyph still reports it, from the
+        # preview's own record, further down.
         #
         # No check is started either - the lock is busy, and the elif below is
         # skipped. FORCE_CHECK_FLAG is left alone, so a refresh requested
         # during a preview is honoured once the lock frees rather than dropped.
-        [ "$LOCK_ROLE" = "preview" ] || checking=true
+        if preview_running; then
+            previewing=true
+        else
+            checking=true
+        fi
     elif [ "$in_grace" = false ] && \
          { [ -f "$FORCE_CHECK_FLAG" ] || [ $((current_time - last_run)) -gt "$UPDATE_INTERVAL" ]; }; then
         # Cleared here rather than in the worker: the request has been honoured
@@ -2643,7 +2680,7 @@ main() {
         [ -n "$PREVIEW_SECTION" ] && tooltip="$tooltip\\n\\n$PREVIEW_SECTION"
         output_json "$updates" "updating" "$tooltip"
         exit 0
-    elif [ "$LOCK_ROLE" != "preview" ]; then
+    elif [ "$previewing" = false ]; then
         # The preview case is excluded because this message would be wrong
         # there: a check waiting on the lock is not throttled, and the interval
         # it reports has already elapsed - "next update is in -2 min."

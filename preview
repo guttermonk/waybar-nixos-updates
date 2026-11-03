@@ -17,10 +17,24 @@ PREVIEW_TARGET="${PREVIEW_TARGET:-.#nixosConfigurations.$(hostname).config.syste
 
 PREVIEW_FILE="$CACHE_DIR/nix-update-preview"
 
+# A click that could not start an evaluation. Deliberately a file of its own
+# rather than a status in the record above: the message is about this click and
+# nothing else, and writing it into the record destroyed whatever the record
+# held - a stored cost, or the "calculating" of an evaluation already running,
+# which the readers then cleared on sight and left running invisibly.
+PREVIEW_DECLINED_FILE="$CACHE_DIR/nix-update-preview-declined"
+
 # Shared with the background update check so the two never evaluate at once -
-# each costs well over a gigabyte of RAM. The holder records
-# "<pgid> <start-epoch> <role>" in it; see the worker below for the role.
+# each costs well over a gigabyte of RAM.
 CHECK_LOCK_FILE="$CACHE_DIR/nix-update-check.lock"
+
+# Held alongside it, by a preview and only by a preview, for as long as the
+# evaluation runs. It is what lets a reader tell which of the two jobs is
+# holding the shared lock, and it answers that with nothing but the lock state:
+# the identity recorded inside the shared lock file cannot be trusted for this,
+# because a process that loses the race truncates that file in the act of
+# opening it to try - so a second click erased the running preview's own entry.
+PREVIEW_LOCK_FILE="$CACHE_DIR/nix-update-preview.lock"
 
 # Fingerprint of what the last check found, recorded so a preview can expire
 # when upstream moves - which leaves flake.lock and the current system
@@ -40,6 +54,26 @@ trap cleanup EXIT
 
 refresh_waybar() {
     pkill -x -RTMIN+12 .waybar-wrapped >/dev/null 2>&1 || true
+}
+
+# True while a cost evaluation is running, anywhere on the machine. Lock state
+# only, so there is nothing to go stale: it cannot outlive the process holding
+# it the way a file's contents outlive their writer.
+#
+# Without flock it answers false. Nothing can be told apart in that case, and
+# false is the reading that leaves a click reported rather than dropped in
+# silence - the preview cannot run without flock either.
+preview_running() {
+    command -v flock >/dev/null 2>&1 || return 1
+    flock -n "$PREVIEW_LOCK_FILE" true 2>/dev/null && return 1
+    return 0
+}
+
+# Report a click that could not be honoured, without touching the record.
+decline() {
+    mkdir -p "$CACHE_DIR"
+    : > "$PREVIEW_DECLINED_FILE"
+    refresh_waybar
 }
 
 have_network() {
@@ -462,11 +496,21 @@ run_preview() {
 start() {
     mkdir -p "$CACHE_DIR"
 
-    # A check and a preview are each a full system evaluation. Decline rather
-    # than queue, so a click never fires a job minutes after it was forgotten.
     if ! flock -n "$CHECK_LOCK_FILE" true 2>/dev/null; then
-        write_state declined
-        refresh_waybar
+        # Already calculating, which is what a second click is asking about.
+        # The record says so and is left exactly as it is: replacing it with a
+        # message about this click took the running evaluation off the bar and
+        # out of the tooltip, since the readers clear that message on sight -
+        # so the preview went on for its three minutes with nothing anywhere
+        # reporting it, and its cost appeared from nowhere at the end.
+        if preview_running; then
+            refresh_waybar
+            return 0
+        fi
+        # A check and a preview are each a full system evaluation. Decline
+        # rather than queue, so a click never fires a job minutes after it was
+        # forgotten.
+        decline
         return 0
     fi
 
@@ -481,31 +525,47 @@ start() {
 worker() {
     (
         # The launcher's lock test and this acquisition are separate moments, so
-        # a check can start in between. Say so and clear the calculating state -
-        # exiting quietly here left the tooltip reading "calculating..." forever,
-        # because nothing else ever rewrites that record.
+        # something can take the lock in between.
         if ! flock -n 9; then
-            write_state declined
-            refresh_waybar
+            # Another preview won it, from a click a moment earlier. Its record
+            # is the live one and describes an evaluation that is running, so
+            # this process leaves without writing anything at all.
+            if preview_running; then
+                exit 0
+            fi
+            # A check won it. The launcher's "calculating" record now describes
+            # an evaluation that will never run, and nothing else would ever
+            # rewrite it - exiting quietly here left the tooltip reading
+            # "calculating..." forever.
+            rm -f "$PREVIEW_FILE"
+            decline
             exit 0
         fi
-        # "<pgid> <start-epoch> <role>", the format the checkers read. The role
-        # is what stops a cost evaluation being reported as an update check:
-        # the two share this lock, and a reader that only sees it held has no
-        # way to tell which of them is holding it. A check writes no role.
-        printf '%s %s preview\n' "$(($(ps -o pgid= -p $$)))" "$(date +%s)" >&9
+        # Taken second and only while the shared lock is held, which is what
+        # makes "the preview lock is held" mean "a preview holds the shared
+        # one". Nothing else takes it, so it cannot be contended from here;
+        # tested anyway rather than assumed, since proceeding without it would
+        # have this evaluation reported as a check for its whole run.
+        if ! flock -n 8; then
+            rm -f "$PREVIEW_FILE"
+            decline
+            exit 0
+        fi
+        # Identity of the holder, for the wedged-check timeout in the
+        # lightweight checker, which is the only reader of this line.
+        printf '%s %s\n' "$(($(ps -o pgid= -p $$)))" "$(date +%s)" >&9
         # Re-stamp with this process's identity so a reader can tell a running
         # evaluation from one that was killed part way through.
         write_state calculating "" "" \
             "$$ $(awk '{print $22}' /proc/$$/stat 2>/dev/null) $(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
         run_preview || true
-    ) 9>"$CHECK_LOCK_FILE"
+    ) 9>"$CHECK_LOCK_FILE" 8>"$PREVIEW_LOCK_FILE"
 }
 
 case "${1:-start}" in
     start)  start ;;
     worker) worker ;;
     run)    run_preview ;;   # synchronous, for terminal use
-    clear)  rm -f "$PREVIEW_FILE"; refresh_waybar ;;
+    clear)  rm -f "$PREVIEW_FILE" "$PREVIEW_DECLINED_FILE"; refresh_waybar ;;
     *)      echo "usage: preview [start|run|clear]" >&2; exit 2 ;;
 esac
