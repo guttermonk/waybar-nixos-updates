@@ -359,7 +359,9 @@ When using the Home Manager module, you can configure these options:
     - The package key reads your `.nix` files rather than the built system, so it fires when you **save**, not when you rebuild — the plan changes at the edit either way. It is deliberately not derived from `nvd`: measured across 19 real commits of one configuration, `nvd` reported added packages for config-generated systemd units and for transitive dependencies pulled in by ordinary upgrades, while the declared list stayed put for all 15 settings-only commits and moved for exactly the 4 that changed packages.
     - The extraction is a heuristic and its contents are noisy; only whether it *changed* matters here, so a stable false positive cancels. If it can find nothing to read it simply never fires, rather than retiring a cost on no evidence.
   - Setting this back to `false` removes the binding *and* clears any result already computed.
-  - Shares a lock with the background check, so the two never evaluate at once. Middle-clicking during a check reports `check in progress — try again shortly` rather than queueing.
+  - Shares a lock with the background check, so the two never evaluate at once. Middle-clicking during a check reports `check in progress — try again shortly` rather than queueing. The message is laid over whatever the section already shows and cleared by the next poll, so a refused click costs you nothing — a stored cost stays exactly where it was, which it did not use to.
+    - Clicking again while a preview is already running does nothing at all, deliberately. The tooltip already reports that evaluation, and the second click used to replace that report with the refusal above — which the next poll then cleared, leaving three minutes of evaluation with nothing anywhere saying it was running, and a cost that appeared from nowhere at the end.
+    - The reverse borrows the glyph but not the header. While a preview runs the module shows the `updating` icon, because an evaluation that takes minutes should be visible on the bar from the moment it starts until the moment it finishes — but the header keeps saying `Next check`, because nothing is checking for updates, and the cost section reports `calculating... (~3 min)` on its own. A check that falls due inside those minutes waits for the lock and runs on the first poll after it frees.
   - `dryRunPreview.target`: flake target to price; literal `${hostname}` is replaced at run time. A leading `.#` resolves against `nixosConfigPath`, not your shell's working directory.
   - `dryRunPreview.recalculateOnChange`: Recompute the cost by itself when it goes stale, instead of showing `middle-click to recalculate` and waiting (default: `false`). Requires `dryRunPreview.enable`.
     - Fires on all three staleness reasons above: `flake.lock` changing, a check finding something different, and the declared package set changing. **Not on a rebuild alone**, which is consistent with a rebuild no longer retiring a cost — what happens after one is already `afterRebuild`'s business, and each of its options leads to a check whose result fires this anyway.
@@ -415,7 +417,7 @@ The script reports its state in the JSON `alt` field, which waybar uses for two 
 | `alt` | Default glyph | Nerd Font name | Meaning |
 | --- | --- | --- | --- |
 | `has-updates` | 󰚰 | `md-update` | There is something to apply. |
-| `updating` |  | `fa-rotate` | A check is running now. |
+| `updating` |  | `fa-rotate` | A check is running now, or an update-cost preview is. A preview takes the glyph but not the header, which keeps saying `Next check`. |
 | `updated` |  | `fa-ok_sign` | A check ran and found nothing outstanding. |
 | `error` |  | `seti-error` | The check itself broke. |
 | `disabled` | 󰔞 | `md-timer_off_outline` | Checking is toggled off. The count is whatever was last measured. |
@@ -599,7 +601,8 @@ The flake provides the following outputs:
    - In lightweight mode a background check may still be running; it holds `~/.cache/nix-update-check.lock` for its duration
    - A check still holding the lock after 15 minutes is treated as wedged — its process group is killed and the next check proceeds. Override with `MAX_CHECK_SECONDS`.
    - Force a fresh check: `update-checker refresh` — this keeps the current count, tooltip and last-checked time on screen, and swaps the header's "Next check" for "Checking for updates..." while it runs
-   - Refreshing while a check is already running shows a "Please Wait" notification instead of doing nothing, and does not queue a second check for when the current one finishes
+   - Refreshing while a check is already running shows a "Please Wait" notification instead of doing nothing, and does not queue a second check for when the current one finishes. Refreshing while an update-cost preview is running does queue one: the preview holds the same lock but learns nothing about updates, so the check starts as soon as it finishes.
+   - An update-cost preview also shows the `updating` glyph, for the two or three minutes it runs — that is deliberate, so a long evaluation is visible on the bar from start to finish. It does **not** put the header in the checking state: it takes the same lock as a check but is not one, so the header keeps saying "Next check" and the cost section reports `calculating...` on its own. If the glyph is stuck there, check that section — `interrupted — middle-click to retry` means the evaluation died.
    - In full mode, clear the updating flag: `rm ~/.cache/nix-update-updating-flag`
    - Restart waybar: `pkill waybar && waybar &`
 
@@ -663,7 +666,8 @@ The script uses several cache files in your ~/.cache directory:
 - `nix-update-system-path`: Caches the last-seen `/run/current-system` path, used to auto-detect rebuilds
 - `nix-update-flake-lock-input-hash`: Caches a hash of `flake.lock`, used to auto-detect input updates
 - `nix-update-updating-flag`: Signals that a check is mid-run (full mode only)
-- `nix-update-check.lock`: Held while a background check runs, so only one runs at a time (lightweight mode only)
+- `nix-update-check.lock`: Held while a check or an update-cost preview runs, so only one of them evaluates at a time. The holder records `<pgid> <start-epoch>` in it, read only by the wedged-check timeout
+- `nix-update-preview.lock`: Held by a preview, and only by a preview, for as long as its evaluation runs. It is what tells a reader which of the two jobs holds the lock above — and it answers with lock state alone, so there is nothing to go stale: a process that loses the race for a lock truncates the file in the act of opening it to try, so the identity recorded inside one cannot be trusted to say who holds it
 - `nix-update-error`: Present when the last check failed, holding the reason; makes the module show its error state instead of a healthy count. Removed by the next successful check.
 - `nix-update-diagnostic` / `.prev`: What the last two checks actually resolved — channels, package-to-channel mapping size, and for each reported package which channel it was compared against versus which one the mapping put it in. The previous run is kept because a wrong result is usually followed immediately by a correct one, which would otherwise overwrite the evidence. If the module reports something you don't expect, `cat ~/.cache/nix-update-diagnostic.prev` is the place to start.
 - `nix-update-source-count` / `-shown` / `-tooltip`: Last `sourceChecks` result, so a rebuild can redraw the Sources section without reaching the network
@@ -672,6 +676,7 @@ The script uses several cache files in your ~/.cache directory:
 - `nix-update-force-check`: Set by `refresh` to request a check before the interval is up; cleared once that check starts
 - `nix-update-result-hash`: Fingerprint of what the last check found, used to expire a stored update-cost preview when upstream moves
 - `nix-update-preview`: Last update-cost preview, with the `flake.lock` hash and system path it was computed against, plus the evaluating process while one is running so an interrupted preview is reported rather than left reading "calculating"; removed when `dryRunPreview.enable` is `false`
+- `nix-update-preview-declined`: Set by a middle-click that could not start an evaluation, and cleared by the first poll that reports it. A file of its own rather than a state in the record above, because writing the refusal into the record destroyed what the record held — a computed cost, or the `calculating` of an evaluation already under way, which the readers then cleared on sight and left running with nothing reporting it
 
 ### 🔒 Privacy and Security Considerations
 The script checks network connectivity locally using the `ip` command to verify network interfaces and routing tables. This approach:
